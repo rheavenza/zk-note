@@ -1588,7 +1588,7 @@ After synchronization:
 Goal: reuse the proven core in the browser.
 
 ## ZK-060 — WASM build for shared core
-Status: TODO  
+Status: DONE  
 Priority: P0  
 Dependencies: M5
 
@@ -1597,6 +1597,19 @@ Acceptance criteria:
 - crypto/core compiles for browser target;
 - narrow typed JS boundary;
 - no raw Vault Key exposure to React APIs where avoidable.
+
+Completion notes:
+- Configured browser target `wasm32-unknown-unknown` across `zk-protocol`, `zk-crypto`, `zk-core`, and created a dedicated `crates/zk-wasm` crate compiled as `cdylib` and `rlib`.
+- Configured browser-compatible CSPRNG via `getrandom = { version = "0.2", features = ["js"] }` for `wasm32` in `zk-crypto` and `zk-wasm`, and enabled the `js` feature for `uuid`.
+- Implemented `WasmVaultSession` encapsulating `VaultSession` and `InMemorySearchIndex` strictly within WASM linear memory. The raw `VaultKey` bytes are never returned to JavaScript/React code; JS only holds an opaque `WasmVaultSession` handle, satisfying SEC-002 and Criterion 3.
+- Implemented narrow, typed JS boundary exposing:
+  - Vault lifecycle: `init_vault`, `unlock_vault`, `unlock_with_recovery_key`, `WasmVaultInitResult`.
+  - Vault operations: `encrypt_note`, `decrypt_note`, `index_note`, `remove_from_index`, `search`, `rewrap_passphrase`, `is_unlocked`, `lock`.
+  - Typed results: `WasmPlaintextNote`, `WasmSearchResult`, `WasmRewrapResult`.
+  - Standalone envelope and KDF helpers for test suites and compatibility testing.
+- Generated browser package (`pkg/`) and TypeScript type definitions (`zk_wasm.d.ts`) using `wasm-pack`.
+- Added WASM target compilation check (`cargo check --target wasm32-unknown-unknown -p zk-protocol -p zk-crypto -p zk-core -p zk-wasm`) to `./scripts/ci.sh`.
+- Added unit tests in `crates/zk-wasm/src/lib.rs` verifying full lifecycle, note encryption/decryption, in-memory search, passphrase rewrapping, and dual-target error handling. All workspace checks in `./scripts/ci.sh` pass cleanly.
 
 ---
 
