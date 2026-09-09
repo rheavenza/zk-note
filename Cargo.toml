@@ -1,0 +1,38 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/zk-protocol",
+    "crates/zk-crypto",
+    "crates/zk-core",
+    "crates/zk-storage",
+    "crates/zk-sync",
+    "apps/cli",
+    "apps/server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["Zero-Knowledge Notes Team"]
+
+# Dependency direction:
+# zk-protocol (bottom of stack, wire protocol & constants)
+#    ↑
+# zk-crypto (cryptographic primitives & envelope formats)
+#    ↑
+# zk-core (domain note model & vault orchestration)
+#    ↑
+# zk-storage (storage traits; depends on zk-protocol)
+#    ↑
+# zk-sync (sync state machine & conflict merge; depends on zk-core, zk-crypto, zk-protocol, zk-storage)
+#    ↑
+# apps/cli (depends on zk-core, zk-crypto, zk-protocol, zk-storage, zk-sync)
+# apps/server (depends on zk-protocol only - server has no crypto/plaintext keys)
+
+[workspace.dependencies]
+zk-protocol = { path = "crates/zk-protocol" }
+zk-crypto = { path = "crates/zk-crypto" }
+zk-core = { path = "crates/zk-core" }
+zk-storage = { path = "crates/zk-storage" }
+zk-sync = { path = "crates/zk-sync" }

@@ -1,0 +1,18 @@
+[package]
+name = "zk-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Terminal/CLI client for zero-knowledge notes"
+
+[[bin]]
+name = "zk-note"
+path = "src/main.rs"
+
+[dependencies]
+zk-core = { workspace = true }
+zk-crypto = { workspace = true }
+zk-protocol = { workspace = true }
+zk-storage = { workspace = true }
+zk-sync = { workspace = true }

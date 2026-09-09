@@ -1,0 +1,9 @@
+[package]
+name = "zk-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Zero-knowledge note-taking protocol types, constants, and wire formats"
+
+[dependencies]

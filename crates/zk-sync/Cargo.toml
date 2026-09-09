@@ -1,0 +1,13 @@
+[package]
+name = "zk-sync"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Synchronization engine, mutation queues, conflict detection, and merge algorithms"
+
+[dependencies]
+zk-core = { workspace = true }
+zk-crypto = { workspace = true }
+zk-protocol = { workspace = true }
+zk-storage = { workspace = true }
