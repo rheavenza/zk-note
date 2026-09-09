@@ -1083,7 +1083,7 @@ history preservation
 Goal: connect CLI to server without silent overwrite.
 
 ## ZK-040 — Native HTTP sync adapter
-Status: TODO  
+Status: DONE  
 Priority: P0  
 Dependencies: M3
 
@@ -1093,6 +1093,14 @@ Acceptance criteria:
 - authenticated requests abstracted;
 - network errors typed;
 - no plaintext payload fields.
+
+Completion notes:
+- Implemented strongly typed network and sync error representation in `crates/zk-sync/src/error.rs` (`SyncNetworkError`), capturing `Unauthorized`, `Forbidden`, `NotFound`, `Conflict(Box<ConflictResponse>)`, `ReplayMismatch`, `InvalidCursor`, `InvalidPayload`, `ServerError`, `ConnectionFailed`, `Serialization`, and `ForbiddenPlaintext`.
+- Implemented `SyncServerAdapter` trait and `NativeHttpSyncAdapter` in `crates/zk-sync/src/adapter.rs`, abstracting authentication token state and headers, URL normalization, request dispatch, and response status mapping into typed errors.
+- Implemented `validate_no_plaintext_secrets` enforcing SEC-001/SEC-002 client-side before any payload packet is sent across the network.
+- Provided `MockSyncAdapter` for deterministic local sync testing.
+- Added comprehensive integration tests in `apps/server/tests/server_sync_adapter_tests.rs` verifying live HTTP interaction with Axum server: vault bootstrap round trip, CAS push, revision conflicts, mutation replay mismatch, paginated pull with tombstones, and token lifecycle.
+- Validated via `./scripts/ci.sh` (cargo fmt, clippy with `-D warnings`, cargo test --workspace).
 
 ---
 

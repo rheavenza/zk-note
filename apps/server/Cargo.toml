@@ -33,5 +33,9 @@ rusqlite = { workspace = true }
 base64ct = { workspace = true }
 blake2 = { workspace = true }
 
+[dev-dependencies]
+zk-sync = { workspace = true }
+
+
 
 

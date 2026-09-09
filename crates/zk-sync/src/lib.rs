@@ -1,6 +1,13 @@
 //! Synchronization state machine, pull/push coordination,
 //! conflict detection, and deterministic three-way merge logic.
 
+pub mod adapter;
+pub mod error;
+
+pub use adapter::{
+    validate_no_plaintext_secrets, MockSyncAdapter, NativeHttpSyncAdapter, SyncServerAdapter,
+};
+pub use error::SyncNetworkError;
 pub use zk_core as core;
 pub use zk_crypto as crypto;
 pub use zk_protocol as protocol;
