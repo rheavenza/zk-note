@@ -761,7 +761,7 @@ lock
 Goal: server stores ciphertext and coordinates safe revisions without note semantics.
 
 ## ZK-030 — Server skeleton
-Status: TODO  
+Status: DONE  
 Priority: P0  
 Dependencies: M0
 
@@ -772,10 +772,23 @@ Acceptance criteria:
 - health endpoint;
 - structured logs with redaction policy.
 
+Implementation notes:
+- Implemented `zk-server` in `apps/server` using Axum 0.8 and Tokio, with zero dependencies on `zk-crypto` or `zk-core` (SEC-002).
+- Added `ServerConfig` with environment variable loading (`ZK_SERVER_HOST`/`HOST`, `ZK_SERVER_PORT`/`PORT`, `ZK_SERVER_LOG_LEVEL`/`RUST_LOG`, `ZK_SERVER_LOG_FORMAT`/`LOG_FORMAT`), parsing validation, and fallback defaults.
+- Implemented structured JSON and text logging via `tracing-subscriber` with SEC-003 compliant redaction policy:
+  - `is_sensitive_header`: classifies `authorization`, `cookie`, `x-auth-token`, `x-session-token`, `x-api-key`, `x-recovery-key`, etc. as sensitive;
+  - `redact_header_value` / `sanitize_headers` / `sanitize_header_map`: redacts token credentials (preserving scheme such as `Bearer [REDACTED]`);
+  - `redacted_trace_middleware`: logs method, path, response status, duration (ms) without query parameters or plaintext/secret headers.
+- Implemented `request_id_middleware` injecting/propagating `x-request-id` correlation IDs.
+- Implemented `health_handler` responding to `GET /health` and `GET /v1/health` with HTTP 200 OK, service status, package version, and `protocol_version: 1`.
+- Added graceful shutdown signal handling for `SIGINT` (Ctrl+C) and `SIGTERM`.
+- Added unit and integration tests covering configuration loading, live TCP socket lifecycle, health endpoint JSON payloads, and strict redaction rules.
+
 ---
 
+
 ## ZK-031 — PostgreSQL schema/migrations
-Status: TODO  
+Status: DONE  
 Priority: P0  
 Dependencies: ZK-030
 
@@ -796,10 +809,29 @@ Acceptance criteria:
 - account/object uniqueness enforced;
 - indexes support sync sequence reads.
 
+Implementation notes:
+- Authored initial PostgreSQL / server schema migration in `migrations/002_initial_server_schema.sql` based on MASTER_SPEC.md §8.
+- Defined all 6 core tables (`accounts`, `vaults`, `encrypted_objects`, `object_history`, `processed_mutations`, `devices`) along with `schema_migrations` tracking table:
+  - Strict zero-knowledge layout: stores only opaque envelopes (`wrapped_key`, `payload`), KDF params, salts, and revision metadata; zero plaintext note columns (titles, bodies, tags, passphrases).
+  - Uniqueness and primary keys: `accounts(id)`, `vaults(account_id)`, `encrypted_objects(account_id, object_id)`, `object_history(account_id, object_id, revision)`, `processed_mutations(account_id, mutation_id)`, `devices(account_id, device_id)`.
+  - Foreign key constraints with cascading deletion from `accounts`.
+  - Unique index `encrypted_objects_account_seq_idx` on `(account_id, server_seq)` ensuring monotonic sequence allocation per account.
+  - Secondary indexes: `idx_object_history_account_seq`, `idx_processed_mutations_account_object`, `idx_devices_account_last_ack`.
+- Implemented `apps/server/src/db/`:
+  - `schema.rs`: strongly typed row structs (`AccountRow`, `VaultRow`, `EncryptedObjectRow`, `ObjectHistoryRow`, `ProcessedMutationRow`, `DeviceRow`, `SchemaMigrationRow`), table/index constants, and `verify_database_schema` integrity checker.
+  - `migrations.rs`: embedded `002_initial_server_schema.sql`, transactional `run_server_migrations` runner with idempotent tracking, and `create_in_memory_db` test database factory.
+- Added integration test suite `apps/server/tests/server_db_migration_tests.rs`:
+  - Verified reproducible, idempotent migration execution from clean state;
+  - Verified rejection of duplicate accounts, duplicate vaults, and foreign key violations;
+  - Verified rejection of duplicate `(account_id, object_id)` and duplicate `(account_id, server_seq)`;
+  - Verified query plan uses `encrypted_objects_account_seq_idx` for sync sequence pull queries (`account_id = ? AND server_seq > ? ORDER BY server_seq ASC`);
+  - Verified zero plaintext columns exist in database schema.
+
 ---
 
+
 ## ZK-032 — Vault bootstrap API
-Status: TODO  
+Status: DONE  
 Priority: P0  
 Dependencies: ZK-031
 
@@ -810,10 +842,29 @@ Acceptance criteria:
 - get/bootstrap round-trip;
 - cross-account access denied.
 
+Implementation notes:
+- Implemented `POST /v1/vault/bootstrap` and `GET /v1/vault/bootstrap` in `apps/server/src/routes/vault.rs`.
+- Enforced zero-knowledge invariants (SEC-001/SEC-002):
+  - Stored strictly KDF parameters (`algorithm`, `salt`, `memory_kib`, `iterations`, `parallelism`) and wrapped key envelopes (`wrapped_vault_key`, `recovery_wrapped_vault_key`) in the `vaults` database table;
+  - Verified no passphrase/password/key field exists in the `VaultBootstrap` API model, with recursive request payload inspection to strictly reject any forbidden credentials (`passphrase`, `password`, `secret`, etc.) with HTTP 400 (`INVALID_VAULT_BOOTSTRAP`).
+- Implemented `AuthenticatedAccount` extractor in `apps/server/src/auth.rs` enforcing `Bearer <uuid>` authentication:
+  - Missing or malformed headers return HTTP 401 (`AUTH_REQUIRED`);
+  - Scopes all queries strictly to the caller's authenticated `account_id`;
+  - Explicitly rejects mismatched cross-account headers (`x-account-id`) with HTTP 403 (`AUTH_FORBIDDEN`).
+- Implemented `ServerDb` vault persistence operations (`create_vault_bootstrap` and `get_vault_bootstrap`) in `apps/server/src/db/store.rs`:
+  - Enforces single-vault-per-account lifecycle, returning HTTP 409 (`VAULT_ALREADY_EXISTS`) on duplicate bootstrap calls;
+  - Decodes/encodes Base64 salts and JSON wrapped keys with full lossless fidelity.
+- Added integration test suite in `apps/server/tests/server_vault_bootstrap_tests.rs`:
+  - Verified POST/GET round-trip preserving all cryptographic fields;
+  - Verified rejection of forbidden passphrase fields;
+  - Verified cross-account access rejection and account isolation;
+  - Verified authentication enforcement (SEC-003).
+
 ---
 
+
 ## ZK-033 — Server sequence allocator
-Status: TODO  
+Status: DONE  
 Priority: P0  
 Dependencies: ZK-031
 
@@ -823,10 +874,26 @@ Acceptance criteria:
 - transactional;
 - concurrency test proves uniqueness/order.
 
+Implementation notes:
+- Created migration `migrations/003_account_sequences.sql` defining `account_sequences` table (`account_id`, `current_seq`, `updated_at`) with backfilling from `encrypted_objects (MAX(server_seq))` for existing accounts.
+- Added `TABLE_ACCOUNT_SEQUENCES` and `AccountSequenceRow` schema definitions to `apps/server/src/db/schema.rs` and registered migration 003 into `SERVER_MIGRATIONS` in `apps/server/src/db/migrations.rs`.
+- Implemented sequence allocator in `apps/server/src/db/store.rs`:
+  - `ServerDb::allocate_sequence_in_tx(&tx, account_id)`: atomic transactional upsert allocating next sequence (`INSERT ... ON CONFLICT (account_id) DO UPDATE SET current_seq = account_sequences.current_seq + 1 ... RETURNING current_seq`);
+  - `ServerDb::allocate_next_sequence(&self, account_id)`: atomic single-sequence transaction helper;
+  - `ServerDb::current_sequence_on_conn(&conn, account_id)` and `ServerDb::current_sequence(&self, account_id)`: inspection helper returning highest sequence (or 0 if unallocated);
+  - `ServerDb::current_sequence_in_tx(&tx, account_id)`: transaction-scoped sequence inspection;
+  - `ServerDb::connection(&self)`: thread-safe connection mutex accessor for multi-operation transactions.
+- Verified acceptance criteria with unit and integration tests:
+  - Monotonic per account: sequence begins at 1 and increments strictly monotonically; distinct accounts have completely independent sequence spaces.
+  - Transactional: sequence increments execute inside database transactions; transaction rollback cleanly rolls back sequence increments without gaps or orphan state; dropped transactions roll back automatically.
+  - Concurrency: 50 concurrent tokio tasks simultaneously allocating sequences for a single account produce strictly unique, contiguous numbers `1..=50` with no duplicates and no gaps; multi-account concurrent allocations (90 tasks across 3 accounts) maintain full per-account isolation.
+  - Backfill verification: migration 003 correctly initializes sequence counter from `MAX(server_seq)` of existing objects.
+- All quality gates passed via `./scripts/ci.sh` (formatting, clippy `-D warnings`, dependency check, workspace tests).
+
 ---
 
 ## ZK-034 — CAS mutation endpoint
-Status: TODO  
+Status: DONE  
 Priority: P0  
 Dependencies: ZK-031, ZK-033
 
@@ -844,10 +911,37 @@ Acceptance criteria:
 - successful update increments revision exactly once;
 - previous revision stored in history.
 
+Implementation notes:
+- Implemented `POST /v1/sync/push` endpoint handler in `apps/server/src/routes/sync.rs` mounted on the Axum router.
+- Implemented CAS push transactional logic in `apps/server/src/db/store.rs`:
+  - `ServerDb::push_mutation_in_tx(&tx, account_id, &request)`: implements MASTER_SPEC.md §9.3 11-step transactional compare-and-swap state machine:
+    1. Checks `processed_mutations` for idempotency and returns cached result on replay (or detects mismatch);
+    2. Reads current object row from `encrypted_objects`;
+    3. If `expected_revision == 0` and object does not exist: creates object at revision 1 and allocates next server sequence;
+    4. If `expected_revision == 0` and object already exists: rejects as conflict returning HTTP 409 `ConflictResponse` with latest `current_envelope`;
+    5. If `expected_revision != current_revision`: rejects as conflict returning HTTP 409 `ConflictResponse`;
+    6. If `expected_revision == current_revision`: archives prior revision into `object_history` table, allocates next monotonic server sequence, increments revision by exactly 1 (`current_revision + 1`), and updates `encrypted_objects`;
+    7. Persists successful mutation result into `processed_mutations` and commits transaction.
+  - `ServerDb::push_mutation(&self, account_id, &request)`: transactional wrapper returning `PushOutcome` (`Success`, `Conflict`, `ObjectNotFound`, `ReplayMismatch`).
+  - `ServerDb::get_encrypted_object` and `ServerDb::get_object_history`: state and history inspection methods.
+- Enforced zero-knowledge invariants (SEC-001/SEC-002) and security rules:
+  - Scans JSON payloads with `contains_forbidden_keys` to strictly reject plaintext notes or credentials with HTTP 400 (`INVALID_ENVELOPE`);
+  - Enforces `AuthenticatedAccount` bearer token authentication with cross-account access isolation;
+  - Validates UUIDs, envelope versions (`ENVELOPE_VERSION_V1`), object ID consistency, and standard Base64 nonce/ciphertext formatting;
+  - Diagnostic logs strictly avoid logging ciphertexts or payload keys (SEC-003).
+- Added comprehensive unit tests in `apps/server/src/db/store.rs` and integration tests in `apps/server/tests/server_cas_push_tests.rs`:
+  - Verified creation at revision 1 and server sequence 1 for `expected_revision = 0`;
+  - Verified duplicate create rejection with HTTP 409 `ConflictResponse`;
+  - Verified exact revision requirement and increment by 1 on update (`1 -> 2 -> 3`);
+  - Verified rejection of stale updates with HTTP 409 `ConflictResponse`;
+  - Verified prior revisions are faithfully preserved in `object_history`;
+  - Verified cross-account isolation and rejection of unauthenticated requests and forbidden plaintext keys.
+- All quality gates passed via `./scripts/ci.sh` (formatting, clippy `-D warnings`, dependency checks, and 144 workspace tests).
+
 ---
 
 ## ZK-035 — Mutation idempotency
-Status: TODO  
+Status: DONE  
 Priority: P0  
 Dependencies: ZK-034
 
@@ -857,6 +951,20 @@ Acceptance criteria:
 - no additional revision/server sequence;
 - same mutation ID with incompatible payload returns explicit replay mismatch error;
 - concurrency test for duplicate simultaneous retries.
+
+Completion notes:
+- Added migration `migrations/004_mutation_idempotency.sql` adding `request_hash BYTEA` to `processed_mutations` table.
+- Implemented `compute_mutation_request_hash` in `apps/server/src/db/store.rs` computing deterministic 32-byte Blake2s-256 digest of semantic request payload fields (`object_id`, `expected_revision`, `object_kind`, `is_deleted`, and envelope ciphertext/nonce components) preserving zero-knowledge invariants (SEC-001/SEC-002).
+- Enhanced CAS push mutation state machine in `apps/server/src/db/store.rs`:
+  - When replaying an identical mutation (matching `account_id`, `mutation_id`, and `request_hash`): returns the original cached `PushResponse` without incrementing revision or allocating a new server sequence.
+  - When replaying with an incompatible payload (mismatched `object_id`, `expected_revision`, `is_deleted`, or envelope ciphertexts/nonces): returns `PushOutcome::ReplayMismatch`, mapped by `apps/server/src/routes/sync.rs` to HTTP 409 Conflict with error code `MUTATION_REPLAY_MISMATCH`.
+  - Persists `request_hash` alongside response body and resulting revision/sequence on both create and update operations.
+- Added comprehensive unit tests in `apps/server/src/db/store.rs` and integration tests in `apps/server/tests/server_mutation_idempotency_tests.rs`:
+  - Verified exact create and update replay return original `PushResponse` with HTTP 200 OK;
+  - Verified revision and sequence counters do not advance on replay, and object history is not duplicated;
+  - Verified explicit replay mismatch errors for differing `object_id`, `expected_revision`, payload ciphertext, and `is_deleted` flag (HTTP 409 `MUTATION_REPLAY_MISMATCH`);
+  - Concurrency tests: 50 concurrent tokio tasks simultaneously retrying create and 50 concurrent tokio tasks simultaneously retrying update all succeed with HTTP 200 OK and identical responses without race conditions or duplicated allocations.
+- All quality gates passed via `./scripts/ci.sh` (formatting, clippy `-D warnings`, dependency check, and all 158 workspace tests).
 
 ---
 

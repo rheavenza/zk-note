@@ -16,6 +16,9 @@ pub struct PushRequest {
     pub object_kind: u16,
     /// Encrypted object envelope.
     pub envelope: EncryptedEnvelope,
+    /// Whether this mutation is a deletion tombstone (defaults to false).
+    #[serde(default)]
+    pub is_deleted: bool,
 }
 
 /// Successful push response returned by server on accepted mutation.

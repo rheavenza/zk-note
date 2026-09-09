@@ -6,12 +6,32 @@ license.workspace = true
 authors.workspace = true
 description = "Zero-knowledge ciphertext store and sync coordination server"
 
+[lib]
+name = "zk_server"
+path = "src/lib.rs"
+
 [[bin]]
 name = "zk-server"
 path = "src/main.rs"
+
 
 [lints]
 workspace = true
 
 [dependencies]
 zk-protocol = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+rusqlite = { workspace = true }
+base64ct = { workspace = true }
+blake2 = { workspace = true }
+
+
+

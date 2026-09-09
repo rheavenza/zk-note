@@ -168,6 +168,7 @@ mod tests {
             expected_revision: 0,
             object_kind: OBJECT_KIND_NOTE,
             envelope: envelope.clone(),
+            is_deleted: false,
         };
         let push_json = serde_json::to_string(&push_req).expect("serialize push request");
         let parsed_push: PushRequest =
