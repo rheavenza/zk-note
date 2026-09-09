@@ -64,6 +64,18 @@ impl fmt::Display for SyncNetworkError {
     }
 }
 
+impl SyncNetworkError {
+    /// Returns true if this error represents a transient transport or server error
+    /// that is safe to retry automatically without client-side credential or payload changes.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Self::ConnectionFailed(_) => true,
+            Self::ServerError { status, .. } => *status >= 500 || *status == 429,
+            _ => false,
+        }
+    }
+}
+
 impl std::error::Error for SyncNetworkError {}
 
 #[cfg(test)]
@@ -107,5 +119,24 @@ mod tests {
 
         let err_sec = SyncNetworkError::ForbiddenPlaintext("title leaked".to_string());
         assert!(err_sec.to_string().contains("security invariant violation"));
+    }
+
+    #[test]
+    fn test_error_retryability() {
+        assert!(SyncNetworkError::ConnectionFailed("timed out".to_string()).is_retryable());
+        assert!(SyncNetworkError::ServerError {
+            status: 503,
+            message: "unavailable".to_string()
+        }
+        .is_retryable());
+        assert!(SyncNetworkError::ServerError {
+            status: 429,
+            message: "rate limited".to_string()
+        }
+        .is_retryable());
+
+        assert!(!SyncNetworkError::Unauthorized("bad token".to_string()).is_retryable());
+        assert!(!SyncNetworkError::Forbidden("no access".to_string()).is_retryable());
+        assert!(!SyncNetworkError::InvalidPayload("bad json".to_string()).is_retryable());
     }
 }

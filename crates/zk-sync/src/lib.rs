@@ -4,6 +4,7 @@
 pub mod adapter;
 pub mod cursor;
 pub mod error;
+pub mod orchestrator;
 pub mod pull;
 pub mod push;
 pub mod queue;
@@ -13,6 +14,10 @@ pub use adapter::{
 };
 pub use cursor::{CursorError, DurableSyncCursor};
 pub use error::SyncNetworkError;
+pub use orchestrator::{
+    run_sync_cycle, run_sync_cycle_with_session, SyncCycleError, SyncCycleOptions, SyncCycleReport,
+    SyncEngine,
+};
 pub use pull::{
     decrypt_stored_objects_on_unlock, pull_remote_changes, pull_with_session, DecryptedPullItem,
     LockedSyncBehavior, PullError, PullOptions, PullReport,

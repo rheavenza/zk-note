@@ -1203,7 +1203,7 @@ Completion notes:
 ---
 
 ## ZK-045 — Pull-before-push orchestration
-Status: TODO  
+Status: DONE  
 Priority: P0  
 Dependencies: ZK-043, ZK-044
 
@@ -1213,6 +1213,18 @@ Acceptance criteria:
 - retryable network failure;
 - final cursor consistent;
 - no mutation silently dropped.
+
+Completion notes:
+- Implemented `run_sync_cycle`, `run_sync_cycle_with_session`, `SyncEngine`, `SyncCycleOptions`, `SyncCycleReport`, and `SyncCycleError` in `crates/zk-sync/src/orchestrator.rs`.
+- Enforced MASTER_SPEC.md § 9.6 pull-before-push execution order:
+  1. Reset stuck in-flight mutations from interrupted runs;
+  2. Initial pull fetches remote changes after cursor and stores encrypted objects durably;
+  3. Push phase transmits pending mutations with CAS revision verification;
+  4. Follow-up pull fetches server-allocated sequences and updates final cursor;
+  5. Decrypted search index updated when unlocked session is provided.
+- Added `is_retryable()` to `SyncNetworkError` and `SyncCycleError` to cleanly distinguish retryable transport/server errors from fatal errors without dropping mutations or corrupting cursors.
+- Added unit tests in `orchestrator.rs` and integration tests in `crates/zk-sync/tests/orchestrator_tests.rs`.
+- Verified via `./scripts/ci.sh`.
 
 ---
 
