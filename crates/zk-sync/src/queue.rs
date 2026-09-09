@@ -96,13 +96,13 @@ where
 
         // If the object already exists locally, preserve its current envelope as the base version
         // for three-way conflict merge at this expected revision.
-        if let Ok(Some(current_obj)) = self.storage.get_object(object_id) {
+        if let Some(current_obj) = self.storage.get_object(object_id)? {
             if current_obj.revision == expected_revision {
-                let _ = self.storage.put_base_version(
+                self.storage.put_base_version(
                     object_id,
                     expected_revision,
                     &current_obj.envelope,
-                );
+                )?;
             }
         }
 
@@ -143,13 +143,13 @@ where
             )));
         }
 
-        if let Ok(Some(current_obj)) = self.storage.get_object(object_id) {
+        if let Some(current_obj) = self.storage.get_object(object_id)? {
             if current_obj.revision == expected_revision {
-                let _ = self.storage.put_base_version(
+                self.storage.put_base_version(
                     object_id,
                     expected_revision,
                     &current_obj.envelope,
-                );
+                )?;
             }
         }
 
@@ -177,7 +177,7 @@ where
     ///
     /// - If the note does not exist locally, base revision is recorded as 0.
     /// - If the note exists locally, base revision is recorded as its current revision,
-    ///   and its current envelope is recorded into [`BaseVersionStore`].
+    ///   and its current envelope is durably recorded into [`BaseVersionStore`].
     pub fn enqueue_local_note_upsert(
         &self,
         object_id: &str,
@@ -185,9 +185,8 @@ where
     ) -> Result<PendingMutation, QueueError> {
         let expected_revision = match self.storage.get_object(object_id)? {
             Some(obj) => {
-                let _ = self
-                    .storage
-                    .put_base_version(object_id, obj.revision, &obj.envelope);
+                self.storage
+                    .put_base_version(object_id, obj.revision, &obj.envelope)?;
                 obj.revision
             }
             None => 0,
@@ -205,9 +204,8 @@ where
     ) -> Result<PendingMutation, QueueError> {
         let expected_revision = match self.storage.get_object(object_id)? {
             Some(obj) => {
-                let _ = self
-                    .storage
-                    .put_base_version(object_id, obj.revision, &obj.envelope);
+                self.storage
+                    .put_base_version(object_id, obj.revision, &obj.envelope)?;
                 obj.revision
             }
             None => {
@@ -223,6 +221,42 @@ where
             expected_revision,
             tombstone_envelope,
         )
+    }
+
+    /// Retrieves the encrypted base envelope for an object at a specific revision (ZK-050).
+    pub fn get_base_version(
+        &self,
+        object_id: &str,
+        revision: u64,
+    ) -> Result<Option<EncryptedEnvelope>, QueueError> {
+        let envelope = self.storage.get_base_version(object_id, revision)?;
+        Ok(envelope)
+    }
+
+    /// Retrieves the base encrypted envelope associated with a pending mutation (ZK-050).
+    ///
+    /// If `mutation.expected_revision == 0` (object creation), returns `Ok(None)`.
+    /// Otherwise, fetches the base version at `mutation.expected_revision` from [`BaseVersionStore`].
+    pub fn get_base_version_for_mutation(
+        &self,
+        mutation: &PendingMutation,
+    ) -> Result<Option<EncryptedEnvelope>, QueueError> {
+        if mutation.expected_revision == 0 {
+            return Ok(None);
+        }
+        self.get_base_version(&mutation.object_id, mutation.expected_revision)
+    }
+
+    /// Stores an explicit base encrypted envelope for an object at a specific revision (ZK-050).
+    pub fn store_base_version(
+        &self,
+        object_id: &str,
+        revision: u64,
+        envelope: &EncryptedEnvelope,
+    ) -> Result<(), QueueError> {
+        self.storage
+            .put_base_version(object_id, revision, envelope)?;
+        Ok(())
     }
 
     /// Retrieves a pending mutation by its unique ID.

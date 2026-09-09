@@ -1287,7 +1287,7 @@ No plaintext is present in server DB. All M4 acceptance criteria and gates verif
 Goal: make multi-device offline conflicts safe and usable.
 
 ## ZK-050 — Persist encrypted BASE versions
-Status: TODO  
+Status: DONE  
 Priority: P0  
 Dependencies: ZK-041
 
@@ -1296,6 +1296,16 @@ Acceptance criteria:
 - pending edit stores reference/base ciphertext;
 - restart preserves merge capability;
 - plaintext BASE is not persisted.
+
+Completion notes:
+- Enforced atomic persistence of encrypted base versions in `PendingMutationQueue::enqueue_upsert`, `enqueue_delete`, and `enqueue_local_note_upsert` in `crates/zk-sync/src/queue.rs`.
+- Added public helper methods on `PendingMutationQueue`: `get_base_version`, `get_base_version_for_mutation`, and `store_base_version`.
+- Propagated durable base version persistence errors fail-closed so merge capability is never lost silently.
+- Added comprehensive integration tests in `crates/zk-sync/tests/base_version_persistence_tests.rs`:
+  - Verified pending edits store reference `expected_revision` and base encrypted envelope in `BaseVersionStore`;
+  - Verified process restart across SQLite connections reloads both pending mutation and base envelope, preserving full decryptability of BASE, LOCAL, and conflicting REMOTE notes for 3-way merge;
+  - Verified zero-knowledge audit: confirmed zero plaintext note titles, bodies, tags, or keys are persisted in the database file (SEC-009).
+- Verified via `./scripts/ci.sh`.
 
 ---
 
