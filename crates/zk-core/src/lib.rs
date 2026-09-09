@@ -1,5 +1,13 @@
-//! Note domain model, vault lifecycle management, and
-//! encrypted object orchestration.
+pub mod error;
+pub mod note;
+pub mod time;
+
+pub use error::{CoreError, NoteValidationError};
+pub use note::{
+    Note, NoteBuilder, PlaintextNote, MAX_ATTACHMENTS_COUNT, MAX_ATTACHMENT_ID_LEN, MAX_BODY_LEN,
+    MAX_TAGS_COUNT, MAX_TAG_LEN, MAX_TITLE_LEN, NOTE_SCHEMA_VERSION_V1,
+};
+pub use time::{now_utc_rfc3339, validate_rfc3339};
 
 pub use zk_crypto as crypto;
 pub use zk_protocol as protocol;

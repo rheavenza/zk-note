@@ -475,7 +475,7 @@ Do not implement server persistence before M1 is green.
 Goal: prove the note model and encrypted persistence without networking.
 
 ## ZK-020 — Plaintext note model
-Status: TODO  
+Status: DONE  
 Priority: P0  
 Dependencies: M1
 
@@ -496,6 +496,17 @@ Acceptance criteria:
 - serialization deterministic enough for application requirements;
 - schema version present;
 - validation limits documented.
+
+Completion notes:
+- Implemented `PlaintextNote` domain model (aliased as `Note`) and `NoteBuilder` in `crates/zk-core/src/note.rs` with `schema_version = 1`, `title`, `body`, `tags`, `created_at`, `updated_at`, and `attachments` placeholder.
+- Implemented canonicalization: BOM stripping (`\u{feff}`), Markdown newline normalization (`\r\n` and `\r` -> `\n`), tag whitespace trimming, lowercase conversion, deduplication, and ascending lexicographical sorting.
+- Implemented deterministic canonical JSON serialization (`to_canonical_json`, `to_canonical_bytes`) ensuring identical logical note state produces byte-identical canonical JSON.
+- Implemented strict RFC 3339 timestamp parsing and validation in `crates/zk-core/src/time.rs` covering year, month, day-of-month, leap year, hour/minute/second, and timezone offsets without heavy external dependencies.
+- Enforced and documented validation limits in `crates/zk-core/src/note.rs`, `crates/zk-core/README.md`, and `docs/protocol/v1.md` §3.4 (`MAX_TITLE_LEN = 1024` bytes, `MAX_BODY_LEN = 10 MiB`, `MAX_TAGS_COUNT = 100`, `MAX_TAG_LEN = 128` bytes, `MAX_ATTACHMENTS_COUNT = 100`, `MAX_ATTACHMENT_ID_LEN = 128` bytes, `NOTE_SCHEMA_VERSION_V1 = 1`).
+- Implemented `encrypt(&vault_key, object_id)` and `decrypt(&envelope, &vault_key)` integrating domain notes directly with `zk-crypto` encrypted envelopes.
+- Implemented typed `NoteValidationError` and `CoreError` in `crates/zk-core/src/error.rs`.
+- Added unit tests covering default construction, builder pattern, BOM stripping, newline normalization, tag canonicalization, deterministic serialization, all validation limit failures, and envelope encryption/decryption round trips.
+- Validated via `./scripts/ci.sh`.
 
 ---
 

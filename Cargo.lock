@@ -363,6 +363,8 @@ dependencies = [
 name = "zk-core"
 version = "0.1.0"
 dependencies = [
+ "serde",
+ "serde_json",
  "zk-crypto",
  "zk-protocol",
 ]
