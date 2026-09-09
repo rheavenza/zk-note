@@ -12,8 +12,10 @@ use std::collections::BTreeSet;
 use std::fmt;
 use zk_core::note::PlaintextNote;
 
+use crate::diff3::Diff3Result;
+
 /// Detailed classification of a scalar field merge attempt.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum FieldMergeStatus<T> {
     /// Field was unchanged across all three versions.
     Unchanged(T),
@@ -23,6 +25,8 @@ pub enum FieldMergeStatus<T> {
     RemoteOnly(T),
     /// Field was modified identically by both local and remote clients.
     Identical(T),
+    /// Field was modified concurrently and merged cleanly (e.g. diff3 line merge).
+    Merged(T),
     /// Divergent modification by both sides: cannot be automatically resolved.
     Conflict {
         /// Base value prior to divergent edits.
@@ -35,7 +39,7 @@ pub enum FieldMergeStatus<T> {
 }
 
 /// A conflict on an individual scalar field.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum FieldConflict {
     /// Divergent note title change.
     Title {
@@ -96,13 +100,13 @@ impl fmt::Display for FieldConflict {
 }
 
 /// The result of a structured three-way merge between BASE, LOCAL, and REMOTE.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NoteMergeOutcome {
     /// Merged note candidate.
     ///
     /// If `is_clean()` is true, this candidate represents the complete, safely resolved note.
     /// If `is_clean()` is false, this candidate contains the non-conflicting fields merged,
-    /// while conflicting fields default to local edits pending user or algorithmic resolution.
+    /// while conflicting fields default to local edits or diff3 conflict markers pending user or algorithmic resolution.
     pub candidate: PlaintextNote,
     /// List of field conflicts that prevented a fully automatic clean merge.
     pub conflicts: Vec<FieldConflict>,
@@ -110,6 +114,8 @@ pub struct NoteMergeOutcome {
     pub title_status: FieldMergeStatus<String>,
     /// Field-by-field body diagnostics.
     pub body_status: FieldMergeStatus<String>,
+    /// Diff3 result for body merge diagnostics and line-level conflict inspection.
+    pub body_diff: Option<Diff3Result>,
 }
 
 impl NoteMergeOutcome {
@@ -251,7 +257,8 @@ pub fn three_way_merge_note(
         FieldMergeStatus::Unchanged(t)
         | FieldMergeStatus::LocalOnly(t)
         | FieldMergeStatus::RemoteOnly(t)
-        | FieldMergeStatus::Identical(t) => t.clone(),
+        | FieldMergeStatus::Identical(t)
+        | FieldMergeStatus::Merged(t) => t.clone(),
         FieldMergeStatus::Conflict {
             base: b,
             local: l,
@@ -266,25 +273,47 @@ pub fn three_way_merge_note(
         }
     };
 
-    // 2. Merge Body
-    let body_status = merge_scalar_field(&base.body, &local.body, &remote.body);
-    let final_body = match &body_status {
-        FieldMergeStatus::Unchanged(b)
-        | FieldMergeStatus::LocalOnly(b)
-        | FieldMergeStatus::RemoteOnly(b)
-        | FieldMergeStatus::Identical(b) => b.clone(),
-        FieldMergeStatus::Conflict {
-            base: b,
-            local: l,
-            remote: r,
-        } => {
-            conflicts.push(FieldConflict::Body {
-                base: b.clone(),
-                local: l.clone(),
-                remote: r.clone(),
-            });
-            l.clone() // Preserve local candidate pending explicit resolution
-        }
+    // 2. Merge Body using line-based diff3 (ZK-052)
+    let body_diff = crate::diff3::diff3_merge(&base.body, &local.body, &remote.body);
+    let (final_body, body_status) = if base.body == local.body && base.body == remote.body {
+        (
+            base.body.clone(),
+            FieldMergeStatus::Unchanged(base.body.clone()),
+        )
+    } else if base.body != local.body && base.body == remote.body {
+        (
+            local.body.clone(),
+            FieldMergeStatus::LocalOnly(local.body.clone()),
+        )
+    } else if base.body == local.body && base.body != remote.body {
+        (
+            remote.body.clone(),
+            FieldMergeStatus::RemoteOnly(remote.body.clone()),
+        )
+    } else if local.body == remote.body {
+        (
+            local.body.clone(),
+            FieldMergeStatus::Identical(local.body.clone()),
+        )
+    } else if body_diff.is_clean {
+        (
+            body_diff.merged_text.clone(),
+            FieldMergeStatus::Merged(body_diff.merged_text.clone()),
+        )
+    } else {
+        conflicts.push(FieldConflict::Body {
+            base: base.body.clone(),
+            local: local.body.clone(),
+            remote: remote.body.clone(),
+        });
+        (
+            body_diff.merged_text.clone(),
+            FieldMergeStatus::Conflict {
+                base: base.body.clone(),
+                local: local.body.clone(),
+                remote: remote.body.clone(),
+            },
+        )
     };
 
     // 3. Merge Tags
@@ -306,6 +335,7 @@ pub fn three_way_merge_note(
         conflicts,
         title_status,
         body_status,
+        body_diff: Some(body_diff),
     }
 }
 
@@ -452,5 +482,27 @@ mod tests {
         assert_eq!(outcome.candidate.title, "Updated Title");
         assert_eq!(outcome.candidate.body, "Base Body");
         assert_eq!(outcome.candidate.tags, vec!["priority", "work"]);
+    }
+
+    #[test]
+    fn test_merge_non_overlapping_body_edits_auto_merge() {
+        let base_body = "# Heading\n\nSection A\nOriginal A\n\nSection B\nOriginal B";
+        let local_body = "# Heading\n\nSection A\nLocal A edit\n\nSection B\nOriginal B";
+        let remote_body = "# Heading\n\nSection A\nOriginal A\n\nSection B\nRemote B edit";
+
+        let base = make_note("Doc", base_body, &[]);
+        let local = make_note("Doc", local_body, &[]);
+        let remote = make_note("Doc", remote_body, &[]);
+
+        let outcome = three_way_merge_note(&base, &local, &remote);
+        assert!(outcome.is_clean());
+        assert!(outcome.conflicts.is_empty());
+        let expected_body = "# Heading\n\nSection A\nLocal A edit\n\nSection B\nRemote B edit";
+        assert_eq!(outcome.candidate.body, expected_body);
+        assert_eq!(
+            outcome.body_status,
+            FieldMergeStatus::Merged(expected_body.to_string())
+        );
+        assert!(outcome.body_diff.as_ref().unwrap().is_clean);
     }
 }

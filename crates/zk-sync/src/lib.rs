@@ -3,6 +3,7 @@
 
 pub mod adapter;
 pub mod cursor;
+pub mod diff3;
 pub mod error;
 pub mod merge;
 pub mod orchestrator;
@@ -14,6 +15,7 @@ pub use adapter::{
     validate_no_plaintext_secrets, MockSyncAdapter, NativeHttpSyncAdapter, SyncServerAdapter,
 };
 pub use cursor::{CursorError, DurableSyncCursor};
+pub use diff3::{diff3_merge, BodyConflict, Diff3Result};
 pub use error::SyncNetworkError;
 pub use merge::{
     merge_attachments, merge_scalar_field, merge_tags, three_way_merge_note, FieldConflict,

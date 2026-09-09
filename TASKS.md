@@ -1334,7 +1334,7 @@ Completion notes:
 ---
 
 ## ZK-052 — Markdown body diff3
-Status: TODO  
+Status: DONE  
 Priority: P0  
 Dependencies: ZK-051
 
@@ -1344,6 +1344,25 @@ Acceptance criteria:
 - overlapping edits become explicit conflict;
 - no side silently discarded;
 - deterministic tests.
+
+Completion notes:
+- Implemented line-based Longest Common Subsequence (LCS) three-way merge (`diff3_merge`) in `crates/zk-sync/src/diff3.rs`:
+  - Trims common line prefix and suffix before LCS dynamic programming for high performance;
+  - Includes allocation guard preventing runaway dynamic programming allocations on pathological inputs;
+  - Identifies common anchors across BASE, LOCAL, and REMOTE;
+  - Cleanly auto-merges non-overlapping edits, additions at boundaries, and deletions;
+  - Cleanly resolves identical concurrent modifications without conflict;
+  - Detects overlapping divergent line edits and converts them into explicit `BodyConflict` records;
+  - Never discards either side silently: formats conflicting chunks with standard diff3 conflict markers (`<<<<<<< LOCAL`, `||||||| BASE`, `=======`, `>>>>>>> REMOTE`);
+  - Normalizes `\r\n` and `\r` to `\n` to guarantee deterministic line behavior across platforms.
+- Integrated `diff3_merge` directly into `three_way_merge_note` in `crates/zk-sync/src/merge.rs`:
+  - Added `FieldMergeStatus::Merged(T)` variant for fields resolved cleanly via automatic 3-way line merge;
+  - Injected `body_diff: Option<Diff3Result>` into `NoteMergeOutcome` for rich diagnostics and structured conflict introspection;
+  - Merged candidate body receives clean merged text on non-overlapping edits, or formatted conflict markers preserving BASE, LOCAL, and REMOTE on overlapping edits.
+- Added comprehensive unit and integration test suites:
+  - Unit tests in `crates/zk-sync/src/diff3.rs` and `crates/zk-sync/src/merge.rs`;
+  - Integration tests in `crates/zk-sync/tests/markdown_body_diff3_tests.rs` covering non-overlapping section auto-merging, boundary additions, edit-vs-delete conflicts, overlapping edits, mixed clean/conflict documents, CRLF normalization, 100-run determinism, and full `PlaintextNote` 3-way merge integration.
+- Passed all quality gates via `./scripts/ci.sh` (formatting, clippy `-D warnings`, dependency audit, workspace tests).
 
 ---
 
