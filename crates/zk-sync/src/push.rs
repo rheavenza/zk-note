@@ -9,16 +9,14 @@
 //!   for three-way merge resolution (no silent data loss).
 
 use crate::adapter::SyncServerAdapter;
-use crate::conflict::{evaluate_guarded_lww, ConflictPolicy, GuardedLwwOutcome};
+use crate::conflict::{evaluate_guarded_lww, record_conflict, ConflictPolicy, GuardedLwwOutcome};
 use crate::error::SyncNetworkError;
 use crate::queue::{PendingMutationQueue, QueueError};
 use std::fmt;
-use uuid::Uuid;
-use zk_core::time::now_utc_rfc3339;
 use zk_crypto::keys::VaultKey;
 use zk_protocol::sync::{ConflictResponse, PushRequest};
 use zk_storage::error::StorageError;
-use zk_storage::models::{ConflictRecord, MutationStatus, MutationType, PendingMutation};
+use zk_storage::models::{MutationStatus, MutationType, PendingMutation};
 use zk_storage::traits::{BaseVersionStore, ConflictStore, MutationStore, ObjectStore};
 
 /// Configuration options for pushing pending mutations.
@@ -201,33 +199,19 @@ where
                     // Default V1 or delete-vs-edit conflict (SEC-008): preserve conflict and leave local mutation recoverable
                     let _ = queue.mark_pending(&mutation.mutation_id);
 
-                    let base_envelope = queue
-                        .storage()
-                        .get_base_version(&mutation.object_id, mutation.expected_revision)
-                        .unwrap_or(None);
-
-                    let conflict_record = ConflictRecord::new(
-                        Uuid::new_v4().to_string(),
-                        &mutation.object_id,
-                        mutation.object_kind,
-                        mutation.expected_revision,
-                        conflict.current_revision,
-                        base_envelope,
-                        mutation.envelope.clone(),
-                        conflict.current_envelope.clone(),
-                        None,
-                        now_utc_rfc3339(),
-                    )
-                    .with_deletion_flags(
-                        mutation.mutation_type == MutationType::Delete,
-                        conflict.is_deleted,
-                    );
-                    let _ = queue.storage().put_conflict(&conflict_record);
-
-                    report.conflicts.push(PushItemConflict {
+                    let push_conflict = PushItemConflict {
                         mutation,
                         conflict: *conflict,
-                    });
+                    };
+
+                    let (_conflict_record, _outcome) = record_conflict(
+                        queue.storage(),
+                        &push_conflict,
+                        options.vault_key.as_ref(),
+                    )
+                    .map_err(PushError::Storage)?;
+
+                    report.conflicts.push(push_conflict);
 
                     if options.stop_on_conflict {
                         break;

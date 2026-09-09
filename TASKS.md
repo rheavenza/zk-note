@@ -1519,7 +1519,7 @@ Completion notes:
 ---
 
 ## ZK-057 — Conflict integration matrix
-Status: TODO  
+Status: DONE  
 Priority: P0  
 Dependencies: ZK-054, ZK-056
 
@@ -1535,9 +1535,43 @@ lost response
 repeated conflict retry
 ```
 
+Completion notes:
+- Automated the entire conflict integration matrix and M5 Gate in `apps/server/tests/conflict_integration_matrix_tests.rs` running multi-device clients with isolated SQLite storage and active vault sessions against a real HTTP server:
+  1. `body vs body` (`test_matrix_body_vs_body`):
+     - Non-overlapping body edits: diff3 auto-merges cleanly without conflict markers; candidate resolved and pushed with revision 3;
+     - Overlapping divergent body edits: diff3 detects conflict and inserts `<<<<<<< LOCAL ... >>>>>>> REMOTE` markers into candidate envelope; both local and remote contents remain recoverable in conflict records; manual resolution accepted at revision 5.
+  2. `title vs body` (`test_matrix_title_vs_body`):
+     - Client A edits title, Client B edits body; structured three-way merge automatically resolves title from remote and body from local (`is_clean() == true`); candidate pushed and accepted at revision 3; both clients converge with both updates.
+  3. `tag vs body` (`test_matrix_tag_vs_body`):
+     - Client A modifies tags, Client B edits body; structured three-way merge combines tag set changes with body edit (`is_clean() == true`); candidate pushed and accepted at revision 3.
+  4. `same edit vs same edit` (`test_matrix_same_edit_vs_same_edit`):
+     - Concurrent identical changes across title, body, and tags detected by three-way merge as identical (`is_clean() == true`), converging without divergence.
+  5. `delete vs edit` (`test_matrix_delete_vs_edit`):
+     - Client A deletes note, Client B edits offline; server strictly rejects push with 409 Conflict (`is_deleted = true`), preventing accidental resurrection (SEC-008);
+     - Tested all three resolution strategies:
+       - Accept deletion (`KeepRemote`): applies tombstone locally;
+       - Explicit resurrection (`RestoreResurrect`): enqueues retry upsert at `expected_revision = remote_revision`, accepted by server at revision 3;
+       - Duplicate as separate (`DuplicateAsSeparate`): preserves original tombstone at revision 2 and creates duplicate note at revision 1.
+  6. `lost response` (`test_matrix_lost_response`):
+     - Dropped HTTP response simulation: client resends exact same `mutation_id` (SEC-007); server idempotency handler detects existing mutation, returning original revision 1 and server sequence 1 without duplicate revision or conflict.
+  7. `repeated conflict retry` (`test_matrix_repeated_conflict_retry`):
+     - Three clients: Client B conflicts against Client A's revision 2 and prepares retry mutation; Client C preempts with revision 3; Client B retries against revision 2 and receives another 409 conflict; Client B's active conflict record updates to revision 3, preserving the local mutation; Client B re-resolves against revision 3 and successfully pushes revision 4.
+- Integrated automated M5 Gate test (`test_m5_gate_offline_concurrent_edits_full_lifecycle`):
+  - Two clients edit the same revision offline;
+  - Verified server does not overwrite silently (CAS mismatch HTTP 409);
+  - Verified both contents remain recoverable locally and in conflict records;
+  - Verified client resolves and server accepts new revision;
+  - Zero-Knowledge security audit: verified raw SQLite database bytes on server disk contains zero note plaintext titles, bodies, tags, or keys (SEC-001, SEC-002, SEC-003, SEC-009).
+- Enhanced `crates/zk-sync/src/push.rs`:
+  - Wired `record_conflict` directly into `push_pending_changes`, automatically evaluating and storing the 3-way merge candidate envelope in `ConflictRecord` during push conflict handling whenever the vault key is available in `PushOptions`.
+- Quality gates: all tests passed via `./scripts/ci.sh`.
+
 ---
 
 ### M5 Gate
+
+Status: PASSED  
+Automated verification in `apps/server/tests/conflict_integration_matrix_tests.rs::test_m5_gate_offline_concurrent_edits_full_lifecycle`.
 
 Two clients edit the same revision offline.
 
