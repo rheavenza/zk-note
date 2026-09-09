@@ -2,9 +2,11 @@
 //! and envelope encryption (XChaCha20-Poly1305) for zero-knowledge notes.
 
 pub mod error;
+pub mod kdf;
 pub mod keys;
 
 pub use error::CryptoError;
+pub use kdf::{derive_kek, KdfParams, ARGON2ID_ALGORITHM, SALT_LEN};
 pub use keys::{KeyEncryptionKey, ObjectKey, RecoveryKey, VaultKey, KEY_LEN};
 pub use zk_protocol as protocol;
 

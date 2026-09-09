@@ -266,7 +266,7 @@ Completion notes:
 ---
 
 ## ZK-011 — Argon2id KEK derivation
-Status: TODO  
+Status: DONE  
 Priority: P0  
 Dependencies: ZK-010
 
@@ -277,6 +277,14 @@ Acceptance criteria:
 - production defaults separate from test parameters;
 - known deterministic test vector exists;
 - passphrase is not retained unnecessarily.
+
+Completion notes:
+- Implemented Argon2id key derivation in `crates/zk-crypto/src/kdf.rs` deriving 256-bit `KeyEncryptionKey` from passphrase and `KdfParams`.
+- Defined `KdfParams` supporting serde JSON serialization and round-trip conversions to/from `zk_protocol::vault::KdfParams`.
+- Established separate production parameters (`64 MiB`, 3 iterations, 1 parallelism) and fast test parameters (`1 MiB`, 1 iteration, 1 parallelism).
+- Established known deterministic test vector in unit tests verifying exact byte output `007f6b258779db1c07dda5ff432b9025b66d7ec395ed9acba7939210b3ed97b8`.
+- Passphrase is taken as a borrowed slice `&[u8]` and processed directly by Argon2 without retention.
+- Validated via `./scripts/ci.sh`.
 
 ---
 

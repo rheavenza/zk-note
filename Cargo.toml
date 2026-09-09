@@ -51,3 +51,5 @@ serde_json = "1.0"
 zeroize = { version = "1.8", features = ["derive"] }
 subtle = "2.6"
 rand_core = { version = "0.6", features = ["getrandom"] }
+argon2 = "0.5"
+base64ct = { version = "1.8", features = ["alloc"] }

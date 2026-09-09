@@ -14,6 +14,12 @@ pub enum CryptoError {
     },
     /// Random number generation failed.
     RngFailure(String),
+    /// Data encoding (e.g. Base64) was malformed.
+    InvalidEncoding(String),
+    /// Cryptographic algorithm or cipher suite is unsupported.
+    UnsupportedAlgorithm(String),
+    /// Key derivation function failed.
+    KdfFailure(String),
 }
 
 impl fmt::Display for CryptoError {
@@ -26,6 +32,11 @@ impl fmt::Display for CryptoError {
                 )
             }
             Self::RngFailure(msg) => write!(f, "cryptographic RNG failure: {msg}"),
+            Self::InvalidEncoding(msg) => write!(f, "invalid encoding: {msg}"),
+            Self::UnsupportedAlgorithm(alg) => {
+                write!(f, "unsupported cryptographic algorithm: {alg}")
+            }
+            Self::KdfFailure(msg) => write!(f, "key derivation failed: {msg}"),
         }
     }
 }

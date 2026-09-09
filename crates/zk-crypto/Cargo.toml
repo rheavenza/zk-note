@@ -10,7 +10,11 @@ description = "Cryptographic primitives, KDF, key wrapping, and envelope encrypt
 workspace = true
 
 [dependencies]
+argon2 = { workspace = true }
+base64ct = { workspace = true }
 rand_core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 subtle = { workspace = true }
 zeroize = { workspace = true }
 zk-protocol = { workspace = true }
