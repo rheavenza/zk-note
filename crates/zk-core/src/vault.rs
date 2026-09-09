@@ -79,19 +79,26 @@ impl VaultManager {
     }
 }
 
-/// In-memory vault session tracking the active, unlocked [`VaultKey`].
+use crate::search::InMemorySearchIndex;
+
+/// In-memory vault session tracking the active, unlocked [`VaultKey`] and volatile search index.
 ///
-/// When dropped or explicitly locked, the active key is removed and its memory scrubbed.
+/// When dropped or explicitly locked, the active key is removed and its memory scrubbed,
+/// and any decrypted in-memory search index is wiped.
 #[derive(Default, Debug)]
 pub struct VaultSession {
     active_key: Option<VaultKey>,
+    search_index: Option<InMemorySearchIndex>,
 }
 
 impl VaultSession {
     /// Creates an empty (locked) session.
     #[must_use]
     pub fn new() -> Self {
-        Self { active_key: None }
+        Self {
+            active_key: None,
+            search_index: None,
+        }
     }
 
     /// Creates an unlocked session with the provided [`VaultKey`].
@@ -99,17 +106,22 @@ impl VaultSession {
     pub fn from_key(key: VaultKey) -> Self {
         Self {
             active_key: Some(key),
+            search_index: Some(InMemorySearchIndex::new()),
         }
     }
 
     /// Unlocks the session with the provided [`VaultKey`].
     pub fn unlock(&mut self, key: VaultKey) {
         self.active_key = Some(key);
+        self.search_index = Some(InMemorySearchIndex::new());
     }
 
-    /// Locks the session and zeroes the active [`VaultKey`] from memory.
+    /// Locks the session and zeroes the active [`VaultKey`] and volatile search index from memory.
     pub fn lock(&mut self) {
         self.active_key = None;
+        if let Some(mut idx) = self.search_index.take() {
+            idx.clear();
+        }
     }
 
     /// Returns `true` if the session is currently unlocked.
@@ -121,6 +133,16 @@ impl VaultSession {
     /// Returns a reference to the active [`VaultKey`] if unlocked, or [`CoreError::VaultLocked`].
     pub fn active_key(&self) -> Result<&VaultKey, CoreError> {
         self.active_key.as_ref().ok_or(CoreError::VaultLocked)
+    }
+
+    /// Returns a reference to the active in-memory search index if unlocked, or [`CoreError::VaultLocked`].
+    pub fn search_index(&self) -> Result<&InMemorySearchIndex, CoreError> {
+        self.search_index.as_ref().ok_or(CoreError::VaultLocked)
+    }
+
+    /// Returns a mutable reference to the active in-memory search index if unlocked, or [`CoreError::VaultLocked`].
+    pub fn search_index_mut(&mut self) -> Result<&mut InMemorySearchIndex, CoreError> {
+        self.search_index.as_mut().ok_or(CoreError::VaultLocked)
     }
 }
 
@@ -190,13 +212,25 @@ mod tests {
 
         assert!(!session.is_unlocked());
         assert_eq!(session.active_key().unwrap_err(), CoreError::VaultLocked);
+        assert_eq!(session.search_index().unwrap_err(), CoreError::VaultLocked);
 
         session.unlock(key.clone());
         assert!(session.is_unlocked());
         assert_eq!(session.active_key().expect("active"), &key);
+        assert!(session.search_index().expect("index").is_empty());
+
+        session.search_index_mut().expect("index_mut").insert_raw(
+            "n1".to_string(),
+            "Title".to_string(),
+            vec![],
+            "Body".to_string(),
+            "2026-09-09T00:00:00Z".to_string(),
+        );
+        assert_eq!(session.search_index().expect("index").len(), 1);
 
         session.lock();
         assert!(!session.is_unlocked());
         assert_eq!(session.active_key().unwrap_err(), CoreError::VaultLocked);
+        assert_eq!(session.search_index().unwrap_err(), CoreError::VaultLocked);
     }
 }

@@ -676,7 +676,7 @@ Completion notes:
 ---
 
 ## ZK-027 — Local search
-Status: TODO  
+Status: DONE  
 Priority: P1  
 Dependencies: ZK-024
 
@@ -686,6 +686,25 @@ Acceptance criteria:
 - search operates only while unlocked;
 - persistent DB has no plaintext index;
 - lock clears in-memory index.
+
+Completion notes:
+- Implemented `InMemorySearchIndex` in `crates/zk-core/src/search.rs` supporting:
+  - Multi-field search over note titles, tags, and bodies with relevance scoring and tie-breaking by `updated_at` descending.
+  - Multi-term queries with AND semantics across fields.
+  - Case-insensitive matching and explicit `#tag` syntax for targeted tag filtering.
+  - Contextual snippet extraction around matched terms in note bodies with clean boundary trimming.
+  - Volatile memory scrubbing via `Zeroize` and `ZeroizeOnDrop` on `IndexedNote` and `InMemorySearchIndex::clear`.
+- Integrated `search_index` into `VaultSession` in `crates/zk-core/src/vault.rs`:
+  - `session.search_index()` and `session.search_index_mut()` provide index access while unlocked, returning `Err(CoreError::VaultLocked)` when locked.
+  - `session.lock()` automatically clears and zeroes the in-memory search index.
+- Implemented `cmd_search` in `apps/cli/src/commands.rs` and added `zk-note search <query> [--json]` subcommand in `apps/cli/src/main.rs`.
+- Added comprehensive unit tests in `crates/zk-core/src/search.rs`, `crates/zk-core/src/vault.rs`, and `apps/cli/src/main.rs` covering:
+  - Title, body, tag, `#tag`, multi-term AND matching, case-insensitivity, and empty queries.
+  - Fail-closed behavior (`CliError::VaultLocked`) when search is attempted while vault is locked.
+  - Tombstone exclusion (deleted notes are excluded from search results).
+  - Memory scrubbing on index clear and vault lock.
+  - Persistent SQLite inspection verifying no plaintext tokens or search tables (`fts%`, `index`, `search`) exist in the database file.
+- Validated via `./scripts/ci.sh`.
 
 ---
 

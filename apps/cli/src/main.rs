@@ -8,8 +8,8 @@ mod session;
 
 use clap::{Parser, Subcommand};
 use commands::{
-    cmd_delete, cmd_edit, cmd_history, cmd_init, cmd_list, cmd_lock, cmd_new, cmd_show, cmd_status,
-    cmd_unlock,
+    cmd_delete, cmd_edit, cmd_history, cmd_init, cmd_list, cmd_lock, cmd_new, cmd_search, cmd_show,
+    cmd_status, cmd_unlock,
 };
 use error::CliError;
 use std::path::PathBuf;
@@ -103,6 +103,15 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Search notes by title, body, or tag (requires unlocked vault)
+    Search {
+        /// Search query terms
+        query: String,
+
+        /// Output results in raw JSON format
+        #[arg(long)]
+        json: bool,
+    },
     /// Delete a note (creates a revisioned tombstone)
     Delete {
         /// Note identifier (or unique prefix)
@@ -172,6 +181,10 @@ fn run() -> Result<(), CliError> {
         }
         Commands::Show { note_id, json } => {
             cmd_show(data_dir, &note_id, json)?;
+            Ok(())
+        }
+        Commands::Search { query, json } => {
+            cmd_search(data_dir, &query, json)?;
             Ok(())
         }
         Commands::Delete { note_id, purge } => {
@@ -922,6 +935,191 @@ mod tests {
             "plaintext edited body found in raw SQLite file"
         );
 
+        let _ = fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn test_cli_search_title_body_and_tags() {
+        let test_dir = temp_test_dir("search_lifecycle");
+        let dir_path = test_dir.as_path();
+        let pass = "search-test-pass".to_string();
+
+        cmd_init(Some(dir_path), Some(pass), true).expect("init");
+
+        // 1. Create Note A
+        let note_a_id = cmd_new(
+            Some(dir_path),
+            Some("Project Roadmap".to_string()),
+            Some("Rust-based architecture with offline sync and local caching.".to_string()),
+            vec!["work".to_string(), "roadmap".to_string()],
+        )
+        .expect("create note A");
+
+        // 2. Create Note B
+        let note_b_id = cmd_new(
+            Some(dir_path),
+            Some("Weekly Groceries".to_string()),
+            Some("Buy green tea, oat milk, and dark chocolate.".to_string()),
+            vec!["personal".to_string()],
+        )
+        .expect("create note B");
+
+        // 3. Create Note C
+        let note_c_id = cmd_new(
+            Some(dir_path),
+            Some("Cryptographic Invariants".to_string()),
+            Some("Zero-knowledge server stores only ciphertext payloads.".to_string()),
+            vec!["security".to_string(), "crypto".to_string()],
+        )
+        .expect("create note C");
+
+        // 4. Search by title
+        let results_roadmap = cmd_search(Some(dir_path), "Roadmap", false).expect("search roadmap");
+        assert_eq!(results_roadmap.len(), 1);
+        assert_eq!(results_roadmap[0].id, note_a_id);
+        assert_eq!(results_roadmap[0].title, "Project Roadmap");
+
+        // 5. Search by body content with snippet
+        let results_chocolate =
+            cmd_search(Some(dir_path), "chocolate", false).expect("search chocolate");
+        assert_eq!(results_chocolate.len(), 1);
+        assert_eq!(results_chocolate[0].id, note_b_id);
+        assert!(results_chocolate[0].snippet.contains("chocolate"));
+
+        // 6. Search by tag
+        let results_crypto = cmd_search(Some(dir_path), "crypto", false).expect("search crypto");
+        assert_eq!(results_crypto.len(), 1);
+        assert_eq!(results_crypto[0].id, note_c_id);
+
+        // 7. Search by explicit #tag syntax
+        let results_hash_personal =
+            cmd_search(Some(dir_path), "#personal", false).expect("search #personal");
+        assert_eq!(results_hash_personal.len(), 1);
+        assert_eq!(results_hash_personal[0].id, note_b_id);
+
+        // 8. Multi-term query (AND semantics across fields)
+        let results_multi =
+            cmd_search(Some(dir_path), "rust architecture", false).expect("search multi");
+        assert_eq!(results_multi.len(), 1);
+        assert_eq!(results_multi[0].id, note_a_id);
+
+        // 9. Case-insensitive search
+        let results_case =
+            cmd_search(Some(dir_path), "zErO-kNoWlEdGe", false).expect("search case");
+        assert_eq!(results_case.len(), 1);
+        assert_eq!(results_case[0].id, note_c_id);
+
+        // 10. Non-matching query returns empty
+        let results_none =
+            cmd_search(Some(dir_path), "nonexistenttoken", false).expect("search none");
+        assert!(results_none.is_empty());
+
+        // 11. Deleted / tombstoned notes are excluded from search results
+        cmd_delete(Some(dir_path), &note_a_id, false).expect("delete note A");
+        let results_after_delete =
+            cmd_search(Some(dir_path), "Roadmap", false).expect("search after delete");
+        assert!(results_after_delete.is_empty());
+
+        let _ = fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn test_cli_search_fails_closed_when_locked() {
+        let test_dir = temp_test_dir("search_locked");
+        let dir_path = test_dir.as_path();
+        let pass = "locked-search-pass".to_string();
+
+        cmd_init(Some(dir_path), Some(pass), true).expect("init");
+
+        cmd_new(
+            Some(dir_path),
+            Some("Secret Note".to_string()),
+            Some("Secret content".to_string()),
+            vec![],
+        )
+        .expect("create");
+
+        // Lock vault
+        cmd_lock(Some(dir_path)).expect("lock");
+
+        // Search while locked must fail closed
+        let locked_err = cmd_search(Some(dir_path), "Secret", false).unwrap_err();
+        match locked_err {
+            CliError::VaultLocked => (),
+            other => panic!("expected VaultLocked error, got {other:?}"),
+        }
+
+        let _ = fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn test_cli_search_persistent_db_has_no_plaintext_index() {
+        let test_dir = temp_test_dir("search_db_no_plaintext");
+        let dir_path = test_dir.as_path();
+        let pass = "db-plaintext-pass".to_string();
+
+        cmd_init(Some(dir_path), Some(pass), true).expect("init");
+
+        let unique_term = "INDEX_SEARCH_TOKEN_99999";
+        let unique_title = "TITLE_FOR_SEARCH_88888";
+
+        cmd_new(
+            Some(dir_path),
+            Some(unique_title.to_string()),
+            Some(format!("Body containing {unique_term} strictly in memory.")),
+            vec!["indexed-tag".to_string()],
+        )
+        .expect("create note");
+
+        // Execute searches while unlocked
+        let res1 = cmd_search(Some(dir_path), unique_term, false).expect("search term");
+        assert_eq!(res1.len(), 1);
+
+        let res2 = cmd_search(Some(dir_path), unique_title, false).expect("search title");
+        assert_eq!(res2.len(), 1);
+
+        // Lock vault to cleanly close session
+        cmd_lock(Some(dir_path)).expect("lock");
+
+        // Inspect raw SQLite file bytes
+        let db_path = config::db_file(dir_path);
+        let raw_db_bytes = fs::read(&db_path).expect("read db");
+        let raw_db_str = String::from_utf8_lossy(&raw_db_bytes);
+
+        assert!(
+            !raw_db_str.contains(unique_term),
+            "search query/body token found in persistent database file"
+        );
+        assert!(
+            !raw_db_str.contains(unique_title),
+            "search title token found in persistent database file"
+        );
+
+        // Verify SQLite tables: no plaintext FTS or index tables exist
+        let storage = zk_storage::SqliteStorage::open(&db_path).expect("open sqlite");
+        let tables: Vec<String> = {
+            // Check table names in sqlite_master
+            let conn = rusqlite::Connection::open(&db_path).expect("open raw sqlite");
+            let mut stmt = conn
+                .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%';")
+                .expect("prepare");
+            let rows = stmt
+                .query_map([], |r| r.get(0))
+                .expect("query")
+                .collect::<Result<Vec<String>, _>>()
+                .expect("collect");
+            rows
+        };
+
+        // Allowed tables: local_objects, encrypted_base_versions, pending_mutations, sync_state
+        for t in &tables {
+            assert!(
+                !t.contains("fts") && !t.contains("search") && !t.contains("index"),
+                "unexpected plaintext search table found in database: {t}"
+            );
+        }
+
+        let _ = storage;
         let _ = fs::remove_dir_all(&test_dir);
     }
 }

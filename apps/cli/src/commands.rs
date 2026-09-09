@@ -1,5 +1,5 @@
 //! Command execution implementations for `zk-note init`, `unlock`, `lock`, `status`,
-//! `new`, `edit`, `show`, `delete`, `history`, and `list`.
+//! `new`, `edit`, `show`, `search`, `delete`, `history`, and `list`.
 
 use crate::config::{db_file, resolve_data_dir, session_file, vault_file};
 use crate::edit::{note_to_edit_buffer, parse_edit_buffer, run_editor, TempFileGuard};
@@ -9,6 +9,7 @@ use serde::Serialize;
 use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::Path;
 use zk_core::note::{NoteBuilder, PlaintextNote};
+use zk_core::search::{InMemorySearchIndex, SearchResult};
 use zk_core::time::now_utc_rfc3339;
 use zk_core::vault::VaultManager;
 use zk_crypto::kdf::KdfParams;
@@ -414,6 +415,80 @@ pub fn cmd_show(
     }
 
     Ok(note)
+}
+
+/// Searches notes across title, body, and tags using volatile in-memory indexing while unlocked.
+pub fn cmd_search(
+    custom_data_dir: Option<&Path>,
+    query: &str,
+    json_output: bool,
+) -> Result<Vec<SearchResult>, CliError> {
+    let data_dir = resolve_data_dir(custom_data_dir);
+    let vault_path = vault_file(&data_dir);
+    let db_path = db_file(&data_dir);
+    let sess_path = session_file(&data_dir);
+
+    if !vault_path.exists() {
+        return Err(CliError::VaultUninitialized);
+    }
+
+    // Must be unlocked to decrypt note contents into volatile memory index
+    let vault_key = load_session_key(&sess_path)?;
+
+    let storage = SqliteStorage::open(&db_path)?;
+    // List only active (non-tombstoned) notes
+    let stored_objects = storage.list_objects(&ObjectFilter::for_kind(OBJECT_KIND_NOTE))?;
+
+    let mut index = InMemorySearchIndex::new();
+    for stored in stored_objects {
+        if stored.is_deleted {
+            continue;
+        }
+
+        let note = PlaintextNote::decrypt(&stored.envelope, &vault_key)?;
+        index.insert(&stored.object_id, &note);
+    }
+
+    let results = index.search(query);
+
+    if json_output {
+        let json = serde_json::to_string_pretty(&results)
+            .map_err(|e| CliError::Io(format!("serialize search json: {e}")))?;
+        println!("{json}");
+    } else if results.is_empty() {
+        println!("No notes matched query: \"{query}\"");
+    } else {
+        println!(
+            "Found {} matching note(s) for \"{}\":",
+            results.len(),
+            query
+        );
+        println!("{:<36}  {:<24}  {:<20}  TITLE", "ID", "UPDATED", "TAGS");
+        println!("{}", "-".repeat(95));
+        for r in &results {
+            let tags_str = if r.tags.is_empty() {
+                "-".to_string()
+            } else {
+                format!("[{}]", r.tags.join(", "))
+            };
+            println!(
+                "{:<36}  {:<24}  {:<20}  {}",
+                r.id,
+                r.updated_at,
+                if tags_str.len() > 20 {
+                    format!("{}...", &tags_str[..17])
+                } else {
+                    tags_str
+                },
+                r.title
+            );
+            if !r.snippet.is_empty() {
+                println!("    snippet: {}", r.snippet);
+            }
+        }
+    }
+
+    Ok(results)
 }
 
 /// Edits an existing note using $EDITOR or programmatic overrides.
