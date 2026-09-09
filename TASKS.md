@@ -127,7 +127,7 @@ Completion notes:
 ---
 
 ## ZK-004 — Create protocol ADR
-Status: TODO  
+Status: DONE  
 Priority: P0  
 Dependencies: ZK-001
 
@@ -145,6 +145,13 @@ Acceptance criteria:
 
 - ADR exists;
 - protocol v1 constants defined in `zk-protocol`.
+
+Completion notes:
+- Created ADR-0002 (`docs/adr/0002-protocol-v1-foundation.md`) documenting protocol and envelope versioning, object IDs, object kinds, compare-and-swap revisions, server sequence monotonicity, mutation idempotency, cursor durable advance semantics, and tombstone deletion.
+- Defined protocol V1 constants in `crates/zk-protocol/src/constants.rs` (`PROTOCOL_VERSION_V1`, `ENVELOPE_VERSION_V1`, `INITIAL_EXPECTED_REVISION`, `INITIAL_OBJECT_REVISION`, `INITIAL_SERVER_SEQ`, `INITIAL_SYNC_CURSOR`, object kinds, and standard error strings).
+- Implemented `ObjectKind` enum with conversions in `crates/zk-protocol/src/kind.rs`.
+- Added unit tests in `crates/zk-protocol` covering constant values, round-trip kind conversions, unknown kind rejection, and error constants.
+- Verified via `./scripts/ci.sh`.
 
 ---
 
