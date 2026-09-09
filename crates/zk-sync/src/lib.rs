@@ -4,6 +4,7 @@
 pub mod adapter;
 pub mod cursor;
 pub mod error;
+pub mod merge;
 pub mod orchestrator;
 pub mod pull;
 pub mod push;
@@ -14,6 +15,10 @@ pub use adapter::{
 };
 pub use cursor::{CursorError, DurableSyncCursor};
 pub use error::SyncNetworkError;
+pub use merge::{
+    merge_attachments, merge_scalar_field, merge_tags, three_way_merge_note, FieldConflict,
+    FieldMergeStatus, NoteMergeOutcome,
+};
 pub use orchestrator::{
     run_sync_cycle, run_sync_cycle_with_session, SyncCycleError, SyncCycleOptions, SyncCycleReport,
     SyncEngine,

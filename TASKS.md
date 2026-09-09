@@ -1310,7 +1310,7 @@ Completion notes:
 ---
 
 ## ZK-051 — Structured three-way merge engine
-Status: TODO  
+Status: DONE  
 Priority: P0  
 Dependencies: ZK-020, ZK-050
 
@@ -1320,6 +1320,16 @@ Acceptance criteria:
 - identical concurrent changes;
 - divergent scalar changes reported as conflict;
 - deterministic tag merge.
+
+Completion notes:
+- Implemented structured three-way merge engine in `crates/zk-sync/src/merge.rs` conforming to MASTER_SPEC.md § 10.2:
+  - `merge_scalar_field` handles unchanged, local-only, remote-only, identical concurrent, and divergent conflict cases for scalar fields;
+  - `merge_tags` implements deterministic set-based three-way merge (canonicalizing, deduplicating, and sorting lexicographically);
+  - `merge_attachments` implements stable ID three-way merge;
+  - `three_way_merge_note` coordinates complete note merge producing `NoteMergeOutcome`, containing merged candidate and explicit `FieldConflict`s (`Title`, `Body`, `Attachments`).
+- Re-exported merge types in `crates/zk-sync/src/lib.rs`.
+- Added unit tests in `merge.rs` and comprehensive integration test suite in `crates/zk-sync/tests/structured_three_way_merge_tests.rs`.
+- Verified via `./scripts/ci.sh`.
 
 ---
 
