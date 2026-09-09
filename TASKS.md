@@ -1040,7 +1040,7 @@ Completion notes:
 ---
 
 ## ZK-038 — Authorization isolation tests
-Status: TODO  
+Status: DONE  
 Priority: P0  
 Dependencies: ZK-032, ZK-036
 
@@ -1049,6 +1049,17 @@ Acceptance criteria:
 - account A cannot fetch/mutate B objects;
 - guessed object IDs do not bypass ownership;
 - history access isolated.
+
+Completion notes:
+- Implemented integration test suite `apps/server/tests/server_authorization_isolation_tests.rs` rigorously verifying zero-knowledge cross-account authorization and data boundaries (SEC-001, SEC-002, SEC-003):
+  - Verified Account A cannot mutate or delete Account B objects: attempting update or delete on an object ID owned by Account B returns HTTP 404 `OBJECT_NOT_FOUND` without leaking object existence, current revision, or ciphertext;
+  - Verified guessed object IDs do not bypass ownership: probing with arbitrary expected revisions returns 404 NOT FOUND without conflict metadata leakage; creating with `expected_revision = 0` creates an isolated record scoped to `(account_a, object_id)` while Account B's record `(account_b, object_id)` remains completely untouched;
+  - Verified history access is strictly isolated: Account A querying history for Account B's object ID returns an empty list with zero visibility into B's historical revisions;
+  - Verified sync pull stream isolation: concurrent pulls across multiple accounts return strictly account-scoped objects with independent monotonic sequence counters;
+  - Verified vault bootstrap isolation: Account A cannot read Account B's bootstrap metadata (returns 404 NOT FOUND);
+  - Verified unauthenticated requests fail closed with HTTP 401 `AUTH_REQUIRED`.
+- Satisfied M3 Gate requirements: CAS compare-and-swap, mutation idempotency, monotonic server sequences, cross-account authorization isolation, tombstone behavior, and history preservation are all proven by integration tests.
+- All quality gates passed via `./scripts/ci.sh` (formatting, clippy `-D warnings`, dependency check, and all 183 workspace tests).
 
 ---
 
