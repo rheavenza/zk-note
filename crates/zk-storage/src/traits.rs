@@ -119,3 +119,126 @@ impl<T> LocalStorage for T where
     T: ObjectStore + MutationStore + BaseVersionStore + SyncStateStore + Send + Sync
 {
 }
+
+use std::sync::Arc;
+
+impl<T: ObjectStore + ?Sized> ObjectStore for Arc<T> {
+    fn get_object(&self, object_id: &str) -> Result<Option<StoredEncryptedObject>, StorageError> {
+        (**self).get_object(object_id)
+    }
+
+    fn put_object(&self, object: &StoredEncryptedObject) -> Result<(), StorageError> {
+        (**self).put_object(object)
+    }
+
+    fn list_objects(
+        &self,
+        filter: &ObjectFilter,
+    ) -> Result<Vec<StoredEncryptedObject>, StorageError> {
+        (**self).list_objects(filter)
+    }
+
+    fn mark_deleted(
+        &self,
+        object_id: &str,
+        revision: u64,
+        envelope: EncryptedEnvelope,
+        updated_at: String,
+    ) -> Result<(), StorageError> {
+        (**self).mark_deleted(object_id, revision, envelope, updated_at)
+    }
+
+    fn purge_object(&self, object_id: &str) -> Result<bool, StorageError> {
+        (**self).purge_object(object_id)
+    }
+}
+
+impl<T: MutationStore + ?Sized> MutationStore for Arc<T> {
+    fn enqueue_mutation(&self, mutation: &PendingMutation) -> Result<(), StorageError> {
+        (**self).enqueue_mutation(mutation)
+    }
+
+    fn get_mutation(&self, mutation_id: &str) -> Result<Option<PendingMutation>, StorageError> {
+        (**self).get_mutation(mutation_id)
+    }
+
+    fn list_pending_mutations(&self) -> Result<Vec<PendingMutation>, StorageError> {
+        (**self).list_pending_mutations()
+    }
+
+    fn list_mutations_for_object(
+        &self,
+        object_id: &str,
+    ) -> Result<Vec<PendingMutation>, StorageError> {
+        (**self).list_mutations_for_object(object_id)
+    }
+
+    fn remove_mutation(&self, mutation_id: &str) -> Result<bool, StorageError> {
+        (**self).remove_mutation(mutation_id)
+    }
+
+    fn update_mutation_status(
+        &self,
+        mutation_id: &str,
+        status: crate::models::MutationStatus,
+        retry_count: u32,
+    ) -> Result<(), StorageError> {
+        (**self).update_mutation_status(mutation_id, status, retry_count)
+    }
+
+    fn pending_mutation_count(&self) -> Result<usize, StorageError> {
+        (**self).pending_mutation_count()
+    }
+}
+
+impl<T: BaseVersionStore + ?Sized> BaseVersionStore for Arc<T> {
+    fn get_base_version(
+        &self,
+        object_id: &str,
+        revision: u64,
+    ) -> Result<Option<EncryptedEnvelope>, StorageError> {
+        (**self).get_base_version(object_id, revision)
+    }
+
+    fn put_base_version(
+        &self,
+        object_id: &str,
+        revision: u64,
+        envelope: &EncryptedEnvelope,
+    ) -> Result<(), StorageError> {
+        (**self).put_base_version(object_id, revision, envelope)
+    }
+
+    fn prune_base_versions(
+        &self,
+        object_id: &str,
+        older_than_revision: u64,
+    ) -> Result<usize, StorageError> {
+        (**self).prune_base_versions(object_id, older_than_revision)
+    }
+
+    fn clear_base_versions(&self, object_id: &str) -> Result<usize, StorageError> {
+        (**self).clear_base_versions(object_id)
+    }
+
+    fn list_base_versions(
+        &self,
+        object_id: &str,
+    ) -> Result<Vec<(u64, EncryptedEnvelope)>, StorageError> {
+        (**self).list_base_versions(object_id)
+    }
+}
+
+impl<T: SyncStateStore + ?Sized> SyncStateStore for Arc<T> {
+    fn get_sync_state(&self) -> Result<SyncState, StorageError> {
+        (**self).get_sync_state()
+    }
+
+    fn set_sync_cursor(&self, cursor: u64) -> Result<(), StorageError> {
+        (**self).set_sync_cursor(cursor)
+    }
+
+    fn set_sync_state(&self, state: &SyncState) -> Result<(), StorageError> {
+        (**self).set_sync_state(state)
+    }
+}

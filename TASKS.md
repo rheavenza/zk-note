@@ -1128,7 +1128,7 @@ Completion notes:
 ---
 
 ## ZK-042 — Durable sync cursor
-Status: TODO  
+Status: DONE  
 Priority: P0  
 Dependencies: ZK-021, ZK-036
 
@@ -1136,6 +1136,18 @@ Acceptance criteria:
 
 - cursor advances only after local durable application;
 - crash simulation does not skip remote changes.
+
+Completion notes:
+- Implemented `DurableSyncCursor` in `crates/zk-sync/src/cursor.rs` wrapping persistent storage implementing `SyncStateStore`.
+- Implemented strict monotonic cursor advancement and regression rejection (`CursorError::Regression`).
+- Implemented `apply_change` and `apply_changes_sequential` enforcing that the persistent `sync_cursor` advances ONLY AFTER the remote encrypted object is durably written to `ObjectStore`. If a local write fails, the cursor remains at the last committed sequence.
+- Added blanket implementations for `Arc<T>` across all storage traits in `crates/zk-storage/src/traits.rs` to allow safe multi-component sharing.
+- Added comprehensive unit tests and integration tests in `crates/zk-sync/tests/durable_sync_cursor_tests.rs` verifying:
+  - Cursor advances only after durable write;
+  - Mid-stream failure stops cursor advancement without corrupting earlier writes;
+  - Scenario E crash simulation with real SQLite disk storage: process crash during pull leaves cursor at last durable sequence (97), restart re-fetches uncommitted changes (98..100) without skipping remote changes;
+  - Monotonicity checks and explicit resync reset.
+- Validated via `./scripts/ci.sh` (cargo fmt, clippy with `-D warnings`, cargo test --workspace).
 
 ---
 

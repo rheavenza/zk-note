@@ -2,12 +2,14 @@
 //! conflict detection, and deterministic three-way merge logic.
 
 pub mod adapter;
+pub mod cursor;
 pub mod error;
 pub mod queue;
 
 pub use adapter::{
     validate_no_plaintext_secrets, MockSyncAdapter, NativeHttpSyncAdapter, SyncServerAdapter,
 };
+pub use cursor::{CursorError, DurableSyncCursor};
 pub use error::SyncNetworkError;
 pub use queue::{PendingMutationQueue, QueueError};
 pub use zk_core as core;
