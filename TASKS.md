@@ -85,7 +85,7 @@ Completion notes:
 ---
 
 ## ZK-002 — Add baseline CI
-Status: TODO  
+Status: DONE  
 Priority: P0  
 Dependencies: ZK-001
 
@@ -96,6 +96,12 @@ Acceptance criteria:
 - workspace tests;
 - dependency lockfile committed;
 - CI fails on test/build failure.
+
+Completion notes:
+- Added GitHub Actions workflow `.github/workflows/ci.yml` running format checks (`cargo fmt --check`), clippy (`cargo clippy --workspace --all-targets --all-features -- -D warnings`), locked dependency verification (`cargo check --workspace --locked`), workspace build, and test suite.
+- Added executable local script `scripts/ci.sh` for running the exact CI gates locally.
+- Verified that `Cargo.lock` is tracked and committed.
+- Confirmed that build/test/lint failures produce non-zero exit codes that fail CI.
 
 ---
 
