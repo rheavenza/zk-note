@@ -188,7 +188,11 @@ where
     .await?;
 
     // Step 5, 6, 7: PUSH pending mutations (CAS checked, accepted cleared, conflicts retained)
-    let push_report = push_pending_changes(adapter, queue, options.push_options.clone()).await?;
+    let mut push_options = options.push_options.clone();
+    if push_options.vault_key.is_none() {
+        push_options.vault_key = vault_key.cloned();
+    }
+    let push_report = push_pending_changes(adapter, queue, push_options).await?;
 
     // Step 8: Follow-up PULL if pushes produced remote-visible sequences
     let followup_pull = if !push_report.accepted.is_empty() || options.always_followup_pull {
@@ -254,7 +258,13 @@ where
     .await?;
 
     // Step 5, 6, 7: PUSH pending mutations (CAS checked, accepted cleared, conflicts retained)
-    let push_report = push_pending_changes(adapter, queue, options.push_options.clone()).await?;
+    let mut push_options = options.push_options.clone();
+    if push_options.vault_key.is_none() {
+        if let Ok(key) = session.active_key() {
+            push_options.vault_key = Some(key.clone());
+        }
+    }
+    let push_report = push_pending_changes(adapter, queue, push_options).await?;
 
     // Step 8: Follow-up PULL if pushes produced remote-visible sequences
     let followup_pull = if !push_report.accepted.is_empty() || options.always_followup_pull {

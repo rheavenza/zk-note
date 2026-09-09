@@ -9,11 +9,13 @@
 //!   for three-way merge resolution (no silent data loss).
 
 use crate::adapter::SyncServerAdapter;
+use crate::conflict::{evaluate_guarded_lww, ConflictPolicy, GuardedLwwOutcome};
 use crate::error::SyncNetworkError;
 use crate::queue::{PendingMutationQueue, QueueError};
 use std::fmt;
 use uuid::Uuid;
 use zk_core::time::now_utc_rfc3339;
+use zk_crypto::keys::VaultKey;
 use zk_protocol::sync::{ConflictResponse, PushRequest};
 use zk_storage::error::StorageError;
 use zk_storage::models::{ConflictRecord, MutationStatus, MutationType, PendingMutation};
@@ -26,6 +28,10 @@ pub struct PushOptions {
     pub max_mutations: Option<usize>,
     /// Whether to halt the push cycle immediately if a conflict is encountered.
     pub stop_on_conflict: bool,
+    /// Conflict resolution policy to apply upon receiving a revision conflict (defaults to Manual).
+    pub conflict_policy: ConflictPolicy,
+    /// Optional VaultKey for inspecting note timestamps during Guarded LWW resolution.
+    pub vault_key: Option<VaultKey>,
 }
 
 /// A successfully accepted mutation record.
@@ -59,6 +65,8 @@ pub struct PushReport {
     pub accepted: Vec<PushItemSuccess>,
     /// Mutations rejected due to revision conflicts, retained for resolution.
     pub conflicts: Vec<PushItemConflict>,
+    /// Conflicts automatically resolved via Guarded LWW.
+    pub lww_resolved: Vec<GuardedLwwOutcome>,
     /// Mutations that failed due to transient network issues, retained for retry.
     pub transient_failures: usize,
 }
@@ -177,36 +185,47 @@ where
                 });
             }
             Err(SyncNetworkError::Conflict(conflict)) => {
-                // Requirement 4: conflict leaves local mutation recoverable
-                // Reset status to Pending (or keep in queue) so local edits are NOT discarded
-                let _ = queue.mark_pending(&mutation.mutation_id);
+                if options.conflict_policy == ConflictPolicy::GuardedLww {
+                    // Guarded Last-Write-Wins: automatically resolve winner, preserving losing revision
+                    let outcome = evaluate_guarded_lww(
+                        queue.storage(),
+                        queue,
+                        &mutation,
+                        &conflict,
+                        options.vault_key.as_ref(),
+                    )?;
+                    report.lww_resolved.push(outcome);
+                } else {
+                    // Default V1: preserve conflict and leave local mutation recoverable
+                    let _ = queue.mark_pending(&mutation.mutation_id);
 
-                let base_envelope = queue
-                    .storage()
-                    .get_base_version(&mutation.object_id, mutation.expected_revision)
-                    .unwrap_or(None);
+                    let base_envelope = queue
+                        .storage()
+                        .get_base_version(&mutation.object_id, mutation.expected_revision)
+                        .unwrap_or(None);
 
-                let conflict_record = ConflictRecord::new(
-                    Uuid::new_v4().to_string(),
-                    &mutation.object_id,
-                    mutation.object_kind,
-                    mutation.expected_revision,
-                    conflict.current_revision,
-                    base_envelope,
-                    mutation.envelope.clone(),
-                    conflict.current_envelope.clone(),
-                    None,
-                    now_utc_rfc3339(),
-                );
-                let _ = queue.storage().put_conflict(&conflict_record);
+                    let conflict_record = ConflictRecord::new(
+                        Uuid::new_v4().to_string(),
+                        &mutation.object_id,
+                        mutation.object_kind,
+                        mutation.expected_revision,
+                        conflict.current_revision,
+                        base_envelope,
+                        mutation.envelope.clone(),
+                        conflict.current_envelope.clone(),
+                        None,
+                        now_utc_rfc3339(),
+                    );
+                    let _ = queue.storage().put_conflict(&conflict_record);
 
-                report.conflicts.push(PushItemConflict {
-                    mutation,
-                    conflict: *conflict,
-                });
+                    report.conflicts.push(PushItemConflict {
+                        mutation,
+                        conflict: *conflict,
+                    });
 
-                if options.stop_on_conflict {
-                    break;
+                    if options.stop_on_conflict {
+                        break;
+                    }
                 }
             }
             Err(SyncNetworkError::ConnectionFailed(_))

@@ -16,8 +16,9 @@ pub use adapter::{
     validate_no_plaintext_secrets, MockSyncAdapter, NativeHttpSyncAdapter, SyncServerAdapter,
 };
 pub use conflict::{
-    generate_merge_candidate, record_conflict, resolve_conflict, ConflictResolutionResult,
-    ConflictResolutionStrategy,
+    evaluate_guarded_lww, generate_merge_candidate, record_conflict, resolve_conflict,
+    ConflictPolicy, ConflictResolutionResult, ConflictResolutionStrategy, GuardedLwwOutcome,
+    LwwWinner,
 };
 pub use cursor::{CursorError, DurableSyncCursor};
 pub use diff3::{diff3_merge, BodyConflict, Diff3Result};

@@ -1446,7 +1446,7 @@ Completion notes:
 ---
 
 ## ZK-055 — Guarded LWW policy option
-Status: TODO  
+Status: DONE  
 Priority: P2  
 Dependencies: ZK-053, ZK-028
 
@@ -1458,6 +1458,23 @@ Acceptance criteria:
 - CAS remains enforced.
 
 Do not enable by default in V1 without explicit product decision.
+
+Completion notes:
+- Authored ADR 0005 (`docs/adr/0005-guarded-lww-policy.md`) documenting Guarded Last-Write-Wins (LWW) policy context, invariants, non-default opt-in model, and zero-knowledge preservation.
+- Implemented `ConflictPolicy` enum (`Manual` [default], `GuardedLww`), `LwwWinner`, `GuardedLwwOutcome`, and `evaluate_guarded_lww` in `crates/zk-sync/src/conflict.rs`.
+- Enforced `ConflictPolicy::Manual` as the default in `PushOptions` and `ConflictPolicy::default()`, guaranteeing Guarded LWW is not enabled by default in V1 without an explicit opt-in product decision.
+- Implemented visible head update and lossless recovery:
+  - When Local wins: local version becomes visible head in `ObjectStore`, losing remote version is archived in `BaseVersionStore` at `remote_revision`, and a retry mutation is enqueued with `expected_revision = remote_revision` to satisfy server CAS.
+  - When Remote wins: remote version becomes visible head in `ObjectStore`, losing local version is archived in `BaseVersionStore`, and stale local mutation is removed from the queue.
+  - Resolved `ConflictRecord` is persisted in `ConflictStore` for auditability in both cases.
+- Integrated `ConflictPolicy` and `vault_key` into `PushOptions`, `push_pending_changes`, and orchestrator sync cycles (`run_sync_cycle`, `run_sync_cycle_with_session`).
+- Added comprehensive integration test suite in `crates/zk-sync/tests/guarded_lww_tests.rs`:
+  - `test_default_conflict_policy_is_manual_v1_safe`: verifies default policy is `Manual`;
+  - `test_guarded_lww_local_wins_updates_visible_head_preserves_remote_enforces_cas`: verifies visible head selection, losing revision recovery, and subsequent CAS retry acceptance;
+  - `test_guarded_lww_remote_wins_updates_visible_head_preserves_local_clears_stale_mutation`: verifies remote winner visible head, local backup in `BaseVersionStore`, and stale mutation dequeuing;
+  - `test_guarded_lww_with_sqlite_backend_restart_and_audit`: verifies persistence across SQLite reopen and raw binary disk inspection proving zero plaintext leakage (SEC-009);
+  - `test_guarded_lww_opaque_mode_without_vault_key`: verifies locked/opaque clients resolve deterministically without panic.
+- Passed all quality gates via `./scripts/ci.sh`.
 
 ---
 
