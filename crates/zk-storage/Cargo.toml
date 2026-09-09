@@ -10,4 +10,6 @@ description = "Storage abstraction traits for encrypted notes, mutations, and sy
 workspace = true
 
 [dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
 zk-protocol = { workspace = true }

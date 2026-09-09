@@ -1,5 +1,15 @@
-//! Storage traits defining interfaces for encrypted object storage,
-//! pending mutation queues, base revisions, and sync cursors.
+pub mod error;
+pub mod memory;
+pub mod models;
+pub mod traits;
+
+pub use error::StorageError;
+pub use memory::MemoryStorage;
+pub use models::{
+    BaseVersion, MutationStatus, MutationType, ObjectFilter, PendingMutation,
+    StoredEncryptedObject, SyncState,
+};
+pub use traits::{BaseVersionStore, LocalStorage, MutationStore, ObjectStore, SyncStateStore};
 
 pub use zk_protocol as protocol;
 

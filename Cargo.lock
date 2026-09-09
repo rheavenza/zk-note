@@ -404,6 +404,8 @@ dependencies = [
 name = "zk-storage"
 version = "0.1.0"
 dependencies = [
+ "serde",
+ "serde_json",
  "zk-protocol",
 ]
 

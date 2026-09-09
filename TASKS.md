@@ -511,7 +511,7 @@ Completion notes:
 ---
 
 ## ZK-021 — Local storage traits
-Status: TODO  
+Status: DONE  
 Priority: P0  
 Dependencies: ZK-020
 
@@ -526,6 +526,21 @@ Acceptance criteria:
 
 - core has no SQLite dependency;
 - storage interface test doubles available.
+
+Completion notes:
+- Defined storage abstraction traits in `crates/zk-storage/src/traits.rs`:
+  - `ObjectStore`: CRUD, kind filtering, and tombstone tracking for `StoredEncryptedObject`.
+  - `MutationStore`: FIFO enqueue, retrieval, object lookup, status/retry updates, and dequeue for `PendingMutation`.
+  - `BaseVersionStore`: storage, retrieval, and pruning of `BaseVersion` envelopes for three-way conflict merge.
+  - `SyncStateStore`: tracking and advancing `SyncState` (sync cursor and device state).
+  - `LocalStorage`: composite blanket trait combining all four storage interfaces.
+- Defined storage domain models in `crates/zk-storage/src/models.rs`: `StoredEncryptedObject`, `ObjectFilter`, `PendingMutation`, `MutationType`, `MutationStatus`, `BaseVersion`, and `SyncState`.
+- Defined typed error enum `StorageError` in `crates/zk-storage/src/error.rs`.
+- Implemented `MemoryStorage` in `crates/zk-storage/src/memory.rs` providing a thread-safe in-memory test double implementing all storage traits.
+- Confirmed zero SQLite dependencies in `zk-core` and `zk-storage`.
+- Documented architecture and traits in `crates/zk-storage/README.md`.
+- Added unit tests covering all four storage trait implementations in `MemoryStorage`.
+- Validated via `./scripts/ci.sh`.
 
 ---
 
