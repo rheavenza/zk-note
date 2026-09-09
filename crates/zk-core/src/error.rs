@@ -132,6 +132,12 @@ pub enum CoreError {
     Validation(NoteValidationError),
     /// Underlying cryptographic failure.
     Crypto(zk_crypto::error::CryptoError),
+    /// Operation rejected because the vault is currently locked.
+    VaultLocked,
+    /// Operation rejected because the vault has not been initialized.
+    VaultUninitialized,
+    /// Provided recovery key string is malformed or has invalid checksum.
+    InvalidRecoveryKey(String),
 }
 
 impl fmt::Display for CoreError {
@@ -139,6 +145,9 @@ impl fmt::Display for CoreError {
         match self {
             Self::Validation(e) => write!(f, "note validation error: {e}"),
             Self::Crypto(e) => write!(f, "crypto error: {e}"),
+            Self::VaultLocked => write!(f, "vault is locked (unlock required)"),
+            Self::VaultUninitialized => write!(f, "vault is uninitialized (init required)"),
+            Self::InvalidRecoveryKey(msg) => write!(f, "invalid recovery key: {msg}"),
         }
     }
 }
@@ -148,6 +157,7 @@ impl std::error::Error for CoreError {
         match self {
             Self::Validation(e) => Some(e),
             Self::Crypto(e) => Some(e),
+            Self::VaultLocked | Self::VaultUninitialized | Self::InvalidRecoveryKey(_) => None,
         }
     }
 }

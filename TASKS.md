@@ -571,7 +571,7 @@ Completion notes:
 ---
 
 ## ZK-023 — Vault init/unlock/lock CLI
-Status: TODO  
+Status: DONE  
 Priority: P0  
 Dependencies: ZK-013, ZK-022
 
@@ -589,6 +589,15 @@ Acceptance criteria:
 - vault metadata persists;
 - unlock required for plaintext operations;
 - lock clears in-memory vault state.
+
+Completion notes:
+- Implemented `VaultManager` and `VaultSession` in `crates/zk-core/src/vault.rs` providing `init_vault`, `unlock_with_passphrase`, and `unlock_with_recovery_key`.
+- Implemented CLI entrypoint and commands (`zk-note init`, `zk-note unlock`, `zk-note lock`, `zk-note status`) in `apps/cli` using `clap` and `rpassword`.
+- Passphrase input uses `rpassword::prompt_password` with terminal echo disabled; confirmation prompt enforced during `init`.
+- Vault metadata is deterministically persisted to `vault.json` (`VaultBootstrap`), holding wrapped master keys and Argon2id KDF parameters with zero plaintext.
+- SQLite encrypted cache (`notes.db`) is initialized during `zk-note init` using `SqliteStorage`.
+- Active session keys are stored in a restricted session file (`session.key`, permissions `0600` on Unix) and zeroized in-memory with `zeroize::Zeroize` and on-disk with zero-byte overwrite before removal upon `zk-note lock`.
+- Added unit tests in `apps/cli/src/main.rs` covering the full init -> unlock -> lock lifecycle, recovery key unlocks, and session permission/clearing guarantees. Validated via `./scripts/ci.sh`.
 
 ---
 
