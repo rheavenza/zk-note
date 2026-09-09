@@ -21,6 +21,8 @@ pub enum CliError {
     CorruptedSession(String),
     /// Note with the requested identifier was not found.
     NoteNotFound(String),
+    /// Note with the requested identifier has already been deleted.
+    NoteAlreadyDeleted(String),
     /// Underlying core domain error.
     Core(zk_core::error::CoreError),
     /// Underlying storage error.
@@ -49,6 +51,7 @@ impl fmt::Display for CliError {
             Self::InvalidRecoveryKey(msg) => write!(f, "invalid recovery key: {msg}"),
             Self::CorruptedSession(msg) => write!(f, "corrupted session: {msg}"),
             Self::NoteNotFound(id) => write!(f, "note not found: {id}"),
+            Self::NoteAlreadyDeleted(id) => write!(f, "note has been deleted: {id}"),
             Self::Core(e) => write!(f, "{e}"),
             Self::Storage(e) => write!(f, "{e}"),
             Self::Io(msg) => write!(f, "I/O error: {msg}"),

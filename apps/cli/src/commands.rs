@@ -1,5 +1,5 @@
 //! Command execution implementations for `zk-note init`, `unlock`, `lock`, `status`,
-//! `new`, `edit`, `show`, and `list`.
+//! `new`, `edit`, `show`, `delete`, `history`, and `list`.
 
 use crate::config::{db_file, resolve_data_dir, session_file, vault_file};
 use crate::edit::{note_to_edit_buffer, parse_edit_buffer, run_editor, TempFileGuard};
@@ -312,31 +312,59 @@ pub fn cmd_new(
 fn find_note_object(
     storage: &SqliteStorage,
     note_id: &str,
+    include_deleted: bool,
 ) -> Result<StoredEncryptedObject, CliError> {
     let stored_opt = storage.get_object(note_id)?;
-    match stored_opt {
-        Some(obj) if !obj.is_deleted && obj.object_kind == OBJECT_KIND_NOTE => Ok(obj),
-        _ => {
-            if note_id.len() >= 4 {
-                let all = storage.list_objects(&ObjectFilter::for_kind(OBJECT_KIND_NOTE))?;
-                let mut matches: Vec<_> = all
-                    .into_iter()
-                    .filter(|o| o.object_id.starts_with(note_id) && !o.is_deleted)
-                    .collect();
-                if matches.len() == 1 {
-                    Ok(matches.remove(0))
-                } else if matches.len() > 1 {
-                    Err(CliError::Io(format!(
-                        "ambiguous note id prefix '{note_id}' matches {} notes",
-                        matches.len()
-                    )))
-                } else {
-                    Err(CliError::NoteNotFound(note_id.to_string()))
-                }
-            } else {
-                Err(CliError::NoteNotFound(note_id.to_string()))
+    if let Some(obj) = stored_opt {
+        if obj.object_kind == OBJECT_KIND_NOTE {
+            if obj.is_deleted && !include_deleted {
+                return Err(CliError::NoteAlreadyDeleted(obj.object_id));
             }
+            return Ok(obj);
         }
+    }
+
+    if note_id.len() >= 4 {
+        let all = storage.list_objects(&ObjectFilter {
+            kind: Some(OBJECT_KIND_NOTE),
+            include_deleted,
+        })?;
+        let mut matches: Vec<_> = all
+            .into_iter()
+            .filter(|o| o.object_id.starts_with(note_id))
+            .collect();
+        if matches.len() == 1 {
+            let obj = matches.remove(0);
+            if obj.is_deleted && !include_deleted {
+                return Err(CliError::NoteAlreadyDeleted(obj.object_id));
+            }
+            Ok(obj)
+        } else if matches.len() > 1 {
+            Err(CliError::Io(format!(
+                "ambiguous note id prefix '{note_id}' matches {} notes",
+                matches.len()
+            )))
+        } else {
+            // Check if it matched a deleted note when include_deleted was false
+            if !include_deleted {
+                let all_deleted = storage.list_objects(&ObjectFilter {
+                    kind: Some(OBJECT_KIND_NOTE),
+                    include_deleted: true,
+                })?;
+                let deleted_matches: Vec<_> = all_deleted
+                    .into_iter()
+                    .filter(|o| o.object_id.starts_with(note_id) && o.is_deleted)
+                    .collect();
+                if !deleted_matches.is_empty() {
+                    return Err(CliError::NoteAlreadyDeleted(
+                        deleted_matches[0].object_id.clone(),
+                    ));
+                }
+            }
+            Err(CliError::NoteNotFound(note_id.to_string()))
+        }
+    } else {
+        Err(CliError::NoteNotFound(note_id.to_string()))
     }
 }
 
@@ -359,7 +387,7 @@ pub fn cmd_show(
     let vault_key = load_session_key(&sess_path)?;
 
     let storage = SqliteStorage::open(&db_path)?;
-    let stored = find_note_object(&storage, note_id)?;
+    let stored = find_note_object(&storage, note_id, false)?;
 
     let note = PlaintextNote::decrypt(&stored.envelope, &vault_key)?;
 
@@ -410,7 +438,7 @@ pub fn cmd_edit(
     let vault_key = load_session_key(&sess_path)?;
 
     let storage = SqliteStorage::open(&db_path)?;
-    let stored = find_note_object(&storage, note_id)?;
+    let stored = find_note_object(&storage, note_id, false)?;
 
     // Decrypt current note
     let current_note = PlaintextNote::decrypt(&stored.envelope, &vault_key)?;
@@ -527,6 +555,73 @@ pub fn cmd_edit(
     Ok(updated_note)
 }
 
+/// Deletes an existing note, creating a revisioned tombstone and archiving base version.
+/// If `purge` is true, completely removes the note and its history from the local database.
+pub fn cmd_delete(
+    custom_data_dir: Option<&Path>,
+    note_id: &str,
+    purge: bool,
+) -> Result<u64, CliError> {
+    let data_dir = resolve_data_dir(custom_data_dir);
+    let vault_path = vault_file(&data_dir);
+    let db_path = db_file(&data_dir);
+    let sess_path = session_file(&data_dir);
+
+    if !vault_path.exists() {
+        return Err(CliError::VaultUninitialized);
+    }
+
+    // Must be unlocked to delete note
+    let vault_key = load_session_key(&sess_path)?;
+
+    let storage = SqliteStorage::open(&db_path)?;
+    let stored = find_note_object(&storage, note_id, purge)?;
+
+    if purge {
+        storage.purge_object(&stored.object_id)?;
+        storage.clear_base_versions(&stored.object_id)?;
+        println!("Purged note: {}", stored.object_id);
+        return Ok(stored.revision);
+    }
+
+    // Decrypt to verify key authenticity and obtain title for confirmation
+    let note = PlaintextNote::decrypt(&stored.envelope, &vault_key)?;
+
+    // Archive current version as base version before creating tombstone
+    storage.put_base_version(&stored.object_id, stored.revision, &stored.envelope)?;
+
+    // Increment revision for the tombstone mutation (monotonic revision bump)
+    let new_revision = stored.revision + 1;
+    let now = now_utc_rfc3339();
+
+    // Mark as deleted in local_objects (tombstone)
+    storage.mark_deleted(
+        &stored.object_id,
+        new_revision,
+        stored.envelope.clone(),
+        now.clone(),
+    )?;
+
+    // Enqueue pending delete mutation for sync (expected_revision = prior revision)
+    let mutation = PendingMutation {
+        mutation_id: uuid::Uuid::new_v4().to_string(),
+        object_id: stored.object_id.clone(),
+        expected_revision: stored.revision,
+        object_kind: OBJECT_KIND_NOTE,
+        mutation_type: MutationType::Delete,
+        envelope: stored.envelope,
+        created_at: now,
+        retry_count: 0,
+        status: MutationStatus::Pending,
+    };
+    storage.enqueue_mutation(&mutation)?;
+
+    println!("Deleted note: {} (\"{}\")", stored.object_id, note.title);
+    println!("Tombstone revision: {new_revision}");
+
+    Ok(new_revision)
+}
+
 /// Note summary row for decrypted list display and JSON output.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct NoteSummary {
@@ -542,12 +637,15 @@ pub struct NoteSummary {
     pub created_at: String,
     /// Current local revision counter.
     pub revision: u64,
+    /// True if this note has been marked as deleted (tombstone).
+    pub is_deleted: bool,
 }
 
 /// Lists notes using locally decrypted state while unlocked.
 pub fn cmd_list(
     custom_data_dir: Option<&Path>,
     tag_filter: Option<String>,
+    include_deleted: bool,
     json_output: bool,
 ) -> Result<Vec<NoteSummary>, CliError> {
     let data_dir = resolve_data_dir(custom_data_dir);
@@ -563,13 +661,16 @@ pub fn cmd_list(
     let vault_key = load_session_key(&sess_path)?;
 
     let storage = SqliteStorage::open(&db_path)?;
-    let stored_objects = storage.list_objects(&ObjectFilter::for_kind(OBJECT_KIND_NOTE))?;
+    let stored_objects = storage.list_objects(&ObjectFilter {
+        kind: Some(OBJECT_KIND_NOTE),
+        include_deleted,
+    })?;
 
     let mut notes = Vec::new();
     let normalized_filter = tag_filter.as_ref().map(|t| t.trim().to_lowercase());
 
     for stored in stored_objects {
-        if stored.is_deleted {
+        if stored.is_deleted && !include_deleted {
             continue;
         }
 
@@ -588,6 +689,7 @@ pub fn cmd_list(
             updated_at: note.updated_at,
             created_at: note.created_at,
             revision: stored.revision,
+            is_deleted: stored.is_deleted,
         });
     }
 
@@ -609,6 +711,11 @@ pub fn cmd_list(
             } else {
                 format!("[{}]", n.tags.join(", "))
             };
+            let title_display = if n.is_deleted {
+                format!("[DELETED] {}", n.title)
+            } else {
+                n.title.clone()
+            };
             println!(
                 "{:<36}  {:<24}  {:<20}  {}",
                 n.id,
@@ -618,10 +725,142 @@ pub fn cmd_list(
                 } else {
                     tags_str
                 },
-                n.title
+                title_display
             );
         }
     }
 
     Ok(notes)
+}
+
+/// Note history record for revision history display and JSON output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NoteHistoryItem {
+    /// Revision number.
+    pub revision: u64,
+    /// Note title at this revision.
+    pub title: String,
+    /// Canonicalized note tags at this revision.
+    pub tags: Vec<String>,
+    /// Note body at this revision.
+    pub body: String,
+    /// Last update timestamp of this revision (RFC 3339 UTC).
+    pub updated_at: String,
+    /// Whether this revision represents a deleted tombstone.
+    pub is_deleted: bool,
+}
+
+/// Displays the revision history or a specific historical revision of a note.
+pub fn cmd_history(
+    custom_data_dir: Option<&Path>,
+    note_id: &str,
+    revision_opt: Option<u64>,
+    json_output: bool,
+) -> Result<Vec<NoteHistoryItem>, CliError> {
+    let data_dir = resolve_data_dir(custom_data_dir);
+    let vault_path = vault_file(&data_dir);
+    let db_path = db_file(&data_dir);
+    let sess_path = session_file(&data_dir);
+
+    if !vault_path.exists() {
+        return Err(CliError::VaultUninitialized);
+    }
+
+    // Must be unlocked to decrypt historical envelopes
+    let vault_key = load_session_key(&sess_path)?;
+
+    let storage = SqliteStorage::open(&db_path)?;
+    let stored = find_note_object(&storage, note_id, true)?;
+
+    let base_versions = storage.list_base_versions(&stored.object_id)?;
+    let mut history = Vec::new();
+
+    for (rev, env) in base_versions {
+        let note = PlaintextNote::decrypt(&env, &vault_key)?;
+        history.push(NoteHistoryItem {
+            revision: rev,
+            title: note.title,
+            tags: note.tags,
+            body: note.body,
+            updated_at: note.updated_at,
+            is_deleted: false,
+        });
+    }
+
+    // Add current head version if not already present
+    if !history.iter().any(|h| h.revision == stored.revision) {
+        let current_note = PlaintextNote::decrypt(&stored.envelope, &vault_key)?;
+        history.push(NoteHistoryItem {
+            revision: stored.revision,
+            title: current_note.title,
+            tags: current_note.tags,
+            body: current_note.body,
+            updated_at: stored.updated_at.clone(),
+            is_deleted: stored.is_deleted,
+        });
+    }
+
+    history.sort_by_key(|h| h.revision);
+
+    if let Some(target_rev) = revision_opt {
+        let item = history
+            .iter()
+            .find(|h| h.revision == target_rev)
+            .ok_or_else(|| {
+                CliError::Io(format!(
+                    "revision {target_rev} not found for note {}",
+                    stored.object_id
+                ))
+            })?;
+
+        if json_output {
+            let json = serde_json::to_string_pretty(item)
+                .map_err(|e| CliError::Io(format!("serialize history item json: {e}")))?;
+            println!("{json}");
+        } else {
+            println!(
+                "================================================================================"
+            );
+            println!("ID:       {}", stored.object_id);
+            println!("Title:    {}", item.title);
+            if !item.tags.is_empty() {
+                println!("Tags:     {}", item.tags.join(", "));
+            }
+            println!(
+                "Revision: {}{}",
+                item.revision,
+                if item.is_deleted { " (tombstone)" } else { "" }
+            );
+            println!("Updated:  {}", item.updated_at);
+            println!(
+                "================================================================================\n"
+            );
+            println!("{}", item.body);
+        }
+        return Ok(vec![item.clone()]);
+    }
+
+    if json_output {
+        let json = serde_json::to_string_pretty(&history)
+            .map_err(|e| CliError::Io(format!("serialize history json: {e}")))?;
+        println!("{json}");
+    } else if history.is_empty() {
+        println!("No history found for note: {}", stored.object_id);
+    } else {
+        println!("History for note: {}", stored.object_id);
+        println!(
+            "{:<10}  {:<24}  {:<10}  TITLE",
+            "REVISION", "UPDATED", "STATUS"
+        );
+        println!("{}", "-".repeat(75));
+        for h in &history {
+            let status = if h.is_deleted { "Deleted" } else { "Active" };
+            println!(
+                "{:<10}  {:<24}  {:<10}  {}",
+                h.revision, h.updated_at, status, h.title
+            );
+        }
+    }
+
+    Ok(history)
 }

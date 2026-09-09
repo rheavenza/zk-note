@@ -89,6 +89,12 @@ pub trait BaseVersionStore: Send + Sync {
 
     /// Clears all retained base versions for an object.
     fn clear_base_versions(&self, object_id: &str) -> Result<usize, StorageError>;
+
+    /// Lists all retained base versions (revision and envelope) for an object, ordered by revision ascending.
+    fn list_base_versions(
+        &self,
+        object_id: &str,
+    ) -> Result<Vec<(u64, EncryptedEnvelope)>, StorageError>;
 }
 
 /// Abstract store for tracking synchronization cursors and device state.

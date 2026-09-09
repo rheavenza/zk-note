@@ -742,6 +742,42 @@ impl BaseVersionStore for SqliteStorage {
 
         Ok(rows)
     }
+
+    fn list_base_versions(
+        &self,
+        object_id: &str,
+    ) -> Result<Vec<(u64, EncryptedEnvelope)>, StorageError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StorageError::Backend(format!("mutex lock failed: {e}")))?;
+
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT revision, envelope FROM encrypted_base_versions WHERE object_id = ?1 ORDER BY revision ASC;",
+            )
+            .map_err(|e| StorageError::Backend(format!("prepare list_base_versions failed: {e}")))?;
+
+        let rows = stmt
+            .query_map(params![object_id], |r| {
+                let rev: u64 = r.get(0)?;
+                let env_json: String = r.get(1)?;
+                Ok((rev, env_json))
+            })
+            .map_err(|e| StorageError::Backend(format!("list_base_versions query failed: {e}")))?;
+
+        let mut results = Vec::new();
+        for item in rows {
+            let (rev, env_json) =
+                item.map_err(|e| StorageError::Backend(format!("row mapping error: {e}")))?;
+            let envelope: EncryptedEnvelope = serde_json::from_str(&env_json).map_err(|e| {
+                StorageError::Serialization(format!("deserialize base envelope: {e}"))
+            })?;
+            results.push((rev, envelope));
+        }
+
+        Ok(results)
+    }
 }
 
 impl SyncStateStore for SqliteStorage {
@@ -1117,5 +1153,44 @@ mod tests {
             .expect("list nbs");
         assert_eq!(nbs.len(), 1);
         assert_eq!(nbs[0].object_id, "nb-1");
+    }
+
+    #[test]
+    fn test_sqlite_base_version_lifecycle() {
+        let storage = SqliteStorage::open_in_memory().expect("open");
+        let obj_id = "test-obj-history";
+        let env1 = dummy_envelope(obj_id, OBJECT_KIND_NOTE);
+        let mut env2 = env1.clone();
+        env2.wrapped_key.nonce = "NONCE_REV_2".to_string();
+
+        storage
+            .put_base_version(obj_id, 1, &env1)
+            .expect("put rev 1");
+        storage
+            .put_base_version(obj_id, 2, &env2)
+            .expect("put rev 2");
+
+        let fetched1 = storage
+            .get_base_version(obj_id, 1)
+            .expect("get rev 1")
+            .expect("found");
+        assert_eq!(env1, fetched1);
+
+        let list = storage.list_base_versions(obj_id).expect("list");
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].0, 1);
+        assert_eq!(list[1].0, 2);
+
+        let pruned = storage.prune_base_versions(obj_id, 2).expect("prune");
+        assert_eq!(pruned, 1);
+        assert_eq!(storage.get_base_version(obj_id, 1).expect("get 1"), None);
+
+        let remaining = storage.list_base_versions(obj_id).expect("list");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].0, 2);
+
+        let cleared = storage.clear_base_versions(obj_id).expect("clear");
+        assert_eq!(cleared, 1);
+        assert!(storage.list_base_versions(obj_id).expect("list").is_empty());
     }
 }

@@ -652,7 +652,7 @@ Completion notes:
 ---
 
 ## ZK-026 — Local delete/tombstone model
-Status: TODO  
+Status: DONE  
 Priority: P0  
 Dependencies: ZK-024
 
@@ -661,6 +661,17 @@ Acceptance criteria:
 - delete becomes local tombstone state;
 - deletion revision intent represented;
 - history/base state remains available.
+
+Completion notes:
+- Extended `BaseVersionStore` trait with `list_base_versions` and implemented in `MemoryStorage` and `SqliteStorage` to query historical base envelopes ordered by revision ascending.
+- Implemented `cmd_delete` in `apps/cli/src/commands.rs`:
+  - When deleting a note, archives pre-deletion version via `storage.put_base_version`, increments monotonic revision counter (`R + 1`), sets `is_deleted = true` in SQLite while preserving the ciphertext envelope (tombstone), and records UTC timestamp.
+  - Enqueues `PendingMutation` with `mutation_type = MutationType::Delete`, `expected_revision = prior_revision` (representing deletion revision intent for conflict-safe CAS sync), and preserved envelope.
+  - Supports `--purge` flag to permanently remove the object and all historical base versions.
+- Updated `find_note_object` in `apps/cli/src/commands.rs` to take `include_deleted: bool` and fail closed with typed `CliError::NoteAlreadyDeleted` when an active note is expected.
+- Updated `cmd_list` and `NoteSummary` with `is_deleted` field and `--include-deleted` CLI flag.
+- Implemented `cmd_history` in `apps/cli/src/commands.rs` and CLI subcommand `zk-note history <note_id> [--revision <rev>] [--json]` to inspect complete revision history or retrieve specific historical revisions while unlocked.
+- Added comprehensive unit tests in `apps/cli/src/main.rs` covering delete tombstone state transitions, deletion revision intent verification, base version retention, history retrieval, locked-vault fail-closed behavior, and raw SQLite file ciphertext-only inspection (zero plaintext leakage). Validated via `./scripts/ci.sh`.
 
 ---
 

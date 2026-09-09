@@ -253,6 +253,23 @@ impl BaseVersionStore for MemoryStorage {
         guard.retain(|(id, _), _| id != object_id);
         Ok(initial_len - guard.len())
     }
+
+    fn list_base_versions(
+        &self,
+        object_id: &str,
+    ) -> Result<Vec<(u64, EncryptedEnvelope)>, StorageError> {
+        let guard = self
+            .base_versions
+            .read()
+            .map_err(|e| StorageError::Backend(format!("lock error: {e}")))?;
+        let mut list: Vec<(u64, EncryptedEnvelope)> = guard
+            .iter()
+            .filter(|((id, _), _)| id == object_id)
+            .map(|((_, rev), env)| (*rev, env.clone()))
+            .collect();
+        list.sort_by_key(|(rev, _)| *rev);
+        Ok(list)
+    }
 }
 
 impl SyncStateStore for MemoryStorage {
@@ -426,6 +443,13 @@ mod tests {
             .expect("get rev 1")
             .expect("found");
         assert_eq!(env1, fetched1);
+
+        let list = store
+            .list_base_versions(obj_id)
+            .expect("list base versions");
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].0, 1);
+        assert_eq!(list[1].0, 2);
 
         // Prune older than revision 2
         let pruned = store.prune_base_versions(obj_id, 2).expect("prune");

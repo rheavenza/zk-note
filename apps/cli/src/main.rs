@@ -7,7 +7,10 @@ mod error;
 mod session;
 
 use clap::{Parser, Subcommand};
-use commands::{cmd_edit, cmd_init, cmd_list, cmd_lock, cmd_new, cmd_show, cmd_status, cmd_unlock};
+use commands::{
+    cmd_delete, cmd_edit, cmd_history, cmd_init, cmd_list, cmd_lock, cmd_new, cmd_show, cmd_status,
+    cmd_unlock,
+};
 use error::CliError;
 use std::path::PathBuf;
 
@@ -100,11 +103,37 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Delete a note (creates a revisioned tombstone)
+    Delete {
+        /// Note identifier (or unique prefix)
+        note_id: String,
+
+        /// Hard-purge the note and its history completely from local database
+        #[arg(long)]
+        purge: bool,
+    },
+    /// Display revision history or a specific historical revision of a note
+    History {
+        /// Note identifier (or unique prefix)
+        note_id: String,
+
+        /// Display note contents at a specific historical revision
+        #[arg(short = 'r', long)]
+        revision: Option<u64>,
+
+        /// Output history in raw JSON format
+        #[arg(long)]
+        json: bool,
+    },
     /// List notes (requires unlocked vault)
     List {
         /// Filter by tag
         #[arg(short = 'g', long = "tag")]
         tag: Option<String>,
+
+        /// Include deleted notes (tombstones) in output
+        #[arg(long)]
+        include_deleted: bool,
 
         /// Output notes in raw JSON format
         #[arg(long)]
@@ -145,8 +174,24 @@ fn run() -> Result<(), CliError> {
             cmd_show(data_dir, &note_id, json)?;
             Ok(())
         }
-        Commands::List { tag, json } => {
-            cmd_list(data_dir, tag, json)?;
+        Commands::Delete { note_id, purge } => {
+            cmd_delete(data_dir, &note_id, purge)?;
+            Ok(())
+        }
+        Commands::History {
+            note_id,
+            revision,
+            json,
+        } => {
+            cmd_history(data_dir, &note_id, revision, json)?;
+            Ok(())
+        }
+        Commands::List {
+            tag,
+            include_deleted,
+            json,
+        } => {
+            cmd_list(data_dir, tag, include_deleted, json)?;
             Ok(())
         }
     }
@@ -363,26 +408,31 @@ mod tests {
         assert_eq!(note1_by_prefix.title, "Architecture Plan");
 
         // 7. List notes (expect 2 notes)
-        let all_notes = cmd_list(Some(dir_path), None, false).expect("list notes");
+        let all_notes = cmd_list(Some(dir_path), None, false, false).expect("list notes");
         assert_eq!(all_notes.len(), 2);
         // Sorted by updated_at descending, note 2 was created after note 1
         assert_eq!(all_notes[0].id, note2_id);
         assert_eq!(all_notes[1].id, note1_id);
 
         // 8. List notes with tag filter
-        let crypto_notes =
-            cmd_list(Some(dir_path), Some("crypto".to_string()), false).expect("list crypto notes");
+        let crypto_notes = cmd_list(Some(dir_path), Some("crypto".to_string()), false, false)
+            .expect("list crypto notes");
         assert_eq!(crypto_notes.len(), 1);
         assert_eq!(crypto_notes[0].id, note1_id);
         assert_eq!(crypto_notes[0].title, "Architecture Plan");
 
-        let personal_notes = cmd_list(Some(dir_path), Some("personal".to_string()), false)
+        let personal_notes = cmd_list(Some(dir_path), Some("personal".to_string()), false, false)
             .expect("list personal notes");
         assert_eq!(personal_notes.len(), 1);
         assert_eq!(personal_notes[0].id, note2_id);
 
-        let non_existent_tag = cmd_list(Some(dir_path), Some("nonexistent".to_string()), false)
-            .expect("list nonexistent tag");
+        let non_existent_tag = cmd_list(
+            Some(dir_path),
+            Some("nonexistent".to_string()),
+            false,
+            false,
+        )
+        .expect("list nonexistent tag");
         assert!(non_existent_tag.is_empty());
 
         // 9. Lock vault -> all note operations fail closed
@@ -394,7 +444,7 @@ mod tests {
             other => panic!("expected VaultLocked on show, got {other:?}"),
         }
 
-        let locked_list = cmd_list(Some(dir_path), None, false).unwrap_err();
+        let locked_list = cmd_list(Some(dir_path), None, false, false).unwrap_err();
         match locked_list {
             CliError::VaultLocked => (),
             other => panic!("expected VaultLocked on list, got {other:?}"),
@@ -418,7 +468,7 @@ mod tests {
         let unlocked_show = cmd_show(Some(dir_path), &note1_id, false).expect("show unlocked");
         assert_eq!(unlocked_show.title, "Architecture Plan");
 
-        let unlocked_list = cmd_list(Some(dir_path), None, false).expect("list unlocked");
+        let unlocked_list = cmd_list(Some(dir_path), None, false, false).expect("list unlocked");
         assert_eq!(unlocked_list.len(), 2);
 
         let _ = fs::remove_dir_all(&test_dir);
@@ -673,6 +723,204 @@ mod tests {
             CliError::VaultLocked => (),
             other => panic!("expected VaultLocked, got {other:?}"),
         }
+
+        let _ = fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn test_cli_delete_tombstone_and_history_lifecycle() {
+        use zk_storage::traits::{BaseVersionStore, MutationStore};
+
+        let test_dir = temp_test_dir("delete_tombstone_lifecycle");
+        let dir_path = test_dir.as_path();
+        let pass = "tombstone-test-pass".to_string();
+
+        // 1. Initialize vault
+        cmd_init(Some(dir_path), Some(pass.clone()), true).expect("init");
+
+        // 2. Create note (revision 1)
+        let note_id = cmd_new(
+            Some(dir_path),
+            Some("Original Title".to_string()),
+            Some("Original secret body.".to_string()),
+            vec!["v1".to_string()],
+        )
+        .expect("create");
+
+        // 3. Edit note (revision 2)
+        let _ = cmd_edit(
+            Some(dir_path),
+            &note_id,
+            None,
+            Some("Edited Title".to_string()),
+            Some("Edited secret body.".to_string()),
+            Some(vec!["v2".to_string()]),
+        )
+        .expect("edit");
+
+        // Verify it is at revision 2
+        let db_path = config::db_file(dir_path);
+        let storage = zk_storage::SqliteStorage::open(&db_path).expect("open");
+        let obj_r2 = storage.get_object(&note_id).expect("get").expect("found");
+        assert_eq!(obj_r2.revision, 2);
+        assert!(!obj_r2.is_deleted);
+
+        // 4. Delete note (creates revision 3 tombstone)
+        let tombstone_rev = cmd_delete(Some(dir_path), &note_id, false).expect("delete");
+        assert_eq!(tombstone_rev, 3);
+
+        // 5. Verify local tombstone state in SQLite:
+        // - is_deleted == true
+        // - revision == 3
+        // - envelope is preserved
+        let obj_r3 = storage.get_object(&note_id).expect("get").expect("found");
+        assert!(obj_r3.is_deleted);
+        assert_eq!(obj_r3.revision, 3);
+        assert_eq!(obj_r3.envelope, obj_r2.envelope);
+
+        // 6. Verify deletion revision intent in pending_mutations:
+        // - PendingMutation with mutation_type == MutationType::Delete
+        // - expected_revision == 2 (prior revision before deletion)
+        let pending = storage.list_pending_mutations().expect("list mutations");
+        let del_mutation = pending
+            .iter()
+            .find(|m| m.object_id == note_id && m.mutation_type == zk_storage::MutationType::Delete)
+            .expect("delete mutation found");
+        assert_eq!(del_mutation.expected_revision, 2);
+        assert_eq!(del_mutation.status, zk_storage::MutationStatus::Pending);
+
+        // 7. Verify show fails closed on deleted note
+        let show_err = cmd_show(Some(dir_path), &note_id, false).unwrap_err();
+        match show_err {
+            CliError::NoteAlreadyDeleted(id) => assert_eq!(id, note_id),
+            other => panic!("expected NoteAlreadyDeleted, got {other:?}"),
+        }
+
+        // 8. Verify delete on already-deleted note fails closed
+        let del_again_err = cmd_delete(Some(dir_path), &note_id, false).unwrap_err();
+        match del_again_err {
+            CliError::NoteAlreadyDeleted(id) => assert_eq!(id, note_id),
+            other => panic!("expected NoteAlreadyDeleted, got {other:?}"),
+        }
+
+        // 9. Verify list excludes deleted notes by default, but includes with include_deleted: true
+        let list_default = cmd_list(Some(dir_path), None, false, false).expect("list");
+        assert!(list_default.is_empty());
+
+        let list_with_deleted = cmd_list(Some(dir_path), None, true, false).expect("list all");
+        assert_eq!(list_with_deleted.len(), 1);
+        assert_eq!(list_with_deleted[0].id, note_id);
+        assert!(list_with_deleted[0].is_deleted);
+        assert_eq!(list_with_deleted[0].revision, 3);
+
+        // 10. Verify history/base state remains available:
+        // - list_base_versions has revisions 1 and 2
+        let base_versions = storage.list_base_versions(&note_id).expect("base versions");
+        assert_eq!(base_versions.len(), 2);
+        assert_eq!(base_versions[0].0, 1);
+        assert_eq!(base_versions[1].0, 2);
+
+        // - cmd_history returns all 3 revisions
+        let history = cmd_history(Some(dir_path), &note_id, None, false).expect("history");
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[0].revision, 1);
+        assert_eq!(history[0].title, "Original Title");
+        assert!(!history[0].is_deleted);
+
+        assert_eq!(history[1].revision, 2);
+        assert_eq!(history[1].title, "Edited Title");
+        assert!(!history[1].is_deleted);
+
+        assert_eq!(history[2].revision, 3);
+        assert_eq!(history[2].title, "Edited Title");
+        assert!(history[2].is_deleted);
+
+        // - cmd_history with specific revision retrieves historical content
+        let rev1_items = cmd_history(Some(dir_path), &note_id, Some(1), false).expect("history r1");
+        assert_eq!(rev1_items.len(), 1);
+        assert_eq!(rev1_items[0].body, "Original secret body.");
+
+        let rev2_items = cmd_history(Some(dir_path), &note_id, Some(2), false).expect("history r2");
+        assert_eq!(rev2_items.len(), 1);
+        assert_eq!(rev2_items[0].body, "Edited secret body.");
+
+        // 11. Lock vault -> delete and history fail closed
+        cmd_lock(Some(dir_path)).expect("lock");
+        let locked_del = cmd_delete(Some(dir_path), &note_id, false).unwrap_err();
+        assert!(matches!(locked_del, CliError::VaultLocked));
+        let locked_hist = cmd_history(Some(dir_path), &note_id, None, false).unwrap_err();
+        assert!(matches!(locked_hist, CliError::VaultLocked));
+
+        // 12. Unlock and test purge
+        cmd_unlock(Some(dir_path), Some(pass), None).expect("unlock");
+        cmd_delete(Some(dir_path), &note_id, true).expect("purge");
+        assert!(storage.get_object(&note_id).expect("get").is_none());
+        assert!(storage
+            .list_base_versions(&note_id)
+            .expect("base")
+            .is_empty());
+
+        let _ = fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn test_cli_delete_and_history_no_plaintext_leakage() {
+        let test_dir = temp_test_dir("delete_no_leakage");
+        let dir_path = test_dir.as_path();
+        let pass = "leakage-test-pass".to_string();
+
+        cmd_init(Some(dir_path), Some(pass), true).expect("init");
+
+        let secret_title = "CANARY_TITLE_ABCDEF";
+        let secret_body = "CANARY_BODY_123456789";
+        let secret_tag = "canary-tag-xyz";
+
+        let note_id = cmd_new(
+            Some(dir_path),
+            Some(secret_title.to_string()),
+            Some(secret_body.to_string()),
+            vec![secret_tag.to_string()],
+        )
+        .expect("create");
+
+        // Edit note to produce a base version in encrypted_base_versions
+        let edited_body = "EDITED_CANARY_BODY_987654321";
+        cmd_edit(
+            Some(dir_path),
+            &note_id,
+            None,
+            None,
+            Some(edited_body.to_string()),
+            None,
+        )
+        .expect("edit");
+
+        // Delete note to produce a tombstone in local_objects and a pending mutation in pending_mutations
+        cmd_delete(Some(dir_path), &note_id, false).expect("delete");
+
+        // Lock vault to ensure clean cache flush
+        cmd_lock(Some(dir_path)).expect("lock");
+
+        let db_path = config::db_file(dir_path);
+        let raw_db_bytes = fs::read(&db_path).expect("read db bytes");
+        let raw_db_str = String::from_utf8_lossy(&raw_db_bytes);
+
+        assert!(
+            !raw_db_str.contains(secret_title),
+            "plaintext title found in raw SQLite file"
+        );
+        assert!(
+            !raw_db_str.contains(secret_body),
+            "plaintext body found in raw SQLite file"
+        );
+        assert!(
+            !raw_db_str.contains(secret_tag),
+            "plaintext tag found in raw SQLite file"
+        );
+        assert!(
+            !raw_db_str.contains(edited_body),
+            "plaintext edited body found in raw SQLite file"
+        );
 
         let _ = fs::remove_dir_all(&test_dir);
     }
