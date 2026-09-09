@@ -48,3 +48,6 @@ zk-storage = { path = "crates/zk-storage" }
 zk-sync = { path = "crates/zk-sync" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+zeroize = { version = "1.8", features = ["derive"] }
+subtle = "2.6"
+rand_core = { version = "0.6", features = ["getrandom"] }

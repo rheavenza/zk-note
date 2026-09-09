@@ -232,7 +232,7 @@ Do not begin M1 until the protocol/crypto ADRs are present.
 Goal: implement independently testable vault and object encryption.
 
 ## ZK-010 — Secure key types
-Status: TODO  
+Status: DONE  
 Priority: P0  
 Dependencies: M0
 
@@ -252,6 +252,16 @@ Acceptance criteria:
 - secret zeroization used where practical;
 - random generation uses OS CSPRNG;
 - tests cover invalid sizes.
+
+Completion notes:
+- Implemented strongly typed 256-bit (32-byte) key wrappers: `VaultKey`, `ObjectKey`, `RecoveryKey`, and `KeyEncryptionKey` in `crates/zk-crypto/src/keys.rs`.
+- Enforced strict 32-byte length checks in `from_slice` returning typed `CryptoError::InvalidKeyLength`.
+- Implemented `zeroize::Zeroize` and `zeroize::ZeroizeOnDrop` to safely scrub secret key buffers from memory on drop.
+- Implemented custom `fmt::Debug` redacting secret material to prevent secret leakage in logs (SEC-003).
+- Implemented constant-time equality comparisons using `subtle::ConstantTimeEq`.
+- Integrated OS CSPRNG random generation via `rand_core::OsRng`.
+- Added unit tests covering invalid sizes (0, 1, 16, 31, 33, 48, 64, 128 bytes), valid construction, debug redaction, CSPRNG generation, constant-time equality, and memory zeroization.
+- Verified via `./scripts/ci.sh`.
 
 ---
 

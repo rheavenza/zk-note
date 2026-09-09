@@ -10,4 +10,7 @@ description = "Cryptographic primitives, KDF, key wrapping, and envelope encrypt
 workspace = true
 
 [dependencies]
+rand_core = { workspace = true }
+subtle = { workspace = true }
+zeroize = { workspace = true }
 zk-protocol = { workspace = true }
