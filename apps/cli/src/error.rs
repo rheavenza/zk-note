@@ -23,6 +23,13 @@ pub enum CliError {
     NoteNotFound(String),
     /// Note with the requested identifier has already been deleted.
     NoteAlreadyDeleted(String),
+    /// Requested revision of a note was not found in history.
+    RevisionNotFound {
+        /// Target note identifier.
+        note_id: String,
+        /// Target revision number.
+        revision: u64,
+    },
     /// Underlying core domain error.
     Core(zk_core::error::CoreError),
     /// Underlying storage error.
@@ -52,6 +59,9 @@ impl fmt::Display for CliError {
             Self::CorruptedSession(msg) => write!(f, "corrupted session: {msg}"),
             Self::NoteNotFound(id) => write!(f, "note not found: {id}"),
             Self::NoteAlreadyDeleted(id) => write!(f, "note has been deleted: {id}"),
+            Self::RevisionNotFound { note_id, revision } => {
+                write!(f, "revision {revision} not found for note: {note_id}")
+            }
             Self::Core(e) => write!(f, "{e}"),
             Self::Storage(e) => write!(f, "{e}"),
             Self::Io(msg) => write!(f, "I/O error: {msg}"),

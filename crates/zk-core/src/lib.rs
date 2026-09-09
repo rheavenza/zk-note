@@ -6,8 +6,9 @@ pub mod vault;
 
 pub use error::{CoreError, NoteValidationError};
 pub use note::{
-    Note, NoteBuilder, PlaintextNote, MAX_ATTACHMENTS_COUNT, MAX_ATTACHMENT_ID_LEN, MAX_BODY_LEN,
-    MAX_TAGS_COUNT, MAX_TAG_LEN, MAX_TITLE_LEN, NOTE_SCHEMA_VERSION_V1,
+    Note, NoteBuilder, NoteHistoryItem, PlaintextNote, MAX_ATTACHMENTS_COUNT,
+    MAX_ATTACHMENT_ID_LEN, MAX_BODY_LEN, MAX_TAGS_COUNT, MAX_TAG_LEN, MAX_TITLE_LEN,
+    NOTE_SCHEMA_VERSION_V1,
 };
 pub use search::{InMemorySearchIndex, IndexedNote, SearchResult};
 pub use time::{now_utc_rfc3339, validate_rfc3339};

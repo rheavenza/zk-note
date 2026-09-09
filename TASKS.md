@@ -709,7 +709,7 @@ Completion notes:
 ---
 
 ## ZK-028 — Local history
-Status: TODO  
+Status: DONE  
 Priority: P1  
 Dependencies: ZK-024
 
@@ -717,6 +717,22 @@ Acceptance criteria:
 
 - encrypted previous versions retained locally;
 - history command can display selected revision while unlocked.
+
+Completion notes:
+- Defined `NoteHistoryItem` in `crates/zk-core/src/note.rs` and exported via `zk-core` for unified note revision history models across client adapters.
+- Implemented encrypted local base version retention in `crates/zk-storage`:
+  - `encrypted_base_versions` stores historical revision envelopes `(object_id, revision, envelope, stored_at)` in SQLite with zero plaintext leakage (SEC-001, SEC-002, SEC-009).
+  - Every note edit and tombstone deletion archives the pre-mutation revision into `encrypted_base_versions` via `storage.put_base_version`.
+- Added typed `CliError::RevisionNotFound { note_id, revision }` error in `apps/cli/src/error.rs`.
+- Implemented `cmd_history` in `apps/cli/src/commands.rs`:
+  - Lists complete historical progression across all revisions (revisions 1..N) with revision numbers, UTC timestamps, Active/Deleted status, and titles.
+  - With `--revision <rev>`, decrypts and displays the selected historical revision's full title, tags, and body content while unlocked.
+  - Supports `--json` flag for machine-readable JSON output.
+  - Fails closed with `CliError::VaultLocked` when vault is locked.
+- Added comprehensive unit tests in `apps/cli/src/main.rs`:
+  - `test_cli_history_multi_revision_retention_and_selection`: tests multi-revision retention across edits, full history listing, selected revision display, typed `RevisionNotFound` error, and locked-vault fail-closed protection.
+  - `test_m2_gate_full_lifecycle_demo`: automated reproduction of the full M2 gate manual demo script (`init` -> `new` -> `lock` -> inspect SQLite ciphertext -> `reopen` -> `unlock` -> `search` -> `edit` -> `delete` -> `history` -> `lock`).
+- Validated via `./scripts/ci.sh` (all 86 tests passed; M2 gate passed).
 
 ---
 

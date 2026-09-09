@@ -55,6 +55,23 @@ pub struct PlaintextNote {
 /// Convenience alias for [`PlaintextNote`].
 pub type Note = PlaintextNote;
 
+/// A decrypted historical snapshot or tombstone record of a note at a specific revision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NoteHistoryItem {
+    /// Revision counter.
+    pub revision: u64,
+    /// Note title at this revision.
+    pub title: String,
+    /// Canonicalized note tags at this revision.
+    pub tags: Vec<String>,
+    /// Note body content at this revision.
+    pub body: String,
+    /// Last update timestamp of this revision in RFC 3339 UTC format.
+    pub updated_at: String,
+    /// True if this revision represents a deleted tombstone.
+    pub is_deleted: bool,
+}
+
 impl PlaintextNote {
     /// Creates a new note with default schema version (1) and timestamps set to the current UTC time.
     #[must_use]

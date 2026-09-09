@@ -1122,4 +1122,261 @@ mod tests {
         let _ = storage;
         let _ = fs::remove_dir_all(&test_dir);
     }
+
+    #[test]
+    fn test_cli_history_multi_revision_retention_and_selection() {
+        use zk_storage::traits::BaseVersionStore;
+
+        let test_dir = temp_test_dir("history_multi_rev");
+        let dir_path = test_dir.as_path();
+        let pass = "history-multi-pass".to_string();
+
+        cmd_init(Some(dir_path), Some(pass.clone()), true).expect("init");
+
+        // 1. Create note (r1)
+        let note_id = cmd_new(
+            Some(dir_path),
+            Some("Architecture RFC".to_string()),
+            Some("Initial design doc.".to_string()),
+            vec!["arch".to_string()],
+        )
+        .expect("create");
+
+        // 2. Edit note (r2)
+        cmd_edit(
+            Some(dir_path),
+            &note_id,
+            None,
+            Some("Architecture RFC v2".to_string()),
+            Some("Updated with Argon2id parameters.".to_string()),
+            Some(vec!["arch".to_string(), "kdf".to_string()]),
+        )
+        .expect("edit r2");
+
+        // 3. Edit note (r3)
+        cmd_edit(
+            Some(dir_path),
+            &note_id,
+            None,
+            Some("Architecture RFC v3".to_string()),
+            Some("Added XChaCha20-Poly1305 encryption details.".to_string()),
+            Some(vec!["arch".to_string(), "crypto".to_string()]),
+        )
+        .expect("edit r3");
+
+        // 4. Edit note (r4)
+        cmd_edit(
+            Some(dir_path),
+            &note_id,
+            None,
+            Some("Architecture RFC Final".to_string()),
+            Some("Completed specifications.".to_string()),
+            Some(vec![
+                "arch".to_string(),
+                "crypto".to_string(),
+                "final".to_string(),
+            ]),
+        )
+        .expect("edit r4");
+
+        // Verify base versions in SQLite
+        let db_path = config::db_file(dir_path);
+        let storage = zk_storage::SqliteStorage::open(&db_path).expect("open storage");
+        let base_versions = storage.list_base_versions(&note_id).expect("list base");
+        assert_eq!(base_versions.len(), 3);
+        assert_eq!(base_versions[0].0, 1);
+        assert_eq!(base_versions[1].0, 2);
+        assert_eq!(base_versions[2].0, 3);
+
+        // Verify full history list returns 4 items
+        let history = cmd_history(Some(dir_path), &note_id, None, false).expect("cmd_history list");
+        assert_eq!(history.len(), 4);
+        assert_eq!(history[0].revision, 1);
+        assert_eq!(history[0].title, "Architecture RFC");
+        assert_eq!(history[0].body, "Initial design doc.");
+
+        assert_eq!(history[1].revision, 2);
+        assert_eq!(history[1].title, "Architecture RFC v2");
+        assert_eq!(history[1].body, "Updated with Argon2id parameters.");
+
+        assert_eq!(history[2].revision, 3);
+        assert_eq!(history[2].title, "Architecture RFC v3");
+        assert_eq!(
+            history[2].body,
+            "Added XChaCha20-Poly1305 encryption details."
+        );
+
+        assert_eq!(history[3].revision, 4);
+        assert_eq!(history[3].title, "Architecture RFC Final");
+        assert_eq!(history[3].body, "Completed specifications.");
+
+        // Query each revision specifically
+        let r1 = cmd_history(Some(dir_path), &note_id, Some(1), false).expect("r1");
+        assert_eq!(r1[0].revision, 1);
+        assert_eq!(r1[0].title, "Architecture RFC");
+        assert_eq!(r1[0].body, "Initial design doc.");
+
+        let r2 = cmd_history(Some(dir_path), &note_id, Some(2), false).expect("r2");
+        assert_eq!(r2[0].revision, 2);
+        assert_eq!(r2[0].title, "Architecture RFC v2");
+        assert_eq!(r2[0].body, "Updated with Argon2id parameters.");
+
+        let r3 = cmd_history(Some(dir_path), &note_id, Some(3), false).expect("r3");
+        assert_eq!(r3[0].revision, 3);
+        assert_eq!(r3[0].title, "Architecture RFC v3");
+        assert_eq!(r3[0].body, "Added XChaCha20-Poly1305 encryption details.");
+
+        let r4 = cmd_history(Some(dir_path), &note_id, Some(4), false).expect("r4");
+        assert_eq!(r4[0].revision, 4);
+        assert_eq!(r4[0].title, "Architecture RFC Final");
+        assert_eq!(r4[0].body, "Completed specifications.");
+
+        // Non-existent revision returns RevisionNotFound
+        let not_found_err = cmd_history(Some(dir_path), &note_id, Some(99), false).unwrap_err();
+        match not_found_err {
+            CliError::RevisionNotFound {
+                note_id: err_id,
+                revision: 99,
+            } => assert_eq!(err_id, note_id),
+            other => panic!("expected RevisionNotFound, got {other:?}"),
+        }
+
+        // Lock vault -> history queries fail closed
+        cmd_lock(Some(dir_path)).expect("lock");
+        let locked_list = cmd_history(Some(dir_path), &note_id, None, false).unwrap_err();
+        assert!(matches!(locked_list, CliError::VaultLocked));
+
+        let locked_rev = cmd_history(Some(dir_path), &note_id, Some(2), false).unwrap_err();
+        assert!(matches!(locked_rev, CliError::VaultLocked));
+
+        // Unlock and verify access restored
+        cmd_unlock(Some(dir_path), Some(pass), None).expect("unlock");
+        let unlocked_rev =
+            cmd_history(Some(dir_path), &note_id, Some(2), false).expect("unlocked r2");
+        assert_eq!(unlocked_rev[0].revision, 2);
+
+        let _ = fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn test_m2_gate_full_lifecycle_demo() {
+        // Manual demo script from M2 Gate:
+        // init vault -> create notes -> close process -> inspect SQLite (no plaintext) ->
+        // reopen -> unlock -> search -> edit -> delete -> history -> lock
+        let test_dir = temp_test_dir("m2_gate_demo");
+        let dir_path = test_dir.as_path();
+        let pass = "m2-gate-demo-pass".to_string();
+
+        let canary_term = "CANARY_DEMO_SECRET_TOKEN_42";
+        let note1_title = "Secret Note 1";
+        let note1_body = format!("Important secret details about {canary_term}.");
+
+        // 1. init vault
+        cmd_init(Some(dir_path), Some(pass.clone()), true).expect("1. init vault");
+
+        // 2. create notes
+        let note1_id = cmd_new(
+            Some(dir_path),
+            Some(note1_title.to_string()),
+            Some(note1_body.clone()),
+            vec!["demo".to_string(), "secret".to_string()],
+        )
+        .expect("2. create note 1");
+
+        let note2_id = cmd_new(
+            Some(dir_path),
+            Some("Ordinary Note 2".to_string()),
+            Some("Just an everyday checklist.".to_string()),
+            vec!["routine".to_string()],
+        )
+        .expect("2. create note 2");
+
+        // 3. close process (lock vault)
+        cmd_lock(Some(dir_path)).expect("3. close process / lock");
+
+        // 4. inspect SQLite -> no note plaintext
+        let db_path = config::db_file(dir_path);
+        let raw_db_bytes = fs::read(&db_path).expect("read db");
+        let raw_db_str = String::from_utf8_lossy(&raw_db_bytes);
+        assert!(
+            !raw_db_str.contains(canary_term),
+            "canary term found in SQLite file after lock"
+        );
+        assert!(
+            !raw_db_str.contains(note1_title),
+            "note title found in SQLite file after lock"
+        );
+        assert!(
+            !raw_db_str.contains("everyday checklist"),
+            "note 2 body found in SQLite file after lock"
+        );
+
+        // 5. reopen (check status)
+        cmd_status(Some(dir_path)).expect("5. reopen status");
+
+        // 6. unlock
+        cmd_unlock(Some(dir_path), Some(pass), None).expect("6. unlock");
+
+        // 7. search
+        let search_results = cmd_search(Some(dir_path), canary_term, false).expect("7. search");
+        assert_eq!(search_results.len(), 1);
+        assert_eq!(search_results[0].id, note1_id);
+        assert!(search_results[0].snippet.contains(canary_term));
+
+        // 8. edit
+        let updated_note1 = cmd_edit(
+            Some(dir_path),
+            &note1_id,
+            None,
+            Some("Secret Note 1 Revised".to_string()),
+            Some("Updated confidential content.".to_string()),
+            None,
+        )
+        .expect("8. edit");
+        assert_eq!(updated_note1.title, "Secret Note 1 Revised");
+
+        // 9. delete (tombstone note 2)
+        let tombstone_rev = cmd_delete(Some(dir_path), &note2_id, false).expect("9. delete");
+        assert_eq!(tombstone_rev, 2);
+
+        // 10. history
+        // - History for note 1 has rev 1 (base) and rev 2 (current)
+        let note1_hist =
+            cmd_history(Some(dir_path), &note1_id, None, false).expect("10. history note 1");
+        assert_eq!(note1_hist.len(), 2);
+        assert_eq!(note1_hist[0].revision, 1);
+        assert_eq!(note1_hist[0].title, "Secret Note 1");
+        assert_eq!(note1_hist[1].revision, 2);
+        assert_eq!(note1_hist[1].title, "Secret Note 1 Revised");
+
+        // - History can display selected revision 1
+        let rev1_shown =
+            cmd_history(Some(dir_path), &note1_id, Some(1), false).expect("10. history r1");
+        assert_eq!(rev1_shown[0].body, note1_body);
+
+        // - History for note 2 shows tombstone
+        let note2_hist =
+            cmd_history(Some(dir_path), &note2_id, None, false).expect("10. history note 2");
+        assert_eq!(note2_hist.len(), 2);
+        assert!(note2_hist[1].is_deleted);
+
+        // 11. lock
+        cmd_lock(Some(dir_path)).expect("11. lock");
+
+        // Operations fail closed after lock
+        assert!(matches!(
+            cmd_show(Some(dir_path), &note1_id, false).unwrap_err(),
+            CliError::VaultLocked
+        ));
+        assert!(matches!(
+            cmd_search(Some(dir_path), "Secret", false).unwrap_err(),
+            CliError::VaultLocked
+        ));
+        assert!(matches!(
+            cmd_history(Some(dir_path), &note1_id, None, false).unwrap_err(),
+            CliError::VaultLocked
+        ));
+
+        let _ = fs::remove_dir_all(&test_dir);
+    }
 }

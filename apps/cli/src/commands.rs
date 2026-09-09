@@ -8,7 +8,7 @@ use crate::session::{clear_session, has_active_session, load_session_key, save_s
 use serde::Serialize;
 use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::Path;
-use zk_core::note::{NoteBuilder, PlaintextNote};
+use zk_core::note::{NoteBuilder, NoteHistoryItem, PlaintextNote};
 use zk_core::search::{InMemorySearchIndex, SearchResult};
 use zk_core::time::now_utc_rfc3339;
 use zk_core::vault::VaultManager;
@@ -808,23 +808,6 @@ pub fn cmd_list(
     Ok(notes)
 }
 
-/// Note history record for revision history display and JSON output.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct NoteHistoryItem {
-    /// Revision number.
-    pub revision: u64,
-    /// Note title at this revision.
-    pub title: String,
-    /// Canonicalized note tags at this revision.
-    pub tags: Vec<String>,
-    /// Note body at this revision.
-    pub body: String,
-    /// Last update timestamp of this revision (RFC 3339 UTC).
-    pub updated_at: String,
-    /// Whether this revision represents a deleted tombstone.
-    pub is_deleted: bool,
-}
-
 /// Displays the revision history or a specific historical revision of a note.
 pub fn cmd_history(
     custom_data_dir: Option<&Path>,
@@ -881,11 +864,9 @@ pub fn cmd_history(
         let item = history
             .iter()
             .find(|h| h.revision == target_rev)
-            .ok_or_else(|| {
-                CliError::Io(format!(
-                    "revision {target_rev} not found for note {}",
-                    stored.object_id
-                ))
+            .ok_or_else(|| CliError::RevisionNotFound {
+                note_id: stored.object_id.clone(),
+                revision: target_rev,
             })?;
 
         if json_output {
