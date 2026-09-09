@@ -1614,7 +1614,7 @@ Completion notes:
 ---
 
 ## ZK-061 — Native/WASM crypto compatibility suite
-Status: TODO  
+Status: DONE  
 Priority: P0  
 Dependencies: ZK-060
 
@@ -1624,6 +1624,27 @@ Acceptance criteria:
 - WASM encrypt → native decrypt;
 - vault wrapper compatibility;
 - failure vectors match.
+
+Completion notes:
+- Implemented comprehensive bi-directional cross-runtime test coverage between native Rust and browser WebAssembly.
+- Native Encrypt → WASM Decrypt:
+  - Verified WASM decryption of native-encrypted short notes, large notes (>64KB Markdown), multibyte UTF-8 text (accents, emojis, Japanese characters), raw binary attachments, and the static committed Envelope v1 test vector.
+  - Decryption in WASM validates 100% byte-for-byte fidelity and tag canonicalization.
+- WASM Encrypt → Native Decrypt:
+  - Notes encrypted in WASM decrypt cleanly in native `zk-core` / `zk-crypto`.
+  - Verified newline normalization (CRLF -> Unix LF), tag canonicalization (lowercase, deduplicated, sorted), and raw binary payload encryption/decryption round-trips.
+- Vault Wrapper Compatibility:
+  - Verified Argon2id KEK derivation parity against RFC 9106 deterministic test vector (`007f6b258779db1c07dda5ff432b9025b66d7ec395ed9acba7939210b3ed97b8`) and random salts.
+  - Verified bi-directional key wrapping and unwrapping under KEK (`wrap_vault_key` / `unwrap_vault_key`).
+  - Verified recovery phrase formatting, checksum validation, and recovery unlocking in both runtimes.
+  - Verified passphrase rewrapping across runtimes (native init -> WASM rewrap -> native unlock; WASM init -> native rewrap -> WASM unlock), confirming old passphrases fail closed.
+- Failure Vectors Match:
+  - Verified identical fail-closed behavior across native and WASM runtimes for: wrong passphrase, wrong recovery key, corrupted recovery phrase checksum, single-bit ciphertext tampering, tampered AAD (`object_id`, `object_kind`, unsupported `envelope_version: 2`), corrupted nonce, truncated nonce, tampered Poly1305 MAC tag, invalid base64, and malformed JSON.
+- Test suites & automation:
+  - `crates/zk-wasm/tests/wasm_crypto_compat.rs`: 7 tests runnable both natively and inside the Node.js WebAssembly VM via `wasm-pack test --node`.
+  - `crates/zk-wasm/src/bin/native_compat_harness.rs`: Native cryptographic harness binary for cross-process JSON-RPC communication.
+  - `tests/wasm_crypto_compat.test.mjs`: 27 live cross-runtime integration tests using `node:test` verifying live native-WASM interoperability.
+  - Integrated into `./scripts/ci.sh` (Steps 6 & 7). All 7 quality gates pass cleanly.
 
 ---
 

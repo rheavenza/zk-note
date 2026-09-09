@@ -1,16 +1,10 @@
 //! Minimal RFC 3339 UTC timestamp utilities and validation without heavy external dependencies.
 
 use crate::error::NoteValidationError;
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Generates the current UTC time as an RFC 3339 formatted string (`YYYY-MM-DDTHH:MM:SS.sssZ`).
-#[must_use]
-pub fn now_utc_rfc3339() -> String {
-    let now = SystemTime::now();
-    let duration = now.duration_since(UNIX_EPOCH).unwrap_or_default();
-    let total_secs = duration.as_secs();
-    let millis = duration.subsec_millis();
-
+fn format_rfc3339_parts(total_secs: u64, millis: u32) -> String {
     let days = (total_secs / 86400) as i64;
     let day_secs = (total_secs % 86400) as u32;
 
@@ -20,6 +14,32 @@ pub fn now_utc_rfc3339() -> String {
     let sec = day_secs % 60;
 
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}.{millis:03}Z")
+}
+
+/// Generates the current UTC time as an RFC 3339 formatted string (`YYYY-MM-DDTHH:MM:SS.sssZ`).
+#[must_use]
+#[cfg(not(target_arch = "wasm32"))]
+pub fn now_utc_rfc3339() -> String {
+    let now = SystemTime::now();
+    let duration = now.duration_since(UNIX_EPOCH).unwrap_or_default();
+    let total_secs = duration.as_secs();
+    let millis = duration.subsec_millis();
+    format_rfc3339_parts(total_secs, millis)
+}
+
+/// Generates the current UTC time as an RFC 3339 formatted string (`YYYY-MM-DDTHH:MM:SS.sssZ`).
+#[must_use]
+#[cfg(target_arch = "wasm32")]
+pub fn now_utc_rfc3339() -> String {
+    let millis_f64 = js_sys::Date::now();
+    let total_millis = if millis_f64.is_sign_positive() && millis_f64.is_finite() {
+        millis_f64 as u64
+    } else {
+        0
+    };
+    let total_secs = total_millis / 1000;
+    let millis = (total_millis % 1000) as u32;
+    format_rfc3339_parts(total_secs, millis)
 }
 
 /// Validates that a string conforms to RFC 3339 timestamp format.

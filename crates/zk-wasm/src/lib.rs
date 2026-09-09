@@ -18,6 +18,7 @@ use zk_core::search::InMemorySearchIndex;
 use zk_core::vault::VaultSession;
 use zk_crypto::kdf::{derive_kek, KdfParams};
 use zk_crypto::keys::{KeyEncryptionKey, RecoveryKey, VaultKey};
+use zk_crypto::object::{decrypt_envelope, encrypt_envelope};
 use zk_crypto::recovery::{format_recovery_key, parse_recovery_key};
 use zk_crypto::vault::{
     unwrap_vault_key, unwrap_vault_key_recovery, wrap_vault_key, wrap_vault_key_recovery,
@@ -384,6 +385,18 @@ impl WasmVaultSession {
         self.rewrap_passphrase_impl(new_passphrase, &KdfParams::new_production())
             .map_err(to_js_error)
     }
+
+    /// Changes the vault passphrase by re-wrapping the active Vault Key with explicit KDF parameters.
+    pub fn rewrap_passphrase_with_params(
+        &mut self,
+        new_passphrase: &str,
+        kdf_params_json: &str,
+    ) -> Result<WasmRewrapResult, JsValue> {
+        let params: KdfParams =
+            serde_json::from_str(kdf_params_json).map_err(|e| to_js_error(e.to_string()))?;
+        self.rewrap_passphrase_impl(new_passphrase, &params)
+            .map_err(to_js_error)
+    }
 }
 
 impl Drop for WasmVaultSession {
@@ -437,12 +450,32 @@ impl WasmVaultInitResult {
     }
 }
 
-/// Initializes a new vault from a user passphrase.
+/// Initializes the panic hook in WebAssembly environments for detailed diagnostics.
+#[wasm_bindgen]
+pub fn init_panic_hook() {
+    #[cfg(target_arch = "wasm32")]
+    console_error_panic_hook::set_once();
+}
+
+/// Initializes a new vault from a user passphrase using production KDF parameters.
 ///
 /// Returns bootstrap data for server persistence and an active [`WasmVaultSession`].
 #[wasm_bindgen]
 pub fn init_vault(passphrase: &str) -> Result<WasmVaultInitResult, JsValue> {
+    init_panic_hook();
     init_vault_impl(passphrase, &KdfParams::new_production()).map_err(to_js_error)
+}
+
+/// Initializes a new vault with explicit KDF parameters JSON (for tests or custom configurations).
+#[wasm_bindgen]
+pub fn init_vault_with_params(
+    passphrase: &str,
+    kdf_params_json: &str,
+) -> Result<WasmVaultInitResult, JsValue> {
+    init_panic_hook();
+    let params: KdfParams =
+        serde_json::from_str(kdf_params_json).map_err(|e| to_js_error(e.to_string()))?;
+    init_vault_impl(passphrase, &params).map_err(to_js_error)
 }
 
 /// Initializes a new vault with explicit KDF parameters (useful for fast testing).
@@ -640,6 +673,68 @@ pub fn wasm_decrypt_envelope(
         created_at: note.created_at,
         updated_at: note.updated_at,
     })
+}
+
+/// Wraps a VaultKey with a formatted RecoveryKey phrase.
+#[wasm_bindgen]
+pub fn wasm_wrap_recovery(
+    vault_key_base64: &str,
+    recovery_phrase: &str,
+) -> Result<String, JsValue> {
+    let key_bytes = Base64::decode_vec(vault_key_base64).map_err(|e| to_js_error(e.to_string()))?;
+    let vault_key = VaultKey::from_slice(&key_bytes).map_err(|e| to_js_error(e.to_string()))?;
+    let recovery_key =
+        parse_recovery_key(recovery_phrase).map_err(|e| to_js_error(e.to_string()))?;
+
+    let wrapped = wrap_vault_key_recovery(&vault_key, &recovery_key)
+        .map_err(|e| to_js_error(e.to_string()))?;
+    serde_json::to_string(&wrapped).map_err(|e| to_js_error(e.to_string()))
+}
+
+/// Unwraps a recovery-wrapped VaultKey using a formatted RecoveryKey phrase.
+#[wasm_bindgen]
+pub fn wasm_unwrap_recovery(
+    recovery_phrase: &str,
+    wrapped_recovery_key_json: &str,
+) -> Result<String, JsValue> {
+    let recovery_key =
+        parse_recovery_key(recovery_phrase).map_err(|e| to_js_error(e.to_string()))?;
+    let wrapped: WrappedVaultKey =
+        serde_json::from_str(wrapped_recovery_key_json).map_err(|e| to_js_error(e.to_string()))?;
+
+    let unwrapped = unwrap_vault_key_recovery(&wrapped, &recovery_key)
+        .map_err(|e| to_js_error(format!("recovery unwrap failed: {e}")))?;
+    Ok(Base64::encode_string(unwrapped.as_bytes()))
+}
+
+/// Encrypts raw bytes into an EncryptedEnvelope JSON string.
+#[wasm_bindgen]
+pub fn wasm_encrypt_raw(
+    vault_key_base64: &str,
+    object_id: &str,
+    object_kind: u16,
+    plaintext: &[u8],
+) -> Result<String, JsValue> {
+    let key_bytes = Base64::decode_vec(vault_key_base64).map_err(|e| to_js_error(e.to_string()))?;
+    let vault_key = VaultKey::from_slice(&key_bytes).map_err(|e| to_js_error(e.to_string()))?;
+
+    let envelope = encrypt_envelope(plaintext, &vault_key, object_id, object_kind)
+        .map_err(|e| to_js_error(e.to_string()))?;
+    serde_json::to_string(&envelope).map_err(|e| to_js_error(e.to_string()))
+}
+
+/// Decrypts raw bytes from an EncryptedEnvelope JSON string.
+#[wasm_bindgen]
+pub fn wasm_decrypt_raw(vault_key_base64: &str, envelope_json: &str) -> Result<Vec<u8>, JsValue> {
+    let key_bytes = Base64::decode_vec(vault_key_base64).map_err(|e| to_js_error(e.to_string()))?;
+    let vault_key = VaultKey::from_slice(&key_bytes).map_err(|e| to_js_error(e.to_string()))?;
+
+    let envelope: EncryptedEnvelope =
+        serde_json::from_str(envelope_json).map_err(|e| to_js_error(e.to_string()))?;
+
+    let plaintext = decrypt_envelope(&envelope, &vault_key)
+        .map_err(|e| to_js_error(format!("decrypt failed: {e}")))?;
+    Ok(plaintext)
 }
 
 #[cfg(test)]
