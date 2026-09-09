@@ -156,7 +156,7 @@ Completion notes:
 ---
 
 ## ZK-005 — Create crypto ADR
-Status: TODO  
+Status: DONE  
 Priority: P0  
 Dependencies: ZK-001
 
@@ -175,6 +175,12 @@ Acceptance criteria:
 - crypto choices documented;
 - no application crypto implementation yet;
 - dependency shortlist documented.
+
+Completion notes:
+- Created ADR-0003 (`docs/adr/0003-cryptographic-architecture.md`) documenting Argon2id KDF (RFC 9106), XChaCha20-Poly1305 AEAD, 256-bit symmetric keys, 192-bit nonces with CSPRNG, key wrapping hierarchy, zeroization, and secret redaction.
+- Documented dependency shortlist (`chacha20poly1305`, `argon2`, `zeroize`, `subtle`, `getrandom`, `rand_core`) for upcoming Milestone M1 implementation.
+- Confirmed zero application crypto code implemented in this step.
+- Verified workspace passes all checks via `./scripts/ci.sh`.
 
 ---
 
