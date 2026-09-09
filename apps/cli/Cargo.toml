@@ -23,3 +23,7 @@ zk-crypto = { workspace = true }
 zk-protocol = { workspace = true }
 zk-storage = { workspace = true }
 zk-sync = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+rusqlite = { workspace = true }

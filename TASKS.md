@@ -602,7 +602,7 @@ Completion notes:
 ---
 
 ## ZK-024 — Create/show/list local notes
-Status: TODO  
+Status: DONE  
 Priority: P0  
 Dependencies: ZK-020, ZK-023
 
@@ -612,6 +612,14 @@ Acceptance criteria:
 - show decrypts only while unlocked;
 - list works using locally decrypted state while unlocked;
 - database contains ciphertext only.
+
+Completion notes:
+- Implemented `zk-note new` (with alias `create`), `zk-note show <note-id>`, and `zk-note list` subcommands in `apps/cli` (`commands.rs`, `main.rs`).
+- `zk-note new` validates input, serializes to canonical plaintext JSON, encrypts with a fresh Object Key wrapped under the session `VaultKey`, saves the encrypted envelope to SQLite `local_objects`, and enqueues a `PendingMutation` in `pending_mutations`. Supports piped stdin or command arguments.
+- `zk-note show` requires an active unlocked session (`VaultKey`), resolves full UUIDs or unique prefix matches (>= 4 chars), decrypts the envelope in-memory, and outputs formatted markdown or JSON. Fails closed with `VaultLocked` when locked.
+- `zk-note list` requires an active unlocked session, decrypts stored envelopes in-memory to present titles, update timestamps, and tags, with support for tag filtering (`--tag`) and JSON output (`--json`). Fails closed with `VaultLocked` when locked.
+- Verified that SQLite database `notes.db` contains ciphertext only, with zero plaintext leakage in database columns or raw disk bytes.
+- Added comprehensive unit and integration tests in `apps/cli/src/main.rs`. Validated via `./scripts/ci.sh`.
 
 ---
 

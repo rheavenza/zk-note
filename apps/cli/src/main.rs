@@ -6,7 +6,7 @@ mod error;
 mod session;
 
 use clap::{Parser, Subcommand};
-use commands::{cmd_init, cmd_lock, cmd_status, cmd_unlock};
+use commands::{cmd_init, cmd_list, cmd_lock, cmd_new, cmd_show, cmd_status, cmd_unlock};
 use error::CliError;
 use std::path::PathBuf;
 
@@ -54,6 +54,40 @@ pub enum Commands {
     Lock,
     /// Display vault status (UNINITIALIZED, LOCKED, or UNLOCKED)
     Status,
+    /// Create a new encrypted note
+    #[command(alias = "create")]
+    New {
+        /// Note title
+        #[arg(short = 't', long)]
+        title: Option<String>,
+
+        /// Note body content (reads from stdin if omitted and piped)
+        #[arg(short = 'b', long)]
+        body: Option<String>,
+
+        /// Tags associated with the note (comma-separated or repeatable)
+        #[arg(short = 'g', long = "tag", value_delimiter = ',')]
+        tag: Vec<String>,
+    },
+    /// Show a decrypted note
+    Show {
+        /// Note identifier (or unique prefix)
+        note_id: String,
+
+        /// Output note in raw JSON format
+        #[arg(long)]
+        json: bool,
+    },
+    /// List notes (requires unlocked vault)
+    List {
+        /// Filter by tag
+        #[arg(short = 'g', long = "tag")]
+        tag: Option<String>,
+
+        /// Output notes in raw JSON format
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn run() -> Result<(), CliError> {
@@ -71,6 +105,18 @@ fn run() -> Result<(), CliError> {
         } => cmd_unlock(data_dir, passphrase, recovery_key),
         Commands::Lock => cmd_lock(data_dir),
         Commands::Status => cmd_status(data_dir),
+        Commands::New { title, body, tag } => {
+            cmd_new(data_dir, title, body, tag)?;
+            Ok(())
+        }
+        Commands::Show { note_id, json } => {
+            cmd_show(data_dir, &note_id, json)?;
+            Ok(())
+        }
+        Commands::List { tag, json } => {
+            cmd_list(data_dir, tag, json)?;
+            Ok(())
+        }
     }
 }
 
@@ -227,6 +273,204 @@ mod tests {
         session::clear_session(&sess_path).expect("clear session");
         assert!(!sess_path.exists());
         assert!(session::load_session_key(&sess_path).is_err());
+
+        let _ = fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn test_cli_create_show_list_note_lifecycle() {
+        let test_dir = temp_test_dir("notes_lifecycle");
+        let dir_path = test_dir.as_path();
+        let pass = "vault-passphrase-123".to_string();
+
+        // 1. Uninitialized vault rejects note creation
+        let uninit_err = cmd_new(
+            Some(dir_path),
+            Some("Note 0".to_string()),
+            Some("Body".to_string()),
+            vec![],
+        )
+        .unwrap_err();
+        match uninit_err {
+            CliError::VaultUninitialized => (),
+            other => panic!("expected VaultUninitialized, got {other:?}"),
+        }
+
+        // 2. Initialize vault (auto-unlocks session)
+        cmd_init(Some(dir_path), Some(pass.clone()), true).expect("init");
+
+        // 3. Create Note 1
+        let note1_id = cmd_new(
+            Some(dir_path),
+            Some("Architecture Plan".to_string()),
+            Some("Client-side encryption details.".to_string()),
+            vec!["architecture".to_string(), "crypto".to_string()],
+        )
+        .expect("create note 1");
+
+        // 4. Create Note 2
+        let note2_id = cmd_new(
+            Some(dir_path),
+            Some("Shopping List".to_string()),
+            Some("Milk, tea, apples.".to_string()),
+            vec!["personal".to_string()],
+        )
+        .expect("create note 2");
+
+        // 5. Show Note 1 by full ID
+        let note1 = cmd_show(Some(dir_path), &note1_id, false).expect("show note 1");
+        assert_eq!(note1.title, "Architecture Plan");
+        assert_eq!(note1.body, "Client-side encryption details.");
+        assert_eq!(note1.tags, vec!["architecture", "crypto"]);
+
+        // 6. Show Note 1 by prefix (first 8 characters)
+        let note1_prefix = &note1_id[..8];
+        let note1_by_prefix =
+            cmd_show(Some(dir_path), note1_prefix, false).expect("show by prefix");
+        assert_eq!(note1_by_prefix.title, "Architecture Plan");
+
+        // 7. List notes (expect 2 notes)
+        let all_notes = cmd_list(Some(dir_path), None, false).expect("list notes");
+        assert_eq!(all_notes.len(), 2);
+        // Sorted by updated_at descending, note 2 was created after note 1
+        assert_eq!(all_notes[0].id, note2_id);
+        assert_eq!(all_notes[1].id, note1_id);
+
+        // 8. List notes with tag filter
+        let crypto_notes =
+            cmd_list(Some(dir_path), Some("crypto".to_string()), false).expect("list crypto notes");
+        assert_eq!(crypto_notes.len(), 1);
+        assert_eq!(crypto_notes[0].id, note1_id);
+        assert_eq!(crypto_notes[0].title, "Architecture Plan");
+
+        let personal_notes = cmd_list(Some(dir_path), Some("personal".to_string()), false)
+            .expect("list personal notes");
+        assert_eq!(personal_notes.len(), 1);
+        assert_eq!(personal_notes[0].id, note2_id);
+
+        let non_existent_tag = cmd_list(Some(dir_path), Some("nonexistent".to_string()), false)
+            .expect("list nonexistent tag");
+        assert!(non_existent_tag.is_empty());
+
+        // 9. Lock vault -> all note operations fail closed
+        cmd_lock(Some(dir_path)).expect("lock");
+
+        let locked_show = cmd_show(Some(dir_path), &note1_id, false).unwrap_err();
+        match locked_show {
+            CliError::VaultLocked => (),
+            other => panic!("expected VaultLocked on show, got {other:?}"),
+        }
+
+        let locked_list = cmd_list(Some(dir_path), None, false).unwrap_err();
+        match locked_list {
+            CliError::VaultLocked => (),
+            other => panic!("expected VaultLocked on list, got {other:?}"),
+        }
+
+        let locked_new = cmd_new(
+            Some(dir_path),
+            Some("Locked Note".to_string()),
+            Some("Cannot create while locked".to_string()),
+            vec![],
+        )
+        .unwrap_err();
+        match locked_new {
+            CliError::VaultLocked => (),
+            other => panic!("expected VaultLocked on new, got {other:?}"),
+        }
+
+        // 10. Unlock again -> show and list succeed
+        cmd_unlock(Some(dir_path), Some(pass), None).expect("unlock");
+
+        let unlocked_show = cmd_show(Some(dir_path), &note1_id, false).expect("show unlocked");
+        assert_eq!(unlocked_show.title, "Architecture Plan");
+
+        let unlocked_list = cmd_list(Some(dir_path), None, false).expect("list unlocked");
+        assert_eq!(unlocked_list.len(), 2);
+
+        let _ = fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn test_cli_database_contains_ciphertext_only() {
+        let test_dir = temp_test_dir("no_plaintext_db");
+        let dir_path = test_dir.as_path();
+        let pass = "db-cipher-only-pass".to_string();
+
+        cmd_init(Some(dir_path), Some(pass), true).expect("init");
+
+        let unique_title = "CLASSIFIED_TOP_SECRET_TITLENAME_9999";
+        let unique_body = "BODY_SUPER_SECRET_PAYLOAD_STRING_8888";
+        let unique_tag = "tagclassified7777";
+
+        let note_id = cmd_new(
+            Some(dir_path),
+            Some(unique_title.to_string()),
+            Some(unique_body.to_string()),
+            vec![unique_tag.to_string()],
+        )
+        .expect("create note");
+
+        let db_path = config::db_file(dir_path);
+        assert!(db_path.exists());
+
+        // 1. Raw disk byte scan: no plaintext string exists anywhere in the sqlite database file
+        let db_bytes = fs::read(&db_path).expect("read db file");
+        assert!(
+            !db_bytes
+                .windows(unique_title.len())
+                .any(|w| w == unique_title.as_bytes()),
+            "plaintext title found in raw sqlite file bytes!"
+        );
+        assert!(
+            !db_bytes
+                .windows(unique_body.len())
+                .any(|w| w == unique_body.as_bytes()),
+            "plaintext body found in raw sqlite file bytes!"
+        );
+        assert!(
+            !db_bytes
+                .windows(unique_tag.len())
+                .any(|w| w == unique_tag.as_bytes()),
+            "plaintext tag found in raw sqlite file bytes!"
+        );
+
+        // 2. Query sqlite tables directly via rusqlite
+        let conn = rusqlite::Connection::open(&db_path).expect("open raw conn");
+
+        // Check local_objects
+        let (obj_id, envelope_json): (String, String) = conn
+            .query_row(
+                "SELECT object_id, envelope FROM local_objects WHERE object_id = ?1",
+                rusqlite::params![note_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("query local_objects");
+
+        assert_eq!(obj_id, note_id);
+        assert!(!envelope_json.contains(unique_title));
+        assert!(!envelope_json.contains(unique_body));
+        assert!(!envelope_json.contains(unique_tag));
+
+        // Parse envelope to confirm it contains ciphertext and wrapped key
+        let envelope: zk_protocol::envelope::EncryptedEnvelope =
+            serde_json::from_str(&envelope_json).expect("parse envelope json");
+        assert_eq!(envelope.envelope_version, 1);
+        assert!(!envelope.payload.ciphertext.is_empty());
+
+        // Check pending_mutations
+        let (mut_obj_id, mut_envelope_json): (String, String) = conn
+            .query_row(
+                "SELECT object_id, envelope FROM pending_mutations WHERE object_id = ?1",
+                rusqlite::params![note_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("query pending_mutations");
+
+        assert_eq!(mut_obj_id, note_id);
+        assert!(!mut_envelope_json.contains(unique_title));
+        assert!(!mut_envelope_json.contains(unique_body));
+        assert!(!mut_envelope_json.contains(unique_tag));
 
         let _ = fs::remove_dir_all(&test_dir);
     }
