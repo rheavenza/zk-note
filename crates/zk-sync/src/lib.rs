@@ -2,6 +2,7 @@
 //! conflict detection, and deterministic three-way merge logic.
 
 pub mod adapter;
+pub mod conflict;
 pub mod cursor;
 pub mod diff3;
 pub mod error;
@@ -13,6 +14,10 @@ pub mod queue;
 
 pub use adapter::{
     validate_no_plaintext_secrets, MockSyncAdapter, NativeHttpSyncAdapter, SyncServerAdapter,
+};
+pub use conflict::{
+    generate_merge_candidate, record_conflict, resolve_conflict, ConflictResolutionResult,
+    ConflictResolutionStrategy,
 };
 pub use cursor::{CursorError, DurableSyncCursor};
 pub use diff3::{diff3_merge, BodyConflict, Diff3Result};

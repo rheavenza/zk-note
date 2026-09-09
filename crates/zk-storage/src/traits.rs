@@ -1,7 +1,9 @@
 //! Storage traits defining abstract interfaces for persistence.
 
 use crate::error::StorageError;
-use crate::models::{ObjectFilter, PendingMutation, StoredEncryptedObject, SyncState};
+use crate::models::{
+    ConflictRecord, ObjectFilter, PendingMutation, StoredEncryptedObject, SyncState,
+};
 use zk_protocol::envelope::EncryptedEnvelope;
 
 /// Abstract store for persisting and querying encrypted objects.
@@ -109,14 +111,52 @@ pub trait SyncStateStore: Send + Sync {
     fn set_sync_state(&self, state: &SyncState) -> Result<(), StorageError>;
 }
 
-/// Unified local storage abstraction combining object, mutation, base version, and sync state stores.
+/// Abstract store for persisting, querying, and resolving conflict records (ZK-053).
+pub trait ConflictStore: Send + Sync {
+    /// Inserts or updates a conflict record.
+    fn put_conflict(&self, conflict: &ConflictRecord) -> Result<(), StorageError>;
+
+    /// Retrieves a conflict record by its unique conflict ID.
+    fn get_conflict(&self, conflict_id: &str) -> Result<Option<ConflictRecord>, StorageError>;
+
+    /// Retrieves the active (unresolved) conflict record for a specific object, if one exists.
+    fn get_active_conflict_for_object(
+        &self,
+        object_id: &str,
+    ) -> Result<Option<ConflictRecord>, StorageError>;
+
+    /// Lists conflict records matching the given resolution status filter.
+    /// If `resolved` is None, returns all conflicts (both resolved and unresolved).
+    /// If `resolved` is Some(true), returns only resolved conflicts.
+    /// If `resolved` is Some(false), returns only unresolved conflicts.
+    fn list_conflicts(&self, resolved: Option<bool>) -> Result<Vec<ConflictRecord>, StorageError>;
+
+    /// Marks a conflict as resolved, optionally updating the candidate/resolved envelope.
+    fn resolve_conflict(
+        &self,
+        conflict_id: &str,
+        resolved_envelope: Option<EncryptedEnvelope>,
+        resolved_at: String,
+    ) -> Result<bool, StorageError>;
+
+    /// Permanently removes a conflict record (for cleanup).
+    fn delete_conflict(&self, conflict_id: &str) -> Result<bool, StorageError>;
+}
+
+/// Unified local storage abstraction combining object, mutation, base version, sync state, and conflict stores.
 pub trait LocalStorage:
-    ObjectStore + MutationStore + BaseVersionStore + SyncStateStore + Send + Sync
+    ObjectStore + MutationStore + BaseVersionStore + SyncStateStore + ConflictStore + Send + Sync
 {
 }
 
 impl<T> LocalStorage for T where
-    T: ObjectStore + MutationStore + BaseVersionStore + SyncStateStore + Send + Sync
+    T: ObjectStore
+        + MutationStore
+        + BaseVersionStore
+        + SyncStateStore
+        + ConflictStore
+        + Send
+        + Sync
 {
 }
 
@@ -240,5 +280,39 @@ impl<T: SyncStateStore + ?Sized> SyncStateStore for Arc<T> {
 
     fn set_sync_state(&self, state: &SyncState) -> Result<(), StorageError> {
         (**self).set_sync_state(state)
+    }
+}
+
+impl<T: ConflictStore + ?Sized> ConflictStore for Arc<T> {
+    fn put_conflict(&self, conflict: &ConflictRecord) -> Result<(), StorageError> {
+        (**self).put_conflict(conflict)
+    }
+
+    fn get_conflict(&self, conflict_id: &str) -> Result<Option<ConflictRecord>, StorageError> {
+        (**self).get_conflict(conflict_id)
+    }
+
+    fn get_active_conflict_for_object(
+        &self,
+        object_id: &str,
+    ) -> Result<Option<ConflictRecord>, StorageError> {
+        (**self).get_active_conflict_for_object(object_id)
+    }
+
+    fn list_conflicts(&self, resolved: Option<bool>) -> Result<Vec<ConflictRecord>, StorageError> {
+        (**self).list_conflicts(resolved)
+    }
+
+    fn resolve_conflict(
+        &self,
+        conflict_id: &str,
+        resolved_envelope: Option<EncryptedEnvelope>,
+        resolved_at: String,
+    ) -> Result<bool, StorageError> {
+        (**self).resolve_conflict(conflict_id, resolved_envelope, resolved_at)
+    }
+
+    fn delete_conflict(&self, conflict_id: &str) -> Result<bool, StorageError> {
+        (**self).delete_conflict(conflict_id)
     }
 }

@@ -1367,7 +1367,7 @@ Completion notes:
 ---
 
 ## ZK-053 — Conflict record model
-Status: TODO  
+Status: DONE  
 Priority: P0  
 Dependencies: ZK-051, ZK-052
 
@@ -1385,6 +1385,19 @@ Acceptance criteria:
 - survives restart;
 - contains enough information to retry after resolution;
 - no plaintext durable conflict body.
+
+Completion notes:
+- Created SQLite migration `migrations/005_local_conflict_records.sql` creating the `conflict_records` table, indexed by `object_id` and `resolved`, holding strictly encrypted envelopes (`base_envelope`, `local_envelope`, `remote_envelope`, `candidate_envelope`) and metadata (`conflict_id`, `object_id`, `object_kind`, `base_revision`, `remote_revision`, `created_at`, `resolved_at`). Zero plaintext columns for title, body, or tags.
+- Defined `ConflictRecord` domain model in `crates/zk-storage/src/models.rs`.
+- Defined `ConflictStore` trait in `crates/zk-storage/src/traits.rs` (`put_conflict`, `get_conflict`, `get_active_conflict_for_object`, `list_conflicts`, `resolve_conflict`, `delete_conflict`), composed it into the `LocalStorage` trait, and implemented `Arc<T>` delegation.
+- Implemented `ConflictStore` in both `MemoryStorage` (`crates/zk-storage/src/memory.rs`) and `SqliteStorage` (`crates/zk-storage/src/sqlite.rs`).
+- Created conflict engine in `crates/zk-sync/src/conflict.rs` (`generate_merge_candidate`, `record_conflict`, `resolve_conflict`) supporting `KeepLocal`, `KeepRemote`, `Merge`, and `DuplicateAsSeparate` strategies, packaging retry mutations with correct target expected revisions.
+- Integrated automatic conflict record creation on push CAS conflict in `crates/zk-sync/src/push.rs` and `crates/zk-sync/src/orchestrator.rs`.
+- Added unit and integration tests in `crates/zk-storage` and `crates/zk-sync/tests/conflict_record_persistence_tests.rs`:
+  - Verified conflict records survive process restarts and SQLite database close/reopen;
+  - Verified all resolution paths retain sufficient metadata (`remote_revision`, envelopes) for immediate CAS retry mutations;
+  - Performed raw binary disk inspection proving zero plaintext leakage into SQLite disk files (SEC-009).
+- Passed all quality gates via `./scripts/ci.sh`.
 
 ---
 

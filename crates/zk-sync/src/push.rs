@@ -12,10 +12,12 @@ use crate::adapter::SyncServerAdapter;
 use crate::error::SyncNetworkError;
 use crate::queue::{PendingMutationQueue, QueueError};
 use std::fmt;
+use uuid::Uuid;
+use zk_core::time::now_utc_rfc3339;
 use zk_protocol::sync::{ConflictResponse, PushRequest};
 use zk_storage::error::StorageError;
-use zk_storage::models::{MutationStatus, MutationType, PendingMutation};
-use zk_storage::traits::{BaseVersionStore, MutationStore, ObjectStore};
+use zk_storage::models::{ConflictRecord, MutationStatus, MutationType, PendingMutation};
+use zk_storage::traits::{BaseVersionStore, ConflictStore, MutationStore, ObjectStore};
 
 /// Configuration options for pushing pending mutations.
 #[derive(Debug, Clone, Default)]
@@ -124,7 +126,7 @@ pub async fn push_pending_changes<A, S>(
 ) -> Result<PushReport, PushError>
 where
     A: SyncServerAdapter,
-    S: MutationStore + ObjectStore + BaseVersionStore,
+    S: MutationStore + ObjectStore + BaseVersionStore + ConflictStore,
 {
     let pending_mutations = queue.list_pending()?;
     let mut report = PushReport::default();
@@ -178,6 +180,25 @@ where
                 // Requirement 4: conflict leaves local mutation recoverable
                 // Reset status to Pending (or keep in queue) so local edits are NOT discarded
                 let _ = queue.mark_pending(&mutation.mutation_id);
+
+                let base_envelope = queue
+                    .storage()
+                    .get_base_version(&mutation.object_id, mutation.expected_revision)
+                    .unwrap_or(None);
+
+                let conflict_record = ConflictRecord::new(
+                    Uuid::new_v4().to_string(),
+                    &mutation.object_id,
+                    mutation.object_kind,
+                    mutation.expected_revision,
+                    conflict.current_revision,
+                    base_envelope,
+                    mutation.envelope.clone(),
+                    conflict.current_envelope.clone(),
+                    None,
+                    now_utc_rfc3339(),
+                );
+                let _ = queue.storage().put_conflict(&conflict_record);
 
                 report.conflicts.push(PushItemConflict {
                     mutation,

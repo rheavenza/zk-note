@@ -141,3 +141,70 @@ impl Default for SyncState {
         }
     }
 }
+
+/// A persistent conflict record capturing divergent concurrent modifications (ZK-053).
+///
+/// In accordance with MASTER_SPEC.md § 10.3 and SEC-009:
+/// - BASE, LOCAL, REMOTE, and CANDIDATE versions are stored strictly as encrypted envelopes.
+/// - Contains no plaintext title, body, or tags columns.
+/// - Persisted across application restarts.
+/// - Contains sufficient metadata to retry push or apply resolution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConflictRecord {
+    /// Unique identifier for this conflict record (UUID v4).
+    pub conflict_id: String,
+    /// Target object identifier.
+    pub object_id: String,
+    /// Protocol object kind discriminant (e.g. 1 = Note).
+    pub object_kind: u16,
+    /// Revision of the base object prior to divergent edits.
+    pub base_revision: u64,
+    /// Revision of the remote object that diverged on the server.
+    pub remote_revision: u64,
+    /// Encrypted envelope of the BASE revision (if available).
+    pub base_envelope: Option<EncryptedEnvelope>,
+    /// Encrypted envelope of the LOCAL edit.
+    pub local_envelope: EncryptedEnvelope,
+    /// Encrypted envelope of the REMOTE revision fetched from the server.
+    pub remote_envelope: EncryptedEnvelope,
+    /// Encrypted envelope of the generated 3-way merge candidate (with diff3 conflict markers if unmerged).
+    pub candidate_envelope: Option<EncryptedEnvelope>,
+    /// Whether this conflict has been resolved by the user or resolution policy.
+    pub resolved: bool,
+    /// Timestamp when this conflict record was created (RFC 3339 UTC).
+    pub created_at: String,
+    /// Timestamp when this conflict record was marked resolved, if resolved (RFC 3339 UTC).
+    pub resolved_at: Option<String>,
+}
+
+impl ConflictRecord {
+    /// Creates a new unresolved conflict record.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        conflict_id: impl Into<String>,
+        object_id: impl Into<String>,
+        object_kind: u16,
+        base_revision: u64,
+        remote_revision: u64,
+        base_envelope: Option<EncryptedEnvelope>,
+        local_envelope: EncryptedEnvelope,
+        remote_envelope: EncryptedEnvelope,
+        candidate_envelope: Option<EncryptedEnvelope>,
+        created_at: impl Into<String>,
+    ) -> Self {
+        Self {
+            conflict_id: conflict_id.into(),
+            object_id: object_id.into(),
+            object_kind,
+            base_revision,
+            remote_revision,
+            base_envelope,
+            local_envelope,
+            remote_envelope,
+            candidate_envelope,
+            resolved: false,
+            created_at: created_at.into(),
+            resolved_at: None,
+        }
+    }
+}

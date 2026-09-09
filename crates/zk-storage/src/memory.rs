@@ -2,15 +2,15 @@
 
 use crate::error::StorageError;
 use crate::models::{
-    MutationStatus, ObjectFilter, PendingMutation, StoredEncryptedObject, SyncState,
+    ConflictRecord, MutationStatus, ObjectFilter, PendingMutation, StoredEncryptedObject, SyncState,
 };
-use crate::traits::{BaseVersionStore, MutationStore, ObjectStore, SyncStateStore};
+use crate::traits::{BaseVersionStore, ConflictStore, MutationStore, ObjectStore, SyncStateStore};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use zk_protocol::envelope::EncryptedEnvelope;
 
 /// In-memory thread-safe implementation of [`ObjectStore`], [`MutationStore`],
-/// [`BaseVersionStore`], and [`SyncStateStore`].
+/// [`BaseVersionStore`], [`SyncStateStore`], and [`ConflictStore`].
 ///
 /// Designed as a test double and ephemeral storage adapter for tests and local experiments.
 #[derive(Debug, Default, Clone)]
@@ -19,6 +19,7 @@ pub struct MemoryStorage {
     mutations: Arc<RwLock<Vec<PendingMutation>>>,
     base_versions: Arc<RwLock<HashMap<(String, u64), EncryptedEnvelope>>>,
     sync_state: Arc<RwLock<SyncState>>,
+    conflicts: Arc<RwLock<HashMap<String, ConflictRecord>>>,
 }
 
 impl MemoryStorage {
@@ -300,6 +301,86 @@ impl SyncStateStore for MemoryStorage {
     }
 }
 
+impl ConflictStore for MemoryStorage {
+    fn put_conflict(&self, conflict: &ConflictRecord) -> Result<(), StorageError> {
+        let mut guard = self
+            .conflicts
+            .write()
+            .map_err(|e| StorageError::Backend(format!("lock error: {e}")))?;
+        guard.insert(conflict.conflict_id.clone(), conflict.clone());
+        Ok(())
+    }
+
+    fn get_conflict(&self, conflict_id: &str) -> Result<Option<ConflictRecord>, StorageError> {
+        let guard = self
+            .conflicts
+            .read()
+            .map_err(|e| StorageError::Backend(format!("lock error: {e}")))?;
+        Ok(guard.get(conflict_id).cloned())
+    }
+
+    fn get_active_conflict_for_object(
+        &self,
+        object_id: &str,
+    ) -> Result<Option<ConflictRecord>, StorageError> {
+        let guard = self
+            .conflicts
+            .read()
+            .map_err(|e| StorageError::Backend(format!("lock error: {e}")))?;
+        Ok(guard
+            .values()
+            .find(|c| c.object_id == object_id && !c.resolved)
+            .cloned())
+    }
+
+    fn list_conflicts(&self, resolved: Option<bool>) -> Result<Vec<ConflictRecord>, StorageError> {
+        let guard = self
+            .conflicts
+            .read()
+            .map_err(|e| StorageError::Backend(format!("lock error: {e}")))?;
+        let mut list: Vec<ConflictRecord> = guard
+            .values()
+            .filter(|c| match resolved {
+                Some(r) => c.resolved == r,
+                None => true,
+            })
+            .cloned()
+            .collect();
+        list.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        Ok(list)
+    }
+
+    fn resolve_conflict(
+        &self,
+        conflict_id: &str,
+        resolved_envelope: Option<EncryptedEnvelope>,
+        resolved_at: String,
+    ) -> Result<bool, StorageError> {
+        let mut guard = self
+            .conflicts
+            .write()
+            .map_err(|e| StorageError::Backend(format!("lock error: {e}")))?;
+        if let Some(record) = guard.get_mut(conflict_id) {
+            record.resolved = true;
+            record.resolved_at = Some(resolved_at);
+            if resolved_envelope.is_some() {
+                record.candidate_envelope = resolved_envelope;
+            }
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    fn delete_conflict(&self, conflict_id: &str) -> Result<bool, StorageError> {
+        let mut guard = self
+            .conflicts
+            .write()
+            .map_err(|e| StorageError::Backend(format!("lock error: {e}")))?;
+        Ok(guard.remove(conflict_id).is_some())
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
@@ -533,5 +614,71 @@ mod tests {
             .expect("list notebooks");
         assert_eq!(notebooks.len(), 1);
         assert_eq!(notebooks[0].object_id, "nb-1");
+    }
+
+    #[test]
+    fn test_memory_conflict_store() {
+        let store = MemoryStorage::new();
+        let obj_id = "mem-obj-conflict-1";
+        let base_env = dummy_envelope(obj_id, OBJECT_KIND_NOTE);
+        let local_env = dummy_envelope(obj_id, OBJECT_KIND_NOTE);
+        let remote_env = dummy_envelope(obj_id, OBJECT_KIND_NOTE);
+        let candidate_env = dummy_envelope(obj_id, OBJECT_KIND_NOTE);
+
+        let conflict = ConflictRecord::new(
+            "mem-conf-1",
+            obj_id,
+            OBJECT_KIND_NOTE,
+            1,
+            2,
+            Some(base_env),
+            local_env,
+            remote_env,
+            Some(candidate_env.clone()),
+            "2026-09-10T01:00:00Z",
+        );
+
+        store.put_conflict(&conflict).expect("put");
+
+        let fetched = store
+            .get_conflict("mem-conf-1")
+            .expect("get")
+            .expect("found");
+        assert_eq!(fetched.conflict_id, "mem-conf-1");
+        assert_eq!(fetched.base_revision, 1);
+        assert_eq!(fetched.remote_revision, 2);
+        assert!(!fetched.resolved);
+
+        let active = store
+            .get_active_conflict_for_object(obj_id)
+            .expect("get active")
+            .expect("active found");
+        assert_eq!(active.conflict_id, "mem-conf-1");
+
+        let unresolved = store.list_conflicts(Some(false)).expect("list unresolved");
+        assert_eq!(unresolved.len(), 1);
+
+        let resolved_env = dummy_envelope(obj_id, OBJECT_KIND_NOTE);
+        let resolved = store
+            .resolve_conflict(
+                "mem-conf-1",
+                Some(resolved_env.clone()),
+                "2026-09-10T02:00:00Z".to_string(),
+            )
+            .expect("resolve");
+        assert!(resolved);
+
+        assert!(store
+            .get_active_conflict_for_object(obj_id)
+            .expect("get active")
+            .is_none());
+
+        let resolved_list = store.list_conflicts(Some(true)).expect("list resolved");
+        assert_eq!(resolved_list.len(), 1);
+        assert!(resolved_list[0].resolved);
+        assert_eq!(resolved_list[0].candidate_envelope, Some(resolved_env));
+
+        assert!(store.delete_conflict("mem-conf-1").expect("delete"));
+        assert!(store.get_conflict("mem-conf-1").expect("get").is_none());
     }
 }

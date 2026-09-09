@@ -29,7 +29,9 @@ use std::fmt;
 use zk_core::vault::VaultSession;
 use zk_crypto::keys::VaultKey;
 use zk_storage::error::StorageError;
-use zk_storage::traits::{BaseVersionStore, MutationStore, ObjectStore, SyncStateStore};
+use zk_storage::traits::{
+    BaseVersionStore, ConflictStore, MutationStore, ObjectStore, SyncStateStore,
+};
 
 /// Configuration options for a full synchronization cycle.
 #[derive(Debug, Clone, Default)]
@@ -167,7 +169,7 @@ pub async fn run_sync_cycle<A, S>(
 ) -> Result<SyncCycleReport, SyncCycleError>
 where
     A: SyncServerAdapter,
-    S: ObjectStore + SyncStateStore + MutationStore + BaseVersionStore,
+    S: ObjectStore + SyncStateStore + MutationStore + BaseVersionStore + ConflictStore,
 {
     // Step 1: Crash recovery - reset any stuck InFlight mutations back to Pending (SEC-007)
     let _ = queue.reset_in_flight();
@@ -233,7 +235,7 @@ pub async fn run_sync_cycle_with_session<A, S>(
 ) -> Result<SyncCycleReport, SyncCycleError>
 where
     A: SyncServerAdapter,
-    S: ObjectStore + SyncStateStore + MutationStore + BaseVersionStore,
+    S: ObjectStore + SyncStateStore + MutationStore + BaseVersionStore + ConflictStore,
 {
     // Step 1: Crash recovery - reset any stuck InFlight mutations back to Pending (SEC-007)
     let _ = queue.reset_in_flight();
@@ -299,7 +301,7 @@ pub struct SyncEngine<A, S> {
 impl<A, S> SyncEngine<A, S>
 where
     A: SyncServerAdapter,
-    S: ObjectStore + SyncStateStore + MutationStore + BaseVersionStore + Clone,
+    S: ObjectStore + SyncStateStore + MutationStore + BaseVersionStore + ConflictStore + Clone,
 {
     /// Creates a new [`SyncEngine`] wrapping the network adapter and storage backend.
     pub fn new(adapter: A, storage: S) -> Self {

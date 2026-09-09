@@ -2,15 +2,17 @@
 
 use crate::error::StorageError;
 use crate::models::{
-    MutationStatus, MutationType, ObjectFilter, PendingMutation, StoredEncryptedObject, SyncState,
+    ConflictRecord, MutationStatus, MutationType, ObjectFilter, PendingMutation,
+    StoredEncryptedObject, SyncState,
 };
-use crate::traits::{BaseVersionStore, MutationStore, ObjectStore, SyncStateStore};
+use crate::traits::{BaseVersionStore, ConflictStore, MutationStore, ObjectStore, SyncStateStore};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use zk_protocol::envelope::EncryptedEnvelope;
 
 const MIGRATION_001: &str = include_str!("../../../migrations/001_initial_local_storage.sql");
+const MIGRATION_005: &str = include_str!("../../../migrations/005_local_conflict_records.sql");
 
 /// SQLite-backed persistent local encrypted storage.
 ///
@@ -114,6 +116,18 @@ fn run_migrations(conn: &mut Connection) -> Result<(), StorageError> {
 
         tx.commit()
             .map_err(|e| StorageError::Backend(format!("failed to commit migration 001: {e}")))?;
+    }
+
+    if version < 2 {
+        let tx = conn.transaction().map_err(|e| {
+            StorageError::Backend(format!("failed to begin migration transaction: {e}"))
+        })?;
+
+        tx.execute_batch(MIGRATION_005)
+            .map_err(|e| StorageError::Backend(format!("failed to execute migration 005: {e}")))?;
+
+        tx.commit()
+            .map_err(|e| StorageError::Backend(format!("failed to commit migration 005: {e}")))?;
     }
 
     Ok(())
@@ -848,6 +862,308 @@ impl SyncStateStore for SqliteStorage {
     }
 }
 
+impl ConflictStore for SqliteStorage {
+    fn put_conflict(&self, conflict: &ConflictRecord) -> Result<(), StorageError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StorageError::Backend(format!("mutex lock failed: {e}")))?;
+
+        let base_env_json = conflict
+            .base_envelope
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| {
+                StorageError::Serialization(format!("failed to serialize base envelope: {e}"))
+            })?;
+
+        let local_env_json = serde_json::to_string(&conflict.local_envelope).map_err(|e| {
+            StorageError::Serialization(format!("failed to serialize local envelope: {e}"))
+        })?;
+
+        let remote_env_json = serde_json::to_string(&conflict.remote_envelope).map_err(|e| {
+            StorageError::Serialization(format!("failed to serialize remote envelope: {e}"))
+        })?;
+
+        let candidate_env_json = conflict
+            .candidate_envelope
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| {
+                StorageError::Serialization(format!("failed to serialize candidate envelope: {e}"))
+            })?;
+
+        let resolved_int = if conflict.resolved { 1i64 } else { 0i64 };
+
+        let mut stmt = conn
+            .prepare_cached(
+                "INSERT INTO conflict_records (
+                    conflict_id, object_id, object_kind, base_revision, remote_revision,
+                    base_envelope, local_envelope, remote_envelope, candidate_envelope,
+                    resolved, created_at, resolved_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                 ON CONFLICT (conflict_id) DO UPDATE SET
+                    object_id = excluded.object_id,
+                    object_kind = excluded.object_kind,
+                    base_revision = excluded.base_revision,
+                    remote_revision = excluded.remote_revision,
+                    base_envelope = excluded.base_envelope,
+                    local_envelope = excluded.local_envelope,
+                    remote_envelope = excluded.remote_envelope,
+                    candidate_envelope = excluded.candidate_envelope,
+                    resolved = excluded.resolved,
+                    created_at = excluded.created_at,
+                    resolved_at = excluded.resolved_at;",
+            )
+            .map_err(|e| StorageError::Backend(format!("prepare put_conflict failed: {e}")))?;
+
+        stmt.execute(params![
+            conflict.conflict_id,
+            conflict.object_id,
+            conflict.object_kind,
+            conflict.base_revision,
+            conflict.remote_revision,
+            base_env_json,
+            local_env_json,
+            remote_env_json,
+            candidate_env_json,
+            resolved_int,
+            conflict.created_at,
+            conflict.resolved_at,
+        ])
+        .map_err(|e| StorageError::Backend(format!("execute put_conflict failed: {e}")))?;
+
+        Ok(())
+    }
+
+    fn get_conflict(&self, conflict_id: &str) -> Result<Option<ConflictRecord>, StorageError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StorageError::Backend(format!("mutex lock failed: {e}")))?;
+
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT conflict_id, object_id, object_kind, base_revision, remote_revision,
+                        base_envelope, local_envelope, remote_envelope, candidate_envelope,
+                        resolved, created_at, resolved_at
+                 FROM conflict_records WHERE conflict_id = ?1;",
+            )
+            .map_err(|e| StorageError::Backend(format!("prepare get_conflict failed: {e}")))?;
+
+        let row = stmt
+            .query_row(params![conflict_id], row_to_conflict_record)
+            .optional()
+            .map_err(|e| StorageError::Backend(format!("execute get_conflict failed: {e}")))?;
+
+        Ok(row)
+    }
+
+    fn get_active_conflict_for_object(
+        &self,
+        object_id: &str,
+    ) -> Result<Option<ConflictRecord>, StorageError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StorageError::Backend(format!("mutex lock failed: {e}")))?;
+
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT conflict_id, object_id, object_kind, base_revision, remote_revision,
+                        base_envelope, local_envelope, remote_envelope, candidate_envelope,
+                        resolved, created_at, resolved_at
+                 FROM conflict_records WHERE object_id = ?1 AND resolved = 0
+                 ORDER BY created_at DESC LIMIT 1;",
+            )
+            .map_err(|e| {
+                StorageError::Backend(format!(
+                    "prepare get_active_conflict_for_object failed: {e}"
+                ))
+            })?;
+
+        let row = stmt
+            .query_row(params![object_id], row_to_conflict_record)
+            .optional()
+            .map_err(|e| {
+                StorageError::Backend(format!(
+                    "execute get_active_conflict_for_object failed: {e}"
+                ))
+            })?;
+
+        Ok(row)
+    }
+
+    fn list_conflicts(&self, resolved: Option<bool>) -> Result<Vec<ConflictRecord>, StorageError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StorageError::Backend(format!("mutex lock failed: {e}")))?;
+
+        let sql = match resolved {
+            None => {
+                "SELECT conflict_id, object_id, object_kind, base_revision, remote_revision,
+                        base_envelope, local_envelope, remote_envelope, candidate_envelope,
+                        resolved, created_at, resolved_at
+                 FROM conflict_records ORDER BY created_at ASC;"
+            }
+            Some(true) => {
+                "SELECT conflict_id, object_id, object_kind, base_revision, remote_revision,
+                        base_envelope, local_envelope, remote_envelope, candidate_envelope,
+                        resolved, created_at, resolved_at
+                 FROM conflict_records WHERE resolved = 1 ORDER BY created_at ASC;"
+            }
+            Some(false) => {
+                "SELECT conflict_id, object_id, object_kind, base_revision, remote_revision,
+                        base_envelope, local_envelope, remote_envelope, candidate_envelope,
+                        resolved, created_at, resolved_at
+                 FROM conflict_records WHERE resolved = 0 ORDER BY created_at ASC;"
+            }
+        };
+
+        let mut stmt = conn
+            .prepare_cached(sql)
+            .map_err(|e| StorageError::Backend(format!("prepare list_conflicts failed: {e}")))?;
+
+        let rows = stmt
+            .query_map([], row_to_conflict_record)
+            .map_err(|e| StorageError::Backend(format!("query list_conflicts failed: {e}")))?;
+
+        let mut list = Vec::new();
+        for r in rows {
+            let rec = r.map_err(|e| StorageError::Backend(format!("row mapping failed: {e}")))?;
+            list.push(rec);
+        }
+
+        Ok(list)
+    }
+
+    fn resolve_conflict(
+        &self,
+        conflict_id: &str,
+        resolved_envelope: Option<EncryptedEnvelope>,
+        resolved_at: String,
+    ) -> Result<bool, StorageError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StorageError::Backend(format!("mutex lock failed: {e}")))?;
+
+        let candidate_json = resolved_envelope
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| {
+                StorageError::Serialization(format!("failed to serialize resolved envelope: {e}"))
+            })?;
+
+        let updated = if let Some(cand) = candidate_json {
+            let mut stmt = conn
+                .prepare_cached(
+                    "UPDATE conflict_records
+                     SET resolved = 1, resolved_at = ?1, candidate_envelope = ?2
+                     WHERE conflict_id = ?3;",
+                )
+                .map_err(|e| {
+                    StorageError::Backend(format!("prepare resolve_conflict failed: {e}"))
+                })?;
+
+            stmt.execute(params![resolved_at, cand, conflict_id])
+                .map_err(|e| {
+                    StorageError::Backend(format!("execute resolve_conflict failed: {e}"))
+                })?
+        } else {
+            let mut stmt = conn
+                .prepare_cached(
+                    "UPDATE conflict_records
+                     SET resolved = 1, resolved_at = ?1
+                     WHERE conflict_id = ?2;",
+                )
+                .map_err(|e| {
+                    StorageError::Backend(format!("prepare resolve_conflict failed: {e}"))
+                })?;
+
+            stmt.execute(params![resolved_at, conflict_id])
+                .map_err(|e| {
+                    StorageError::Backend(format!("execute resolve_conflict failed: {e}"))
+                })?
+        };
+
+        Ok(updated > 0)
+    }
+
+    fn delete_conflict(&self, conflict_id: &str) -> Result<bool, StorageError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StorageError::Backend(format!("mutex lock failed: {e}")))?;
+
+        let mut stmt = conn
+            .prepare_cached("DELETE FROM conflict_records WHERE conflict_id = ?1;")
+            .map_err(|e| StorageError::Backend(format!("prepare delete_conflict failed: {e}")))?;
+
+        let count = stmt
+            .execute(params![conflict_id])
+            .map_err(|e| StorageError::Backend(format!("execute delete_conflict failed: {e}")))?;
+
+        Ok(count > 0)
+    }
+}
+
+fn row_to_conflict_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ConflictRecord> {
+    let conflict_id: String = row.get(0)?;
+    let object_id: String = row.get(1)?;
+    let object_kind: u16 = row.get(2)?;
+    let base_revision: u64 = row.get(3)?;
+    let remote_revision: u64 = row.get(4)?;
+    let base_env_str: Option<String> = row.get(5)?;
+    let local_env_str: String = row.get(6)?;
+    let remote_env_str: String = row.get(7)?;
+    let candidate_env_str: Option<String> = row.get(8)?;
+    let resolved_int: i64 = row.get(9)?;
+    let created_at: String = row.get(10)?;
+    let resolved_at: Option<String> = row.get(11)?;
+
+    let base_envelope = match base_env_str {
+        Some(s) => Some(serde_json::from_str(&s).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(e))
+        })?),
+        None => None,
+    };
+
+    let local_envelope = serde_json::from_str(&local_env_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(e))
+    })?;
+
+    let remote_envelope = serde_json::from_str(&remote_env_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(e))
+    })?;
+
+    let candidate_envelope = match candidate_env_str {
+        Some(s) => Some(serde_json::from_str(&s).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, Box::new(e))
+        })?),
+        None => None,
+    };
+
+    Ok(ConflictRecord {
+        conflict_id,
+        object_id,
+        object_kind,
+        base_revision,
+        remote_revision,
+        base_envelope,
+        local_envelope,
+        remote_envelope,
+        candidate_envelope,
+        resolved: resolved_int != 0,
+        created_at,
+        resolved_at,
+    })
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
@@ -997,6 +1313,7 @@ mod tests {
             "pending_mutations",
             "encrypted_base_versions",
             "sync_state",
+            "conflict_records",
         ];
 
         let forbidden_keywords = [
@@ -1090,6 +1407,21 @@ mod tests {
             storage
                 .put_base_version(id, 1, &envelope)
                 .expect("put base version");
+
+            storage
+                .put_conflict(&ConflictRecord::new(
+                    "canary-conf-1",
+                    id,
+                    OBJECT_KIND_NOTE,
+                    1,
+                    2,
+                    Some(envelope.clone()),
+                    envelope.clone(),
+                    envelope.clone(),
+                    Some(envelope.clone()),
+                    "2026-09-09T05:02:00Z",
+                ))
+                .expect("put conflict");
         }
 
         // Now read the raw DB file from disk
@@ -1108,6 +1440,98 @@ mod tests {
             !file_str.contains(canary_tag),
             "plaintext tag leaked to SQLite file!"
         );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_sqlite_conflict_records_crud_and_reopen() {
+        let path = temp_db_path("conflict_reopen");
+        let _ = fs::remove_file(&path);
+
+        let object_id = "obj-conflicted-1";
+        let base_env = dummy_envelope(object_id, OBJECT_KIND_NOTE);
+        let local_env = dummy_envelope(object_id, OBJECT_KIND_NOTE);
+        let remote_env = dummy_envelope(object_id, OBJECT_KIND_NOTE);
+        let candidate_env = dummy_envelope(object_id, OBJECT_KIND_NOTE);
+
+        let conflict = ConflictRecord::new(
+            "conf-1",
+            object_id,
+            OBJECT_KIND_NOTE,
+            3,
+            4,
+            Some(base_env.clone()),
+            local_env.clone(),
+            remote_env.clone(),
+            Some(candidate_env.clone()),
+            "2026-09-10T01:00:00Z",
+        );
+
+        // 1. Write conflict to disk database
+        {
+            let storage = SqliteStorage::open(&path).expect("open initial");
+            storage.put_conflict(&conflict).expect("put conflict");
+
+            let active = storage
+                .get_active_conflict_for_object(object_id)
+                .expect("get active")
+                .expect("should find active conflict");
+            assert_eq!(active.conflict_id, "conf-1");
+            assert_eq!(active.base_revision, 3);
+            assert_eq!(active.remote_revision, 4);
+            assert!(!active.resolved);
+        }
+
+        // 2. Reopen from disk (simulating application restart)
+        {
+            let storage = SqliteStorage::open(&path).expect("reopen");
+
+            let fetched = storage
+                .get_conflict("conf-1")
+                .expect("get conflict")
+                .expect("must exist after restart");
+            assert_eq!(fetched, conflict);
+
+            // List unresolved conflicts
+            let unresolved = storage
+                .list_conflicts(Some(false))
+                .expect("list unresolved");
+            assert_eq!(unresolved.len(), 1);
+            assert_eq!(unresolved[0].conflict_id, "conf-1");
+
+            // Resolve conflict with a candidate envelope
+            let resolved_env = dummy_envelope(object_id, OBJECT_KIND_NOTE);
+            let resolved = storage
+                .resolve_conflict(
+                    "conf-1",
+                    Some(resolved_env.clone()),
+                    "2026-09-10T02:00:00Z".to_string(),
+                )
+                .expect("resolve");
+            assert!(resolved);
+
+            // Verify active conflict is now None
+            let active = storage
+                .get_active_conflict_for_object(object_id)
+                .expect("get active");
+            assert!(active.is_none());
+
+            // List resolved conflicts
+            let resolved_list = storage.list_conflicts(Some(true)).expect("list resolved");
+            assert_eq!(resolved_list.len(), 1);
+            assert!(resolved_list[0].resolved);
+            assert_eq!(resolved_list[0].candidate_envelope, Some(resolved_env));
+            assert_eq!(
+                resolved_list[0].resolved_at,
+                Some("2026-09-10T02:00:00Z".to_string())
+            );
+
+            // Delete conflict
+            let deleted = storage.delete_conflict("conf-1").expect("delete");
+            assert!(deleted);
+            assert!(storage.get_conflict("conf-1").expect("get").is_none());
+        }
 
         let _ = fs::remove_file(&path);
     }
