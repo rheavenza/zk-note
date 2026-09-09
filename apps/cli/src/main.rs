@@ -8,8 +8,8 @@ mod session;
 
 use clap::{Parser, Subcommand};
 use commands::{
-    cmd_delete, cmd_edit, cmd_history, cmd_init, cmd_list, cmd_lock, cmd_new, cmd_search, cmd_show,
-    cmd_status, cmd_unlock,
+    cmd_conflicts, cmd_delete, cmd_edit, cmd_history, cmd_init, cmd_list, cmd_lock, cmd_new,
+    cmd_resolve, cmd_search, cmd_show, cmd_status, cmd_unlock,
 };
 use error::CliError;
 use std::path::PathBuf;
@@ -148,6 +148,57 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// List active or all conflict records
+    Conflicts {
+        /// Include resolved conflicts in output
+        #[arg(long)]
+        all: bool,
+
+        /// Output conflicts in raw JSON format
+        #[arg(long)]
+        json: bool,
+    },
+    /// Resolve an active conflict record
+    Resolve {
+        /// Conflict identifier (or unique prefix)
+        conflict_id: String,
+
+        /// Resolve by keeping local version (retry push on next sync)
+        #[arg(short = 'l', long)]
+        local: bool,
+
+        /// Resolve by accepting remote version (discard local changes)
+        #[arg(short = 'r', long)]
+        remote: bool,
+
+        /// Resolve with merged note (manual edit in $EDITOR or candidate)
+        #[arg(short = 'm', long)]
+        merge: bool,
+
+        /// Resolve by keeping remote version and duplicating local changes as a separate note
+        #[arg(short = 'd', long)]
+        duplicate: bool,
+
+        /// Custom title for duplicated note (when using --duplicate)
+        #[arg(long)]
+        duplicate_title: Option<String>,
+
+        /// Custom editor command to override $EDITOR or $VISUAL for manual merge
+        #[arg(long)]
+        editor: Option<String>,
+
+        /// Override note title for manual merge (skips interactive editor if specified with --merge)
+        #[arg(short = 't', long)]
+        title: Option<String>,
+
+        /// Override note body for manual merge (skips interactive editor if specified with --merge)
+        #[arg(short = 'b', long)]
+        body: Option<String>,
+
+        /// Override note tags for manual merge (comma-separated)
+        #[arg(short = 'g', long = "tag", value_delimiter = ',')]
+        tag: Option<Vec<String>>,
+    },
 }
 
 fn run() -> Result<(), CliError> {
@@ -207,6 +258,37 @@ fn run() -> Result<(), CliError> {
             cmd_list(data_dir, tag, include_deleted, json)?;
             Ok(())
         }
+        Commands::Conflicts { all, json } => {
+            cmd_conflicts(data_dir, all, json)?;
+            Ok(())
+        }
+        Commands::Resolve {
+            conflict_id,
+            local,
+            remote,
+            merge,
+            duplicate,
+            duplicate_title,
+            editor,
+            title,
+            body,
+            tag,
+        } => {
+            cmd_resolve(
+                data_dir,
+                &conflict_id,
+                local,
+                remote,
+                merge,
+                duplicate,
+                duplicate_title,
+                editor.as_deref(),
+                title,
+                body,
+                tag,
+            )?;
+            Ok(())
+        }
     }
 }
 
@@ -222,7 +304,10 @@ fn main() {
 mod tests {
     use super::*;
     use std::fs;
+    use zk_core::note::PlaintextNote;
+    use zk_protocol::constants::OBJECT_KIND_NOTE;
     use zk_storage::traits::{BaseVersionStore, ObjectStore};
+    use zk_storage::SqliteStorage;
 
     fn temp_test_dir(name: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
@@ -1376,6 +1461,505 @@ mod tests {
             cmd_history(Some(dir_path), &note1_id, None, false).unwrap_err(),
             CliError::VaultLocked
         ));
+
+        let _ = fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn test_cli_conflicts_listing_and_filtering() {
+        use zk_storage::models::ConflictRecord;
+        use zk_storage::traits::ConflictStore;
+
+        let test_dir = temp_test_dir("conflicts_listing");
+        let dir_path = test_dir.as_path();
+        let pass = "test-passphrase-conflicts".to_string();
+
+        cmd_init(Some(dir_path), Some(pass.clone()), true).expect("init vault");
+        let sess_file = config::session_file(dir_path);
+        let vault_key = session::load_session_key(&sess_file).expect("load key");
+
+        // 1. When no conflicts exist
+        let initial_conflicts = cmd_conflicts(Some(dir_path), false, false).expect("list empty");
+        assert!(initial_conflicts.is_empty());
+
+        // 2. Insert two conflicts into SqliteStorage: one active, one resolved
+        let obj1_id = uuid::Uuid::new_v4().to_string();
+        let note1 = PlaintextNote::new("Active Note Title", "Local body content");
+        let note1_remote = PlaintextNote::new("Remote Note Title", "Remote body content");
+        let env1_local = note1.encrypt(&vault_key, &obj1_id).expect("enc local");
+        let env1_remote = note1_remote
+            .encrypt(&vault_key, &obj1_id)
+            .expect("enc remote");
+
+        let conf1_id = format!("c100-{}", uuid::Uuid::new_v4());
+        let record1 = ConflictRecord::new(
+            &conf1_id,
+            &obj1_id,
+            OBJECT_KIND_NOTE,
+            1,
+            2,
+            None,
+            env1_local,
+            env1_remote,
+            None,
+            "2026-09-10T02:00:00Z",
+        );
+
+        let obj2_id = uuid::Uuid::new_v4().to_string();
+        let note2 = PlaintextNote::new("Resolved Note Title", "Resolved content");
+        let env2_local = note2.encrypt(&vault_key, &obj2_id).expect("enc local");
+        let env2_remote = note2.encrypt(&vault_key, &obj2_id).expect("enc remote");
+
+        let conf2_id = format!("c200-{}", uuid::Uuid::new_v4());
+        let mut record2 = ConflictRecord::new(
+            &conf2_id,
+            &obj2_id,
+            OBJECT_KIND_NOTE,
+            3,
+            4,
+            None,
+            env2_local,
+            env2_remote,
+            None,
+            "2026-09-10T01:00:00Z",
+        );
+        record2.resolved = true;
+        record2.resolved_at = Some("2026-09-10T01:30:00Z".to_string());
+
+        {
+            let storage = SqliteStorage::open(config::db_file(dir_path)).expect("open db");
+            storage.put_conflict(&record1).expect("put conf1");
+            storage.put_conflict(&record2).expect("put conf2");
+        }
+
+        // 3. List active conflicts (all = false): should return only record1 with decrypted title
+        let active = cmd_conflicts(Some(dir_path), false, false).expect("list active");
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].conflict_id, conf1_id);
+        assert_eq!(active[0].title, "Active Note Title");
+        assert!(!active[0].resolved);
+
+        // 4. List all conflicts (all = true): should return both
+        let all = cmd_conflicts(Some(dir_path), true, false).expect("list all");
+        assert_eq!(all.len(), 2);
+
+        // 5. JSON output
+        let json_items = cmd_conflicts(Some(dir_path), true, true).expect("list json");
+        assert_eq!(json_items.len(), 2);
+
+        // 6. When locked: listing still works but title is masked as [locked] (SEC-009)
+        cmd_lock(Some(dir_path)).expect("lock");
+        let locked_list = cmd_conflicts(Some(dir_path), false, false).expect("list locked");
+        assert_eq!(locked_list.len(), 1);
+        assert_eq!(locked_list[0].conflict_id, conf1_id);
+        assert_eq!(locked_list[0].title, "[locked]");
+
+        let _ = fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn test_cli_resolve_keep_local() {
+        use zk_storage::models::ConflictRecord;
+        use zk_storage::traits::{ConflictStore, ObjectStore};
+
+        let test_dir = temp_test_dir("resolve_local");
+        let dir_path = test_dir.as_path();
+        let pass = "test-passphrase-resolve".to_string();
+
+        cmd_init(Some(dir_path), Some(pass), true).expect("init vault");
+        let sess_file = config::session_file(dir_path);
+        let vault_key = session::load_session_key(&sess_file).expect("load key");
+
+        let obj_id = uuid::Uuid::new_v4().to_string();
+        let local_note = PlaintextNote::new("Local Title", "My local edited body");
+        let remote_note = PlaintextNote::new("Remote Title", "Server edited body");
+        let env_local = local_note.encrypt(&vault_key, &obj_id).expect("enc local");
+        let env_remote = remote_note
+            .encrypt(&vault_key, &obj_id)
+            .expect("enc remote");
+
+        let conf_id = format!("conf-loc-{}", uuid::Uuid::new_v4());
+        let record = ConflictRecord::new(
+            &conf_id,
+            &obj_id,
+            OBJECT_KIND_NOTE,
+            2,
+            5,
+            None,
+            env_local.clone(),
+            env_remote,
+            None,
+            "2026-09-10T02:00:00Z",
+        );
+
+        {
+            let storage = SqliteStorage::open(config::db_file(dir_path)).expect("open db");
+            storage.put_conflict(&record).expect("put");
+        }
+
+        // Resolve by keeping local version
+        let result = cmd_resolve(
+            Some(dir_path),
+            &conf_id,
+            true,  // local
+            false, // remote
+            false, // merge
+            false, // duplicate
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("resolve keep local");
+
+        assert_eq!(result.conflict_id, conf_id);
+        assert_eq!(result.object_id, obj_id);
+
+        let retry_mut = result.retry_mutation.expect("retry mutation");
+        assert_eq!(retry_mut.expected_revision, 5);
+        assert_eq!(retry_mut.envelope, env_local);
+
+        // Verify storage state
+        let storage = SqliteStorage::open(config::db_file(dir_path)).expect("open db");
+        let conf_after = storage
+            .get_conflict(&conf_id)
+            .expect("get")
+            .expect("exists");
+        assert!(conf_after.resolved);
+        assert!(conf_after.resolved_at.is_some());
+
+        // Verify local object has local envelope
+        let obj = storage.get_object(&obj_id).expect("get").expect("exists");
+        assert_eq!(obj.revision, 5);
+        assert_eq!(obj.envelope, env_local);
+
+        // Resolving again fails closed
+        let second_try = cmd_resolve(
+            Some(dir_path),
+            &conf_id,
+            true,
+            false,
+            false,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(second_try, CliError::ConflictAlreadyResolved(_)));
+
+        let _ = fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn test_cli_resolve_keep_remote() {
+        use zk_storage::models::ConflictRecord;
+        use zk_storage::traits::{ConflictStore, ObjectStore};
+
+        let test_dir = temp_test_dir("resolve_remote");
+        let dir_path = test_dir.as_path();
+        let pass = "test-passphrase-remote".to_string();
+
+        cmd_init(Some(dir_path), Some(pass), true).expect("init vault");
+        let sess_file = config::session_file(dir_path);
+        let vault_key = session::load_session_key(&sess_file).expect("load key");
+
+        let obj_id = uuid::Uuid::new_v4().to_string();
+        let local_note = PlaintextNote::new("Local Title", "Local Body");
+        let remote_note = PlaintextNote::new("Remote Winner", "Remote Body Content");
+        let env_local = local_note.encrypt(&vault_key, &obj_id).expect("enc local");
+        let env_remote = remote_note
+            .encrypt(&vault_key, &obj_id)
+            .expect("enc remote");
+
+        let conf_id = format!("conf-rem-{}", uuid::Uuid::new_v4());
+        let record = ConflictRecord::new(
+            &conf_id,
+            &obj_id,
+            OBJECT_KIND_NOTE,
+            1,
+            3,
+            None,
+            env_local,
+            env_remote.clone(),
+            None,
+            "2026-09-10T02:00:00Z",
+        );
+
+        {
+            let storage = SqliteStorage::open(config::db_file(dir_path)).expect("open db");
+            storage.put_conflict(&record).expect("put");
+        }
+
+        // Resolve by keeping remote
+        let result = cmd_resolve(
+            Some(dir_path),
+            &conf_id,
+            false, // local
+            true,  // remote
+            false, // merge
+            false, // duplicate
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("resolve keep remote");
+
+        assert_eq!(result.conflict_id, conf_id);
+        assert_eq!(result.object_id, obj_id);
+        assert!(result.retry_mutation.is_none());
+
+        // Verify local object has remote envelope
+        let storage = SqliteStorage::open(config::db_file(dir_path)).expect("open db");
+        let obj = storage.get_object(&obj_id).expect("get").expect("exists");
+        assert_eq!(obj.revision, 3);
+        assert_eq!(obj.envelope, env_remote);
+
+        // cmd_show displays remote winner
+        let shown = cmd_show(Some(dir_path), &obj_id, false).expect("show");
+        assert_eq!(shown.title, "Remote Winner");
+        assert_eq!(shown.body, "Remote Body Content");
+
+        let _ = fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn test_cli_resolve_manual_merge() {
+        use zk_storage::models::ConflictRecord;
+        use zk_storage::traits::{ConflictStore, ObjectStore};
+
+        let test_dir = temp_test_dir("resolve_merge");
+        let dir_path = test_dir.as_path();
+        let pass = "test-passphrase-merge".to_string();
+
+        cmd_init(Some(dir_path), Some(pass), true).expect("init vault");
+        let sess_file = config::session_file(dir_path);
+        let vault_key = session::load_session_key(&sess_file).expect("load key");
+
+        let obj_id = uuid::Uuid::new_v4().to_string();
+        let local_note = PlaintextNote::new("Local Title", "Local Body");
+        let remote_note = PlaintextNote::new("Remote Title", "Remote Body");
+        let env_local = local_note.encrypt(&vault_key, &obj_id).expect("enc local");
+        let env_remote = remote_note
+            .encrypt(&vault_key, &obj_id)
+            .expect("enc remote");
+
+        let conf_id = format!("conf-mrg-{}", uuid::Uuid::new_v4());
+        let record = ConflictRecord::new(
+            &conf_id,
+            &obj_id,
+            OBJECT_KIND_NOTE,
+            1,
+            4,
+            None,
+            env_local,
+            env_remote,
+            None,
+            "2026-09-10T02:00:00Z",
+        );
+
+        {
+            let storage = SqliteStorage::open(config::db_file(dir_path)).expect("open db");
+            storage.put_conflict(&record).expect("put");
+        }
+
+        // Resolve using manual merge overrides (--merge with --title and --body)
+        let result = cmd_resolve(
+            Some(dir_path),
+            &conf_id,
+            false, // local
+            false, // remote
+            true,  // merge
+            false, // duplicate
+            None,
+            None,
+            Some("Manually Merged Title".to_string()),
+            Some("Consolidated body containing both changes".to_string()),
+            Some(vec!["merged".to_string(), "notes".to_string()]),
+        )
+        .expect("resolve merge");
+
+        assert_eq!(result.conflict_id, conf_id);
+        let retry_mut = result.retry_mutation.expect("retry mutation");
+        assert_eq!(retry_mut.expected_revision, 4);
+
+        // Verify storage decrypted object reflects merged note
+        let storage = SqliteStorage::open(config::db_file(dir_path)).expect("open db");
+        let obj = storage.get_object(&obj_id).expect("get").expect("exists");
+        assert_eq!(obj.revision, 4);
+
+        let shown = cmd_show(Some(dir_path), &obj_id, false).expect("show");
+        assert_eq!(shown.title, "Manually Merged Title");
+        assert_eq!(shown.body, "Consolidated body containing both changes");
+        assert_eq!(shown.tags, vec!["merged", "notes"]);
+
+        let _ = fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn test_cli_resolve_duplicate_as_separate() {
+        use zk_storage::models::ConflictRecord;
+        use zk_storage::traits::ConflictStore;
+
+        let test_dir = temp_test_dir("resolve_duplicate");
+        let dir_path = test_dir.as_path();
+        let pass = "test-passphrase-dup".to_string();
+
+        cmd_init(Some(dir_path), Some(pass), true).expect("init vault");
+        let sess_file = config::session_file(dir_path);
+        let vault_key = session::load_session_key(&sess_file).expect("load key");
+
+        let obj_id = uuid::Uuid::new_v4().to_string();
+        let local_note = PlaintextNote::new("Important Idea", "Offline brilliant thought");
+        let remote_note = PlaintextNote::new("Remote Important Idea", "Remote revision content");
+        let env_local = local_note.encrypt(&vault_key, &obj_id).expect("enc local");
+        let env_remote = remote_note
+            .encrypt(&vault_key, &obj_id)
+            .expect("enc remote");
+
+        let conf_id = format!("conf-dup-{}", uuid::Uuid::new_v4());
+        let record = ConflictRecord::new(
+            &conf_id,
+            &obj_id,
+            OBJECT_KIND_NOTE,
+            2,
+            7,
+            None,
+            env_local,
+            env_remote,
+            None,
+            "2026-09-10T02:00:00Z",
+        );
+
+        {
+            let storage = SqliteStorage::open(config::db_file(dir_path)).expect("open db");
+            storage.put_conflict(&record).expect("put");
+        }
+
+        // Resolve via --duplicate
+        let result = cmd_resolve(
+            Some(dir_path),
+            &conf_id,
+            false, // local
+            false, // remote
+            false, // merge
+            true,  // duplicate
+            Some("Important Idea (Branch Copy)".to_string()),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("resolve duplicate");
+
+        assert_eq!(result.conflict_id, conf_id);
+        assert_eq!(result.object_id, obj_id);
+        let dup_id = result.duplicated_object_id.expect("duplicate object id");
+
+        // Verify original note has remote content
+        let orig_shown = cmd_show(Some(dir_path), &obj_id, false).expect("show original");
+        assert_eq!(orig_shown.title, "Remote Important Idea");
+        assert_eq!(orig_shown.body, "Remote revision content");
+
+        // Verify duplicated note has local content and custom title
+        let dup_shown = cmd_show(Some(dir_path), &dup_id, false).expect("show duplicate");
+        assert_eq!(dup_shown.title, "Important Idea (Branch Copy)");
+        assert_eq!(dup_shown.body, "Offline brilliant thought");
+
+        let _ = fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn test_cli_resolve_prefix_matching_and_validations() {
+        use zk_storage::models::ConflictRecord;
+        use zk_storage::traits::ConflictStore;
+
+        let test_dir = temp_test_dir("resolve_validations");
+        let dir_path = test_dir.as_path();
+        let pass = "test-passphrase-validations".to_string();
+
+        cmd_init(Some(dir_path), Some(pass), true).expect("init vault");
+        let sess_file = config::session_file(dir_path);
+        let vault_key = session::load_session_key(&sess_file).expect("load key");
+
+        let obj_id = uuid::Uuid::new_v4().to_string();
+        let note = PlaintextNote::new("Title", "Body");
+        let env = note.encrypt(&vault_key, &obj_id).expect("enc");
+
+        let conf_id = "abcd-1234-5678-90ef".to_string();
+        let record = ConflictRecord::new(
+            &conf_id,
+            &obj_id,
+            OBJECT_KIND_NOTE,
+            1,
+            2,
+            None,
+            env.clone(),
+            env,
+            None,
+            "2026-09-10T02:00:00Z",
+        );
+
+        {
+            let storage = SqliteStorage::open(config::db_file(dir_path)).expect("open db");
+            storage.put_conflict(&record).expect("put");
+        }
+
+        // 1. Multiple mutually exclusive flags error
+        let multi_err = cmd_resolve(
+            Some(dir_path),
+            &conf_id,
+            true, // local
+            true, // remote
+            false,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(multi_err, CliError::Io(_)));
+
+        // 2. Non-existent conflict ID error
+        let not_found_err = cmd_resolve(
+            Some(dir_path),
+            "non-existent-conflict",
+            true,
+            false,
+            false,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(not_found_err, CliError::ConflictNotFound(_)));
+
+        // 3. Prefix matching: "abcd" matches "abcd-1234-5678-90ef"
+        let prefix_res = cmd_resolve(
+            Some(dir_path),
+            "abcd",
+            true, // local
+            false,
+            false,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("resolve by 4-char prefix");
+        assert_eq!(prefix_res.conflict_id, conf_id);
 
         let _ = fs::remove_dir_all(&test_dir);
     }

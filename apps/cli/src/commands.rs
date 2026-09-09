@@ -8,6 +8,7 @@ use crate::session::{clear_session, has_active_session, load_session_key, save_s
 use serde::Serialize;
 use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::Path;
+use std::sync::Arc;
 use zk_core::note::{NoteBuilder, NoteHistoryItem, PlaintextNote};
 use zk_core::search::{InMemorySearchIndex, SearchResult};
 use zk_core::time::now_utc_rfc3339;
@@ -17,10 +18,15 @@ use zk_protocol::constants::{
     INITIAL_EXPECTED_REVISION, INITIAL_OBJECT_REVISION, INITIAL_SERVER_SEQ, OBJECT_KIND_NOTE,
 };
 use zk_protocol::vault::VaultBootstrap;
-use zk_storage::traits::{BaseVersionStore, MutationStore, ObjectStore};
+use zk_storage::models::ConflictRecord;
+use zk_storage::traits::{BaseVersionStore, ConflictStore, MutationStore, ObjectStore};
 use zk_storage::{
     MutationStatus, MutationType, ObjectFilter, PendingMutation, SqliteStorage,
     StoredEncryptedObject,
+};
+use zk_sync::{
+    generate_merge_candidate, resolve_conflict, ConflictResolutionResult,
+    ConflictResolutionStrategy, PendingMutationQueue,
 };
 
 /// Initializes a new zero-knowledge note vault.
@@ -919,4 +925,450 @@ pub fn cmd_history(
     }
 
     Ok(history)
+}
+
+/// Summary representation of a conflict record for listing and JSON serialization.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConflictListItem {
+    pub conflict_id: String,
+    pub object_id: String,
+    pub object_kind: u16,
+    pub base_revision: u64,
+    pub remote_revision: u64,
+    pub resolved: bool,
+    pub created_at: String,
+    pub resolved_at: Option<String>,
+    pub title: String,
+}
+
+/// Helper to resolve a stored conflict record by exact ID or unique >=4 character prefix.
+pub fn find_conflict_record(
+    storage: &SqliteStorage,
+    conflict_id: &str,
+) -> Result<ConflictRecord, CliError> {
+    if let Some(record) = storage.get_conflict(conflict_id)? {
+        return Ok(record);
+    }
+
+    if conflict_id.len() >= 4 {
+        let all = storage.list_conflicts(None)?;
+        let mut matches: Vec<_> = all
+            .into_iter()
+            .filter(|c| c.conflict_id.starts_with(conflict_id))
+            .collect();
+        if matches.len() == 1 {
+            Ok(matches.remove(0))
+        } else if matches.len() > 1 {
+            Err(CliError::Io(format!(
+                "ambiguous conflict id prefix '{conflict_id}' matches {} conflicts",
+                matches.len()
+            )))
+        } else {
+            Err(CliError::ConflictNotFound(conflict_id.to_string()))
+        }
+    } else {
+        Err(CliError::ConflictNotFound(conflict_id.to_string()))
+    }
+}
+
+/// Lists active or all conflict records (`zk-note conflicts`).
+pub fn cmd_conflicts(
+    custom_data_dir: Option<&Path>,
+    include_resolved: bool,
+    json_output: bool,
+) -> Result<Vec<ConflictListItem>, CliError> {
+    let data_dir = resolve_data_dir(custom_data_dir);
+    let vault_path = vault_file(&data_dir);
+    let db_path = db_file(&data_dir);
+    let sess_path = session_file(&data_dir);
+
+    if !vault_path.exists() {
+        return Err(CliError::VaultUninitialized);
+    }
+
+    let storage = SqliteStorage::open(&db_path)?;
+    let filter = if include_resolved { None } else { Some(false) };
+    let raw_conflicts = storage.list_conflicts(filter)?;
+
+    let vault_key_opt = load_session_key(&sess_path).ok();
+
+    let mut items = Vec::with_capacity(raw_conflicts.len());
+    for c in raw_conflicts {
+        let title = match &vault_key_opt {
+            Some(key) => {
+                let env = c.candidate_envelope.as_ref().unwrap_or(&c.local_envelope);
+                PlaintextNote::decrypt(env, key)
+                    .map(|n| n.title)
+                    .unwrap_or_else(|_| "[decryption error]".to_string())
+            }
+            None => "[locked]".to_string(),
+        };
+
+        items.push(ConflictListItem {
+            conflict_id: c.conflict_id,
+            object_id: c.object_id,
+            object_kind: c.object_kind,
+            base_revision: c.base_revision,
+            remote_revision: c.remote_revision,
+            resolved: c.resolved,
+            created_at: c.created_at,
+            resolved_at: c.resolved_at,
+            title,
+        });
+    }
+
+    if json_output {
+        let json = serde_json::to_string_pretty(&items)
+            .map_err(|e| CliError::Io(format!("serialize conflicts json: {e}")))?;
+        println!("{json}");
+    } else if items.is_empty() {
+        if include_resolved {
+            println!("No conflict records found.");
+        } else {
+            println!("No active conflicts.");
+        }
+    } else {
+        println!(
+            "{:<36}  {:<36}  {:<6}  {:<6}  {:<10}  TITLE",
+            "CONFLICT ID", "NOTE ID", "BASE", "REMOTE", "STATUS"
+        );
+        println!("{}", "-".repeat(110));
+        for item in &items {
+            let status = if item.resolved {
+                "Resolved"
+            } else {
+                "Unresolved"
+            };
+            println!(
+                "{:<36}  {:<36}  {:<6}  {:<6}  {:<10}  {}",
+                item.conflict_id,
+                item.object_id,
+                item.base_revision,
+                item.remote_revision,
+                status,
+                item.title
+            );
+        }
+    }
+
+    Ok(items)
+}
+
+/// Resolves an active conflict record (`zk-note resolve <conflict_id>`).
+#[allow(clippy::too_many_arguments)]
+pub fn cmd_resolve(
+    custom_data_dir: Option<&Path>,
+    conflict_id: &str,
+    choose_local: bool,
+    choose_remote: bool,
+    choose_merge: bool,
+    choose_duplicate: bool,
+    duplicate_title: Option<String>,
+    editor_override: Option<&str>,
+    title_override: Option<String>,
+    body_override: Option<String>,
+    tag_override: Option<Vec<String>>,
+) -> Result<ConflictResolutionResult, CliError> {
+    let data_dir = resolve_data_dir(custom_data_dir);
+    let vault_path = vault_file(&data_dir);
+    let db_path = db_file(&data_dir);
+    let sess_path = session_file(&data_dir);
+
+    if !vault_path.exists() {
+        return Err(CliError::VaultUninitialized);
+    }
+
+    // Vault must be unlocked to resolve conflicts
+    let vault_key = load_session_key(&sess_path)?;
+
+    let storage = Arc::new(SqliteStorage::open(&db_path)?);
+    let conflict = find_conflict_record(&storage, conflict_id)?;
+
+    if conflict.resolved {
+        return Err(CliError::ConflictAlreadyResolved(conflict.conflict_id));
+    }
+
+    let flags_count = [choose_local, choose_remote, choose_merge, choose_duplicate]
+        .iter()
+        .filter(|&&b| b)
+        .count();
+
+    if flags_count > 1 {
+        return Err(CliError::Io(
+            "only one of --local, --remote, --merge, or --duplicate can be specified".to_string(),
+        ));
+    }
+
+    let strategy = if choose_local {
+        ConflictResolutionStrategy::KeepLocal
+    } else if choose_remote {
+        ConflictResolutionStrategy::KeepRemote
+    } else if choose_duplicate {
+        let new_object_id = uuid::Uuid::new_v4().to_string();
+        ConflictResolutionStrategy::DuplicateAsSeparate {
+            new_object_id,
+            new_title: duplicate_title,
+        }
+    } else if choose_merge {
+        if title_override.is_some() || body_override.is_some() || tag_override.is_some() {
+            // Programmatic merge overrides
+            let candidate_note = match &conflict.candidate_envelope {
+                Some(cand_env) => PlaintextNote::decrypt(cand_env, &vault_key)?,
+                None => {
+                    let (outcome, _) = generate_merge_candidate(
+                        conflict.base_envelope.as_ref(),
+                        &conflict.local_envelope,
+                        &conflict.remote_envelope,
+                        &vault_key,
+                    )?;
+                    outcome.candidate
+                }
+            };
+            let merged_title = title_override.unwrap_or(candidate_note.title);
+            let merged_body = body_override.unwrap_or(candidate_note.body);
+            let merged_tags = tag_override.unwrap_or(candidate_note.tags);
+
+            let merged_note = NoteBuilder::new()
+                .title(merged_title)
+                .body(merged_body)
+                .tags(merged_tags)
+                .build()?;
+            ConflictResolutionStrategy::Merge(merged_note)
+        } else if editor_override.is_some() || io::stdin().is_terminal() {
+            let candidate_note = match &conflict.candidate_envelope {
+                Some(cand_env) => PlaintextNote::decrypt(cand_env, &vault_key)?,
+                None => {
+                    let (outcome, _) = generate_merge_candidate(
+                        conflict.base_envelope.as_ref(),
+                        &conflict.local_envelope,
+                        &conflict.remote_envelope,
+                        &vault_key,
+                    )?;
+                    outcome.candidate
+                }
+            };
+            let editor_cmd = if let Some(e) = editor_override {
+                e.to_string()
+            } else if let Ok(e) = std::env::var("VISUAL") {
+                e
+            } else if let Ok(e) = std::env::var("EDITOR") {
+                e
+            } else {
+                "nano".to_string()
+            };
+
+            let initial_text = note_to_edit_buffer(
+                &candidate_note.title,
+                &candidate_note.tags,
+                &candidate_note.body,
+            );
+            let guard = TempFileGuard::create("zk-note-resolve-merge", initial_text.as_bytes())?;
+            println!("Opening conflict merge candidate in editor ({editor_cmd})...");
+            run_editor(&editor_cmd, guard.path())?;
+            let edited_bytes = guard.read_bytes()?;
+            let edited_str = String::from_utf8(edited_bytes)
+                .map_err(|e| CliError::Io(format!("invalid UTF-8 in edited merge note: {e}")))?;
+            let parsed =
+                parse_edit_buffer(&edited_str, &candidate_note.title, &candidate_note.tags)?;
+            guard.cleanup();
+
+            let merged_note = NoteBuilder::new()
+                .title(parsed.title)
+                .body(parsed.body)
+                .tags(parsed.tags)
+                .build()?;
+            ConflictResolutionStrategy::Merge(merged_note)
+        } else {
+            // Non-interactive without overrides and no terminal: accept auto-generated candidate
+            let candidate_note = match &conflict.candidate_envelope {
+                Some(cand_env) => PlaintextNote::decrypt(cand_env, &vault_key)?,
+                None => {
+                    let (outcome, _) = generate_merge_candidate(
+                        conflict.base_envelope.as_ref(),
+                        &conflict.local_envelope,
+                        &conflict.remote_envelope,
+                        &vault_key,
+                    )?;
+                    outcome.candidate
+                }
+            };
+            ConflictResolutionStrategy::Merge(candidate_note)
+        }
+    } else {
+        // No strategy flags passed
+        if !io::stdin().is_terminal() {
+            return Err(CliError::Io(
+                "no resolution strategy specified; use --local, --remote, --merge, or --duplicate"
+                    .to_string(),
+            ));
+        }
+
+        let local_note = PlaintextNote::decrypt(&conflict.local_envelope, &vault_key)?;
+        let remote_note = PlaintextNote::decrypt(&conflict.remote_envelope, &vault_key)?;
+
+        println!("\n=== CONFLICT RESOLUTION ===");
+        println!("Conflict ID:     {}", conflict.conflict_id);
+        println!("Note ID:         {}", conflict.object_id);
+        println!("Base revision:   {}", conflict.base_revision);
+        println!("Remote revision: {}", conflict.remote_revision);
+        println!("\nLocal version (your offline changes):");
+        println!("  Title:   {}", local_note.title);
+        println!(
+            "  Tags:    {}",
+            if local_note.tags.is_empty() {
+                "-".to_string()
+            } else {
+                local_note.tags.join(", ")
+            }
+        );
+        println!("  Updated: {}", local_note.updated_at);
+        println!("\nRemote version (server head):");
+        println!("  Title:   {}", remote_note.title);
+        println!(
+            "  Tags:    {}",
+            if remote_note.tags.is_empty() {
+                "-".to_string()
+            } else {
+                remote_note.tags.join(", ")
+            }
+        );
+        println!("  Updated: {}", remote_note.updated_at);
+        println!("\nResolution options:");
+        println!("  [1] Keep local version (overwrite remote on next sync)");
+        println!("  [2] Keep remote version (discard local changes)");
+        println!("  [3] Merge (open editor with diff3 merge candidate)");
+        println!("  [4] Duplicate as separate note (keep remote and preserve local as new note)");
+        println!("  [q] Abort");
+        print!("\nSelect an option [1-4, q]: ");
+        io::stdout()
+            .flush()
+            .map_err(|e| CliError::Io(e.to_string()))?;
+
+        let mut input = String::new();
+        let stdin = io::stdin();
+        stdin
+            .lock()
+            .read_line(&mut input)
+            .map_err(|e| CliError::Io(e.to_string()))?;
+        let choice = input.trim();
+
+        let chosen_strategy = match choice {
+            "1" => ConflictResolutionStrategy::KeepLocal,
+            "2" => ConflictResolutionStrategy::KeepRemote,
+            "3" => {
+                let candidate_note = match &conflict.candidate_envelope {
+                    Some(cand_env) => PlaintextNote::decrypt(cand_env, &vault_key)?,
+                    None => {
+                        let (outcome, _) = generate_merge_candidate(
+                            conflict.base_envelope.as_ref(),
+                            &conflict.local_envelope,
+                            &conflict.remote_envelope,
+                            &vault_key,
+                        )?;
+                        outcome.candidate
+                    }
+                };
+                let editor_cmd = if let Some(e) = editor_override {
+                    e.to_string()
+                } else if let Ok(e) = std::env::var("VISUAL") {
+                    e
+                } else if let Ok(e) = std::env::var("EDITOR") {
+                    e
+                } else {
+                    "nano".to_string()
+                };
+
+                let initial_text = note_to_edit_buffer(
+                    &candidate_note.title,
+                    &candidate_note.tags,
+                    &candidate_note.body,
+                );
+                let guard =
+                    TempFileGuard::create("zk-note-resolve-merge", initial_text.as_bytes())?;
+                println!("Opening conflict merge in editor ({editor_cmd})...");
+                run_editor(&editor_cmd, guard.path())?;
+                let edited_bytes = guard.read_bytes()?;
+                let edited_str = String::from_utf8(edited_bytes).map_err(|e| {
+                    CliError::Io(format!("invalid UTF-8 in edited merge note: {e}"))
+                })?;
+                let parsed =
+                    parse_edit_buffer(&edited_str, &candidate_note.title, &candidate_note.tags)?;
+                guard.cleanup();
+
+                let merged_note = NoteBuilder::new()
+                    .title(parsed.title)
+                    .body(parsed.body)
+                    .tags(parsed.tags)
+                    .build()?;
+                ConflictResolutionStrategy::Merge(merged_note)
+            }
+            "4" => {
+                print!(
+                    "Enter title for duplicate note [default: \"{} (Local Copy)\"]: ",
+                    local_note.title
+                );
+                io::stdout()
+                    .flush()
+                    .map_err(|e| CliError::Io(e.to_string()))?;
+                let mut title_input = String::new();
+                stdin
+                    .lock()
+                    .read_line(&mut title_input)
+                    .map_err(|e| CliError::Io(e.to_string()))?;
+                let trimmed_title = title_input.trim();
+                let title = if trimmed_title.is_empty() {
+                    Some(format!("{} (Local Copy)", local_note.title))
+                } else {
+                    Some(trimmed_title.to_string())
+                };
+                let new_object_id = uuid::Uuid::new_v4().to_string();
+                ConflictResolutionStrategy::DuplicateAsSeparate {
+                    new_object_id,
+                    new_title: title,
+                }
+            }
+            "q" | "Q" => {
+                println!("Resolution aborted.");
+                return Err(CliError::Io("resolution aborted by user".to_string()));
+            }
+            other => {
+                return Err(CliError::Io(format!("invalid option: '{other}'")));
+            }
+        };
+        chosen_strategy
+    };
+
+    let queue = PendingMutationQueue::new(Arc::clone(&storage));
+    let result = resolve_conflict(
+        &storage,
+        &queue,
+        &vault_key,
+        &conflict.conflict_id,
+        strategy,
+    )?;
+
+    match &result.duplicated_object_id {
+        Some(dup_id) => {
+            println!(
+                "Conflict '{}' resolved. Local changes preserved as new note '{}'. Original note '{}' updated to remote revision {}.",
+                result.conflict_id, dup_id, result.object_id, conflict.remote_revision
+            );
+        }
+        None => match result.retry_mutation {
+            Some(ref m) => {
+                println!(
+                    "Conflict '{}' resolved for note '{}'. Mutation enqueued with expected revision {} for sync retry.",
+                    result.conflict_id, result.object_id, m.expected_revision
+                );
+            }
+            None => {
+                println!(
+                    "Conflict '{}' resolved for note '{}'. Remote version accepted.",
+                    result.conflict_id, result.object_id
+                );
+            }
+        },
+    }
+
+    Ok(result)
 }

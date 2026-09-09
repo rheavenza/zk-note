@@ -1402,7 +1402,7 @@ Completion notes:
 ---
 
 ## ZK-054 — CLI conflict commands
-Status: TODO  
+Status: DONE  
 Priority: P1  
 Dependencies: ZK-053
 
@@ -1419,6 +1419,29 @@ Acceptance criteria:
 - user can choose remote;
 - user can save manual merge;
 - user can preserve both as separate notes where safe.
+
+Completion notes:
+- Implemented `zk-note conflicts` subcommand in `apps/cli/src/commands.rs` and `apps/cli/src/main.rs`:
+  - Lists active/unresolved conflict records by default, with `--all` flag to include resolved records.
+  - Supports `--json` for machine-readable output.
+  - Safe when vault is locked (displays sync metadata with `[locked]` title, preserving SEC-009 zero-knowledge on disk).
+  - Decrypts and shows note titles in list when vault is unlocked.
+- Implemented `zk-note resolve <conflict_id>` subcommand in `apps/cli/src/commands.rs` and `apps/cli/src/main.rs`:
+  - Supports resolving by full UUID or unique >=4-char prefix.
+  - Four resolution strategies supported:
+    - User can choose local: `--local` (`-l`) or interactive option `1` (queues retry mutation based on remote revision, updates local object).
+    - User can choose remote: `--remote` (`-r`) or interactive option `2` (updates local object with remote envelope, clears stale mutation).
+    - User can save manual merge: `--merge` (`-m`) or interactive option `3`, supporting `$EDITOR` with diff3 conflict markers or programmatic overrides (`--title`, `--body`, `--tag`).
+    - User can preserve both as separate notes where safe: `--duplicate` (`-d`) or interactive option `4`, creating a new note with local content while updating the original note to the remote version.
+  - Validates mutex constraints, fails closed if conflict not found or already resolved, and requires unlocked vault.
+- Added comprehensive unit and integration test suite covering:
+  - `test_cli_conflicts_listing_and_filtering` (empty, active-only, all, json, locked mask).
+  - `test_cli_resolve_keep_local` (mutation retry, storage update, already-resolved guard).
+  - `test_cli_resolve_keep_remote` (remote update, show output).
+  - `test_cli_resolve_manual_merge` (overrides, decrypted object verification).
+  - `test_cli_resolve_duplicate_as_separate` (both notes preserved and showable).
+  - `test_cli_resolve_prefix_matching_and_validations` (prefix matching, mutually exclusive flag validation, not-found validation).
+- Passed all quality gates via `./scripts/ci.sh`.
 
 ---
 

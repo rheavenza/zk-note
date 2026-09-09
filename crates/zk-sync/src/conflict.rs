@@ -171,6 +171,18 @@ where
                 let _ = storage.remove_mutation(&m.mutation_id);
             }
 
+            // Update local object to reflect the chosen local version at remote revision
+            let local_obj = StoredEncryptedObject {
+                object_id: conflict.object_id.clone(),
+                object_kind: conflict.object_kind,
+                revision: conflict.remote_revision,
+                server_seq: 0,
+                is_deleted: false,
+                envelope: conflict.local_envelope.clone(),
+                updated_at: resolved_at.clone(),
+            };
+            storage.put_object(&local_obj)?;
+
             // Enqueue new mutation based on remote revision (so CAS will succeed)
             let retry_mutation = PendingMutation {
                 mutation_id: Uuid::new_v4().to_string(),
@@ -246,6 +258,18 @@ where
                 let _ = storage.remove_mutation(&m.mutation_id);
             }
 
+            // Update local object to reflect the merged version at remote revision
+            let merged_obj = StoredEncryptedObject {
+                object_id: conflict.object_id.clone(),
+                object_kind: conflict.object_kind,
+                revision: conflict.remote_revision,
+                server_seq: 0,
+                is_deleted: false,
+                envelope: merged_envelope.clone(),
+                updated_at: resolved_at.clone(),
+            };
+            storage.put_object(&merged_obj)?;
+
             // Enqueue new mutation based on remote revision
             let retry_mutation = PendingMutation {
                 mutation_id: Uuid::new_v4().to_string(),
@@ -308,8 +332,23 @@ where
                 )))
             })?;
 
-            let dup_mutation =
-                queue.enqueue_upsert(&new_object_id, conflict.object_kind, 0, dup_envelope)?;
+            let dup_mutation = queue.enqueue_upsert(
+                &new_object_id,
+                conflict.object_kind,
+                0,
+                dup_envelope.clone(),
+            )?;
+
+            let dup_obj = StoredEncryptedObject {
+                object_id: new_object_id.clone(),
+                object_kind: conflict.object_kind,
+                revision: 1,
+                server_seq: 0,
+                is_deleted: false,
+                envelope: dup_envelope,
+                updated_at: resolved_at.clone(),
+            };
+            storage.put_object(&dup_obj)?;
 
             storage.resolve_conflict(
                 conflict_id,

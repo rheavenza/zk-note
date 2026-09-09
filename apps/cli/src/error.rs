@@ -30,6 +30,10 @@ pub enum CliError {
         /// Target revision number.
         revision: u64,
     },
+    /// Conflict with the requested identifier was not found.
+    ConflictNotFound(String),
+    /// Conflict with the requested identifier has already been resolved.
+    ConflictAlreadyResolved(String),
     /// Underlying core domain error.
     Core(zk_core::error::CoreError),
     /// Underlying storage error.
@@ -61,6 +65,10 @@ impl fmt::Display for CliError {
             Self::NoteAlreadyDeleted(id) => write!(f, "note has been deleted: {id}"),
             Self::RevisionNotFound { note_id, revision } => {
                 write!(f, "revision {revision} not found for note: {note_id}")
+            }
+            Self::ConflictNotFound(id) => write!(f, "conflict record not found: {id}"),
+            Self::ConflictAlreadyResolved(id) => {
+                write!(f, "conflict record already resolved: {id}")
             }
             Self::Core(e) => write!(f, "{e}"),
             Self::Storage(e) => write!(f, "{e}"),
@@ -94,6 +102,17 @@ impl From<zk_core::error::NoteValidationError> for CliError {
 impl From<zk_storage::error::StorageError> for CliError {
     fn from(e: zk_storage::error::StorageError) -> Self {
         Self::Storage(e)
+    }
+}
+
+impl From<zk_sync::QueueError> for CliError {
+    fn from(e: zk_sync::QueueError) -> Self {
+        match e {
+            zk_sync::QueueError::NotFound(msg) => Self::ConflictNotFound(msg),
+            zk_sync::QueueError::InvalidState(msg) => Self::ConflictAlreadyResolved(msg),
+            zk_sync::QueueError::Storage(se) => Self::Storage(se),
+            other => Self::Io(other.to_string()),
+        }
     }
 }
 
