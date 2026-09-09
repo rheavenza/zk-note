@@ -1229,7 +1229,7 @@ Completion notes:
 ---
 
 ## ZK-046 — Two-client integration harness
-Status: TODO  
+Status: DONE  
 Priority: P0  
 Dependencies: ZK-045
 
@@ -1245,9 +1245,26 @@ client B local DB
 
 and proves clean multi-device sync.
 
+Completion notes:
+- Implemented comprehensive two-client integration test harness in `apps/server/tests/two_client_sync_tests.rs`.
+- Spun up real HTTP server over TCP (`127.0.0.1:0`), client A with local SQLite storage, and client B with local SQLite storage.
+- Executed the full M4 Gate scenario:
+  1. Device A creates note offline;
+  2. Device A syncs to server;
+  3. Device B syncs from server, stores encrypted object in its local DB, decrypts note and updates search index;
+  4. Device B edits note offline;
+  5. Device B syncs edit to server;
+  6. Device A syncs from server;
+  7. Device A sees decrypted update and updated search index.
+- Performed rigorous zero-knowledge database audit directly on server SQLite database: confirmed 0 forbidden plaintext strings appear anywhere in `encrypted_objects`, `object_history`, `processed_mutations`, `vaults`, or `accounts`.
+- Added 10 sequential alternating multi-device edits test.
+- Added tombstone deletion propagation test between devices.
+- Added killed sync resumption test from durable cursor without skipped revisions.
+- Verified via `./scripts/ci.sh`.
+
 ---
 
-### M4 Gate
+### M4 Gate: PASSED
 
 Required scenario:
 
@@ -1261,7 +1278,7 @@ A syncs
 A sees update
 ```
 
-No plaintext is present in server DB.
+No plaintext is present in server DB. All M4 acceptance criteria and gates verified.
 
 ---
 

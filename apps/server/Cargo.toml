@@ -35,6 +35,9 @@ blake2 = { workspace = true }
 
 [dev-dependencies]
 zk-sync = { workspace = true }
+zk-core = { workspace = true }
+zk-crypto = { workspace = true }
+zk-storage = { workspace = true }
 
 
 
