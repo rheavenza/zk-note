@@ -20,6 +20,14 @@ pub enum CryptoError {
     UnsupportedAlgorithm(String),
     /// Key derivation function failed.
     KdfFailure(String),
+    /// Decryption or authentication tag verification failed (fails closed).
+    DecryptionFailed,
+    /// AEAD encryption operation failed.
+    AeadFailure(String),
+    /// Checksum verification failed (e.g. in recovery key string).
+    InvalidChecksum,
+    /// Cryptographic envelope or parameter version is unsupported.
+    UnsupportedVersion(u32),
 }
 
 impl fmt::Display for CryptoError {
@@ -37,6 +45,14 @@ impl fmt::Display for CryptoError {
                 write!(f, "unsupported cryptographic algorithm: {alg}")
             }
             Self::KdfFailure(msg) => write!(f, "key derivation failed: {msg}"),
+            Self::DecryptionFailed => {
+                write!(f, "cryptographic authentication or decryption failed")
+            }
+            Self::AeadFailure(msg) => write!(f, "AEAD operation failed: {msg}"),
+            Self::InvalidChecksum => write!(f, "checksum verification failed (typo detected)"),
+            Self::UnsupportedVersion(v) => {
+                write!(f, "unsupported cryptographic envelope version: {v}")
+            }
         }
     }
 }

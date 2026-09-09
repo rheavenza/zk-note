@@ -289,7 +289,7 @@ Completion notes:
 ---
 
 ## ZK-012 — Vault Key creation and wrapping
-Status: TODO  
+Status: DONE  
 Priority: P0  
 Dependencies: ZK-010, ZK-011
 
@@ -301,10 +301,18 @@ Acceptance criteria:
 - wrong KEK fails closed;
 - tampered wrapper fails closed.
 
+Completion notes:
+- Implemented `wrap_vault_key` and `unwrap_vault_key` in `crates/zk-crypto/src/vault.rs` using XChaCha20-Poly1305 AEAD with 192-bit CSPRNG nonces (`OsRng`).
+- Verified round-trip wrap and unwrap restores identical Vault Key.
+- Verified wrong KEK fails closed (`CryptoError::DecryptionFailed`).
+- Verified tampering with ciphertext or nonce fails closed.
+- Implemented bidirectional conversions between `zk_crypto::vault::WrappedVaultKey` and `zk_protocol::vault::WrappedVaultKey`.
+- Validated via `./scripts/ci.sh`.
+
 ---
 
 ## ZK-013 — Recovery Key wrapping
-Status: TODO  
+Status: DONE  
 Priority: P0  
 Dependencies: ZK-012
 
@@ -316,10 +324,17 @@ Acceptance criteria:
 - wrong Recovery Key fails;
 - recovery representation has checksum or typo-detection strategy documented.
 
+Completion notes:
+- Implemented `wrap_vault_key_recovery` and `unwrap_vault_key_recovery` in `crates/zk-crypto/src/vault.rs` independently wrapping the Vault Key using a 256-bit `RecoveryKey`.
+- Implemented `format_recovery_key` and `parse_recovery_key` in `crates/zk-crypto/src/recovery.rs` appending a 4-byte cryptographic BLAKE2b checksum to the 32-byte key (36 bytes total = 72 hex digits), formatted into 9 groups of 8 hex digits separated by hyphens (80 characters total).
+- Implemented constant-time checksum comparison (`subtle::ConstantTimeEq`) detecting typos before attempting cryptographic operations.
+- Added tests covering recovery key wrapping round-trip, wrong recovery key rejection, formatted string parsing, and typo detection.
+- Validated via `./scripts/ci.sh`.
+
 ---
 
 ## ZK-014 — Object Key wrapping
-Status: TODO  
+Status: DONE  
 Priority: P0  
 Dependencies: ZK-012
 
@@ -330,10 +345,16 @@ Acceptance criteria:
 - object ID/kind bound via AAD according to protocol;
 - tampered AAD fails.
 
+Completion notes:
+- Implemented `wrap_object_key` and `unwrap_object_key` in `crates/zk-crypto/src/object.rs` wrapping a per-object random `ObjectKey` under the `VaultKey` with XChaCha20-Poly1305.
+- Implemented canonical AAD builder `build_aad` binding envelope version, object ID string, and object kind (`zk-envelope-aad:<version>:<object_id>:<kind>`).
+- Added tests verifying round-trip unwrapping and fail-closed rejection when object ID, object kind, or envelope version is modified in the AAD.
+- Validated via `./scripts/ci.sh`.
+
 ---
 
 ## ZK-015 — Object payload encryption
-Status: TODO  
+Status: DONE  
 Priority: P0  
 Dependencies: ZK-014
 
@@ -345,10 +366,15 @@ Acceptance criteria:
 - ciphertext tamper fails;
 - unknown envelope version fails.
 
+Completion notes:
+- Implemented `encrypt_object_payload` and `decrypt_object_payload` in `crates/zk-crypto/src/object.rs` using XChaCha20-Poly1305 with unique 192-bit CSPRNG nonces and canonical AAD metadata binding.
+- Added unit tests verifying payload encryption/decryption round-trip, wrong Object Key rejection, ciphertext tamper rejection, and nonce tamper rejection.
+- Validated via `./scripts/ci.sh`.
+
 ---
 
 ## ZK-016 — Encrypted envelope v1
-Status: TODO  
+Status: DONE  
 Priority: P0  
 Dependencies: ZK-014, ZK-015
 
@@ -360,10 +386,17 @@ Acceptance criteria:
 - no secret values exposed through Debug/Display;
 - compatibility test vector committed.
 
+Completion notes:
+- Implemented `encrypt_envelope` and `decrypt_envelope` in `crates/zk-crypto/src/object.rs` assembling complete versioned `EncryptedEnvelope` (V1) holding wrapped key and encrypted payload containers.
+- Validated serialization and deserialization round-trip with `zk_protocol::envelope::EncryptedEnvelope`.
+- Enforced `[REDACTED]` debug representation for all key types (`VaultKey`, `ObjectKey`, `RecoveryKey`, `KeyEncryptionKey`).
+- Committed static compatibility test vector in `test_compatibility_test_vector_v1` verifying deterministic decryption and fail-closed tamper detection.
+- Validated via `./scripts/ci.sh`.
+
 ---
 
 ## ZK-017 — Vault password rewrap
-Status: TODO  
+Status: DONE  
 Priority: P0  
 Dependencies: ZK-012
 
@@ -374,10 +407,16 @@ Acceptance criteria:
 - Vault Key identity stays unchanged;
 - existing object ciphertext remains unchanged.
 
+Completion notes:
+- Implemented `rewrap_vault_key` in `crates/zk-crypto/src/vault.rs` enabling vault password changes without re-encrypting object content.
+- Unwraps existing `VaultKey` using old passphrase and old KDF params, derives new KEK using new passphrase and new KDF params, and wraps the unchanged `VaultKey` under the new KEK.
+- Added tests verifying Vault Key identity preservation, successful unlock with new passphrase, rejection with old passphrase, and continued decryptability of existing object ciphertexts.
+- Validated via `./scripts/ci.sh`.
+
 ---
 
 ## ZK-018 — Crypto negative/fuzz test harness
-Status: TODO  
+Status: DONE  
 Priority: P1  
 Dependencies: ZK-016
 
@@ -388,6 +427,15 @@ Acceptance criteria:
 - unknown versions;
 - modified nonce/ciphertext/AAD;
 - no panic on untrusted envelope bytes.
+
+Completion notes:
+- Created negative and robustness test harness in `crates/zk-crypto/tests/crypto_negative_tests.rs`.
+- Tested malformed envelope corpus (`MALFORMED_CORPUS` covering empty strings, invalid JSON, missing fields, corrupted Base64).
+- Tested truncated inputs (truncated nonces < 24 bytes, truncated ciphertexts < 16 bytes auth tag, truncated recovery keys).
+- Tested unknown envelope versions (versions 0, 2, 3, 42, 999, u32::MAX) returning `CryptoError::UnsupportedVersion`.
+- Tested bit flips across payload ciphertext, payload nonce, wrapped key ciphertext, wrapped key nonce, and AAD fields (object ID and kind), verifying all fail closed without panics.
+- Tested pseudo-random fuzzed envelope mutations over 100 iterations with `std::panic::catch_unwind` demonstrating panic-free fail-closed handling.
+- Validated via `./scripts/ci.sh`.
 
 ---
 
@@ -405,6 +453,18 @@ tamper rejection
 AAD rejection
 version rejection
 ```
+
+Gate verification:
+- `vault create/unlock`: covered in `test_vault_key_wrapping_round_trip`
+- `wrong password`: covered in `test_vault_key_wrapping_round_trip`
+- `recovery unlock`: covered in `test_recovery_key_wrapping_and_formatting`
+- `password change`: covered in `test_vault_password_rewrap`
+- `object round trip`: covered in `test_complete_envelope_lifecycle`
+- `tamper rejection`: covered in `test_modified_components_fail_closed`
+- `AAD rejection`: covered in `test_object_key_wrapping_and_aad_binding`
+- `version rejection`: covered in `test_unknown_envelope_versions_rejected`
+
+All required tests passing. M1 gate passed!
 
 Do not implement server persistence before M1 is green.
 
