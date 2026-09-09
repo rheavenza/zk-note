@@ -1479,7 +1479,7 @@ Completion notes:
 ---
 
 ## ZK-056 — Delete-vs-edit conflict
-Status: TODO  
+Status: DONE  
 Priority: P0  
 Dependencies: ZK-053, ZK-037
 
@@ -1488,6 +1488,33 @@ Acceptance criteria:
 - stale edit cannot resurrect deleted note;
 - conflict UX distinguishes deletion;
 - user can explicitly restore as new/current revision.
+
+Completion notes:
+- Enforced tombstone resurrection prevention (SEC-008, MASTER_SPEC.md § 11):
+  - Updated `zk-protocol` and `zk-server` to return `is_deleted: bool` in `ConflictResponse` whenever a CAS revision conflict occurs on push.
+  - Guarded LWW (`evaluate_guarded_lww`) strictly refuses automatic resolution when either the local mutation or the remote state is a tombstone (`is_del_conflict`), preserving the conflict record for explicit user action.
+- Distinguishable Delete-vs-Edit conflict UX:
+  - Added migration `migrations/006_conflict_records_deletion_flags.sql` adding `remote_is_deleted` and `local_is_deleted` flags to `conflict_records`.
+  - Added deletion flags to `ConflictRecord` in `crates/zk-storage/src/models.rs` with helper methods (`is_deletion_conflict`, `is_delete_vs_edit`, `conflict_type_str`).
+  - Updated `zk-storage` SQLite backend to persist and query deletion flags across restarts.
+  - Enhanced CLI `zk-note conflicts list` (`apps/cli/src/commands.rs`) to display `Unresolved (Delete-vs-Edit)` / `Unresolved (Edit-vs-Delete)` and decrypt note titles from the active version when remote is deleted.
+  - Enhanced CLI `zk-note conflicts resolve` with dedicated interactive prompt for delete-vs-edit conflicts, clearly explaining tombstone state and offering tailored choices:
+    - [1] Restore at current revision (resurrect note on server with local changes);
+    - [2] Accept remote deletion (discard local changes and delete note locally);
+    - [3] Restore as new note (preserve remote deletion, create new note with local content).
+  - Added `--restore` flag to CLI `zk-note conflicts resolve --note-id <ID> --restore` and disallowed `--merge` on deletion conflicts with descriptive fail-closed errors.
+- Explicit restore and resurrection semantics:
+  - Added `ConflictResolutionStrategy::RestoreResurrect` in `crates/zk-sync/src/conflict.rs`.
+  - In `resolve_conflict`:
+    - `RestoreResurrect` / `KeepLocal`: enqueues an `Upsert` mutation targeting the current remote revision (`expected_revision = remote_revision`), ensuring CAS compliance and explicit resurrection on the server;
+    - `KeepRemote`: applies remote tombstone locally (`is_deleted = true`);
+    - `DuplicateAsSeparate`: preserves remote tombstone on original note, creating a brand new note at `expected_revision = 0`.
+- Verified with comprehensive test suites:
+  - Unit tests in `apps/cli/src/main.rs` (`test_cli_delete_vs_edit_conflict_lifecycle`, `test_cli_delete_vs_edit_keep_remote_accepts_deletion`);
+  - Unit test in `crates/zk-storage/src/sqlite.rs` (`test_sqlite_delete_vs_edit_conflict_flags_survive_restart`);
+  - Integration tests in `crates/zk-sync/tests/delete_vs_edit_conflict_tests.rs` (7 tests covering stale edit rejection, Guarded LWW tombstone safety, explicit restore, keep remote, duplicate separate, merge fail-closed, and SQLite persistence & zero-knowledge plaintext audit);
+  - Server tests in `apps/server/tests/server_tombstone_tests.rs`.
+- All quality gates passed via `./scripts/ci.sh`.
 
 ---
 

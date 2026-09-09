@@ -227,6 +227,7 @@ impl NativeHttpSyncAdapter {
                             ciphertext: String::new(),
                         },
                     },
+                    is_deleted: false,
                 })))
             }
             StatusCode::BAD_REQUEST => {
@@ -437,6 +438,7 @@ impl SyncServerAdapter for MockSyncAdapter {
                 current_revision: cur_rev,
                 current_server_seq: existing.map(|c| c.server_seq).unwrap_or(0),
                 current_envelope: conflict_envelope,
+                is_deleted: existing.map(|c| c.is_deleted).unwrap_or(false),
             })));
         }
 

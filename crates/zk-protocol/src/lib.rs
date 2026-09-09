@@ -197,6 +197,7 @@ mod tests {
             current_revision: 5,
             current_server_seq: 108,
             current_envelope: envelope.clone(),
+            is_deleted: false,
         };
         let conflict_json = serde_json::to_string(&conflict).expect("serialize conflict response");
         let parsed_conflict: ConflictResponse =

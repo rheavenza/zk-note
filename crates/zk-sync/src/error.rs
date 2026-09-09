@@ -111,6 +111,7 @@ mod tests {
                     ciphertext: "cipher".to_string(),
                 },
             },
+            is_deleted: false,
         }));
         assert!(err_conflict.to_string().contains("revision conflict"));
         assert!(err_conflict

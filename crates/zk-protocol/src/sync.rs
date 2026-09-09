@@ -47,6 +47,9 @@ pub struct ConflictResponse {
     pub current_server_seq: u64,
     /// Latest encrypted envelope stored on server for client reconciliation.
     pub current_envelope: EncryptedEnvelope,
+    /// Whether the conflicting remote version is a deletion tombstone (defaults to false).
+    #[serde(default)]
+    pub is_deleted: bool,
 }
 
 /// Individual object change entry in pull response.

@@ -204,6 +204,10 @@ async fn test_tombstone_stale_edit_and_duplicate_create_conflict() {
         "current revision is tombstone rev 2"
     );
     assert_eq!(conflict.current_server_seq, 2);
+    assert!(
+        conflict.is_deleted,
+        "conflict response must indicate remote is tombstone"
+    );
 
     // 4. Stale client trying to create with expected_revision = 0 MUST conflict
     let duplicate_create = helper_push_request(&obj_str, 0, b"resurrect without revision", false);

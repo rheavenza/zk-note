@@ -13,6 +13,8 @@ use zk_protocol::envelope::EncryptedEnvelope;
 
 const MIGRATION_001: &str = include_str!("../../../migrations/001_initial_local_storage.sql");
 const MIGRATION_005: &str = include_str!("../../../migrations/005_local_conflict_records.sql");
+const MIGRATION_006: &str =
+    include_str!("../../../migrations/006_conflict_records_deletion_flags.sql");
 
 /// SQLite-backed persistent local encrypted storage.
 ///
@@ -128,6 +130,18 @@ fn run_migrations(conn: &mut Connection) -> Result<(), StorageError> {
 
         tx.commit()
             .map_err(|e| StorageError::Backend(format!("failed to commit migration 005: {e}")))?;
+    }
+
+    if version < 3 {
+        let tx = conn.transaction().map_err(|e| {
+            StorageError::Backend(format!("failed to begin migration transaction: {e}"))
+        })?;
+
+        tx.execute_batch(MIGRATION_006)
+            .map_err(|e| StorageError::Backend(format!("failed to execute migration 006: {e}")))?;
+
+        tx.commit()
+            .map_err(|e| StorageError::Backend(format!("failed to commit migration 006: {e}")))?;
     }
 
     Ok(())
@@ -902,8 +916,8 @@ impl ConflictStore for SqliteStorage {
                 "INSERT INTO conflict_records (
                     conflict_id, object_id, object_kind, base_revision, remote_revision,
                     base_envelope, local_envelope, remote_envelope, candidate_envelope,
-                    resolved, created_at, resolved_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                    resolved, remote_is_deleted, local_is_deleted, created_at, resolved_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
                  ON CONFLICT (conflict_id) DO UPDATE SET
                     object_id = excluded.object_id,
                     object_kind = excluded.object_kind,
@@ -914,6 +928,8 @@ impl ConflictStore for SqliteStorage {
                     remote_envelope = excluded.remote_envelope,
                     candidate_envelope = excluded.candidate_envelope,
                     resolved = excluded.resolved,
+                    remote_is_deleted = excluded.remote_is_deleted,
+                    local_is_deleted = excluded.local_is_deleted,
                     created_at = excluded.created_at,
                     resolved_at = excluded.resolved_at;",
             )
@@ -930,6 +946,16 @@ impl ConflictStore for SqliteStorage {
             remote_env_json,
             candidate_env_json,
             resolved_int,
+            if conflict.remote_is_deleted {
+                1i64
+            } else {
+                0i64
+            },
+            if conflict.local_is_deleted {
+                1i64
+            } else {
+                0i64
+            },
             conflict.created_at,
             conflict.resolved_at,
         ])
@@ -948,7 +974,7 @@ impl ConflictStore for SqliteStorage {
             .prepare_cached(
                 "SELECT conflict_id, object_id, object_kind, base_revision, remote_revision,
                         base_envelope, local_envelope, remote_envelope, candidate_envelope,
-                        resolved, created_at, resolved_at
+                        resolved, remote_is_deleted, local_is_deleted, created_at, resolved_at
                  FROM conflict_records WHERE conflict_id = ?1;",
             )
             .map_err(|e| StorageError::Backend(format!("prepare get_conflict failed: {e}")))?;
@@ -974,7 +1000,7 @@ impl ConflictStore for SqliteStorage {
             .prepare_cached(
                 "SELECT conflict_id, object_id, object_kind, base_revision, remote_revision,
                         base_envelope, local_envelope, remote_envelope, candidate_envelope,
-                        resolved, created_at, resolved_at
+                        resolved, remote_is_deleted, local_is_deleted, created_at, resolved_at
                  FROM conflict_records WHERE object_id = ?1 AND resolved = 0
                  ORDER BY created_at DESC LIMIT 1;",
             )
@@ -1006,19 +1032,19 @@ impl ConflictStore for SqliteStorage {
             None => {
                 "SELECT conflict_id, object_id, object_kind, base_revision, remote_revision,
                         base_envelope, local_envelope, remote_envelope, candidate_envelope,
-                        resolved, created_at, resolved_at
+                        resolved, remote_is_deleted, local_is_deleted, created_at, resolved_at
                  FROM conflict_records ORDER BY created_at ASC;"
             }
             Some(true) => {
                 "SELECT conflict_id, object_id, object_kind, base_revision, remote_revision,
                         base_envelope, local_envelope, remote_envelope, candidate_envelope,
-                        resolved, created_at, resolved_at
+                        resolved, remote_is_deleted, local_is_deleted, created_at, resolved_at
                  FROM conflict_records WHERE resolved = 1 ORDER BY created_at ASC;"
             }
             Some(false) => {
                 "SELECT conflict_id, object_id, object_kind, base_revision, remote_revision,
                         base_envelope, local_envelope, remote_envelope, candidate_envelope,
-                        resolved, created_at, resolved_at
+                        resolved, remote_is_deleted, local_is_deleted, created_at, resolved_at
                  FROM conflict_records WHERE resolved = 0 ORDER BY created_at ASC;"
             }
         };
@@ -1123,8 +1149,10 @@ fn row_to_conflict_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ConflictR
     let remote_env_str: String = row.get(7)?;
     let candidate_env_str: Option<String> = row.get(8)?;
     let resolved_int: i64 = row.get(9)?;
-    let created_at: String = row.get(10)?;
-    let resolved_at: Option<String> = row.get(11)?;
+    let remote_is_deleted_int: i64 = row.get(10).unwrap_or(0);
+    let local_is_deleted_int: i64 = row.get(11).unwrap_or(0);
+    let created_at: String = row.get(12)?;
+    let resolved_at: Option<String> = row.get(13)?;
 
     let base_envelope = match base_env_str {
         Some(s) => Some(serde_json::from_str(&s).map_err(|e| {
@@ -1159,6 +1187,8 @@ fn row_to_conflict_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ConflictR
         remote_envelope,
         candidate_envelope,
         resolved: resolved_int != 0,
+        remote_is_deleted: remote_is_deleted_int != 0,
+        local_is_deleted: local_is_deleted_int != 0,
         created_at,
         resolved_at,
     })
@@ -1531,6 +1561,56 @@ mod tests {
             let deleted = storage.delete_conflict("conf-1").expect("delete");
             assert!(deleted);
             assert!(storage.get_conflict("conf-1").expect("get").is_none());
+        }
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_sqlite_delete_vs_edit_conflict_flags_survive_restart() {
+        let path = temp_db_path("conflict_deletion_flags");
+        let _ = fs::remove_file(&path);
+
+        let object_id = "obj-del-vs-edit";
+        let local_env = dummy_envelope(object_id, OBJECT_KIND_NOTE);
+        let remote_env = dummy_envelope(object_id, OBJECT_KIND_NOTE);
+
+        let conflict = ConflictRecord::new(
+            "conf-del-1",
+            object_id,
+            OBJECT_KIND_NOTE,
+            9,
+            10,
+            None,
+            local_env,
+            remote_env,
+            None,
+            "2026-09-10T01:00:00Z",
+        )
+        .with_deletion_flags(false, true);
+
+        assert!(conflict.is_delete_vs_edit());
+        assert!(!conflict.is_edit_vs_delete());
+        assert_eq!(conflict.conflict_type_str(), "Delete-vs-Edit");
+
+        // 1. Write conflict to disk database
+        {
+            let storage = SqliteStorage::open(&path).expect("open initial");
+            storage.put_conflict(&conflict).expect("put conflict");
+        }
+
+        // 2. Reopen from disk and verify deletion flags preserved
+        {
+            let storage = SqliteStorage::open(&path).expect("reopen");
+            let fetched = storage
+                .get_conflict("conf-del-1")
+                .expect("get")
+                .expect("must exist");
+
+            assert!(fetched.remote_is_deleted);
+            assert!(!fetched.local_is_deleted);
+            assert!(fetched.is_delete_vs_edit());
+            assert_eq!(fetched.conflict_type_str(), "Delete-vs-Edit");
         }
 
         let _ = fs::remove_file(&path);

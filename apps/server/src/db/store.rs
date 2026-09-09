@@ -414,6 +414,7 @@ impl ServerDb {
                         current_revision: cur_rev_u64,
                         current_server_seq: cur_seq as u64,
                         current_envelope,
+                        is_deleted,
                     }));
                 }
 

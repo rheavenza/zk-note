@@ -185,7 +185,9 @@ where
                 });
             }
             Err(SyncNetworkError::Conflict(conflict)) => {
-                if options.conflict_policy == ConflictPolicy::GuardedLww {
+                let is_del_conflict =
+                    conflict.is_deleted || mutation.mutation_type == MutationType::Delete;
+                if options.conflict_policy == ConflictPolicy::GuardedLww && !is_del_conflict {
                     // Guarded Last-Write-Wins: automatically resolve winner, preserving losing revision
                     let outcome = evaluate_guarded_lww(
                         queue.storage(),
@@ -196,7 +198,7 @@ where
                     )?;
                     report.lww_resolved.push(outcome);
                 } else {
-                    // Default V1: preserve conflict and leave local mutation recoverable
+                    // Default V1 or delete-vs-edit conflict (SEC-008): preserve conflict and leave local mutation recoverable
                     let _ = queue.mark_pending(&mutation.mutation_id);
 
                     let base_envelope = queue
@@ -215,6 +217,10 @@ where
                         conflict.current_envelope.clone(),
                         None,
                         now_utc_rfc3339(),
+                    )
+                    .with_deletion_flags(
+                        mutation.mutation_type == MutationType::Delete,
+                        conflict.is_deleted,
                     );
                     let _ = queue.storage().put_conflict(&conflict_record);
 

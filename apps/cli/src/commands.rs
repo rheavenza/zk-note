@@ -936,9 +936,21 @@ pub struct ConflictListItem {
     pub base_revision: u64,
     pub remote_revision: u64,
     pub resolved: bool,
+    pub remote_is_deleted: bool,
+    pub local_is_deleted: bool,
+    pub conflict_type: String,
     pub created_at: String,
     pub resolved_at: Option<String>,
     pub title: String,
+}
+
+impl ConflictListItem {
+    pub fn is_delete_vs_edit(&self) -> bool {
+        self.remote_is_deleted && !self.local_is_deleted
+    }
+    pub fn is_edit_vs_delete(&self) -> bool {
+        self.local_is_deleted && !self.remote_is_deleted
+    }
 }
 
 /// Helper to resolve a stored conflict record by exact ID or unique >=4 character prefix.
@@ -996,13 +1008,21 @@ pub fn cmd_conflicts(
     for c in raw_conflicts {
         let title = match &vault_key_opt {
             Some(key) => {
-                let env = c.candidate_envelope.as_ref().unwrap_or(&c.local_envelope);
+                let env = if c.remote_is_deleted {
+                    &c.local_envelope
+                } else if c.local_is_deleted {
+                    &c.remote_envelope
+                } else {
+                    c.candidate_envelope.as_ref().unwrap_or(&c.local_envelope)
+                };
                 PlaintextNote::decrypt(env, key)
                     .map(|n| n.title)
                     .unwrap_or_else(|_| "[decryption error]".to_string())
             }
             None => "[locked]".to_string(),
         };
+
+        let conflict_type = c.conflict_type_str().to_string();
 
         items.push(ConflictListItem {
             conflict_id: c.conflict_id,
@@ -1011,6 +1031,9 @@ pub fn cmd_conflicts(
             base_revision: c.base_revision,
             remote_revision: c.remote_revision,
             resolved: c.resolved,
+            remote_is_deleted: c.remote_is_deleted,
+            local_is_deleted: c.local_is_deleted,
+            conflict_type,
             created_at: c.created_at,
             resolved_at: c.resolved_at,
             title,
@@ -1029,18 +1052,22 @@ pub fn cmd_conflicts(
         }
     } else {
         println!(
-            "{:<36}  {:<36}  {:<6}  {:<6}  {:<10}  TITLE",
+            "{:<36}  {:<36}  {:<6}  {:<6}  {:<28}  TITLE",
             "CONFLICT ID", "NOTE ID", "BASE", "REMOTE", "STATUS"
         );
-        println!("{}", "-".repeat(110));
+        println!("{}", "-".repeat(125));
         for item in &items {
             let status = if item.resolved {
-                "Resolved"
+                "Resolved".to_string()
+            } else if item.is_delete_vs_edit() {
+                "Unresolved (Delete-vs-Edit)".to_string()
+            } else if item.is_edit_vs_delete() {
+                "Unresolved (Edit-vs-Delete)".to_string()
             } else {
-                "Unresolved"
+                "Unresolved".to_string()
             };
             println!(
-                "{:<36}  {:<36}  {:<6}  {:<6}  {:<10}  {}",
+                "{:<36}  {:<36}  {:<6}  {:<6}  {:<28}  {}",
                 item.conflict_id,
                 item.object_id,
                 item.base_revision,
@@ -1063,6 +1090,7 @@ pub fn cmd_resolve(
     choose_remote: bool,
     choose_merge: bool,
     choose_duplicate: bool,
+    choose_restore: bool,
     duplicate_title: Option<String>,
     editor_override: Option<&str>,
     title_override: Option<String>,
@@ -1088,18 +1116,33 @@ pub fn cmd_resolve(
         return Err(CliError::ConflictAlreadyResolved(conflict.conflict_id));
     }
 
-    let flags_count = [choose_local, choose_remote, choose_merge, choose_duplicate]
-        .iter()
-        .filter(|&&b| b)
-        .count();
+    let flags_count = [
+        choose_local,
+        choose_remote,
+        choose_merge,
+        choose_duplicate,
+        choose_restore,
+    ]
+    .iter()
+    .filter(|&&b| b)
+    .count();
 
     if flags_count > 1 {
         return Err(CliError::Io(
-            "only one of --local, --remote, --merge, or --duplicate can be specified".to_string(),
+            "only one of --local, --remote, --merge, --duplicate, or --restore can be specified"
+                .to_string(),
         ));
     }
 
-    let strategy = if choose_local {
+    if choose_merge && (conflict.remote_is_deleted || conflict.local_is_deleted) {
+        return Err(CliError::Io(
+            "cannot merge a delete conflict; use --restore to resurrect as current revision, --duplicate to restore as a new note, or --remote to accept deletion".to_string()
+        ));
+    }
+
+    let strategy = if choose_restore {
+        ConflictResolutionStrategy::RestoreResurrect
+    } else if choose_local {
         ConflictResolutionStrategy::KeepLocal
     } else if choose_remote {
         ConflictResolutionStrategy::KeepRemote
@@ -1198,144 +1241,287 @@ pub fn cmd_resolve(
         // No strategy flags passed
         if !io::stdin().is_terminal() {
             return Err(CliError::Io(
-                "no resolution strategy specified; use --local, --remote, --merge, or --duplicate"
+                "no resolution strategy specified; use --local, --remote, --merge, --duplicate, or --restore"
                     .to_string(),
             ));
         }
 
-        let local_note = PlaintextNote::decrypt(&conflict.local_envelope, &vault_key)?;
-        let remote_note = PlaintextNote::decrypt(&conflict.remote_envelope, &vault_key)?;
+        if conflict.remote_is_deleted {
+            // --- DELETE-VS-EDIT CONFLICT UX ---
+            let local_note = PlaintextNote::decrypt(&conflict.local_envelope, &vault_key)?;
 
-        println!("\n=== CONFLICT RESOLUTION ===");
-        println!("Conflict ID:     {}", conflict.conflict_id);
-        println!("Note ID:         {}", conflict.object_id);
-        println!("Base revision:   {}", conflict.base_revision);
-        println!("Remote revision: {}", conflict.remote_revision);
-        println!("\nLocal version (your offline changes):");
-        println!("  Title:   {}", local_note.title);
-        println!(
-            "  Tags:    {}",
-            if local_note.tags.is_empty() {
-                "-".to_string()
-            } else {
-                local_note.tags.join(", ")
-            }
-        );
-        println!("  Updated: {}", local_note.updated_at);
-        println!("\nRemote version (server head):");
-        println!("  Title:   {}", remote_note.title);
-        println!(
-            "  Tags:    {}",
-            if remote_note.tags.is_empty() {
-                "-".to_string()
-            } else {
-                remote_note.tags.join(", ")
-            }
-        );
-        println!("  Updated: {}", remote_note.updated_at);
-        println!("\nResolution options:");
-        println!("  [1] Keep local version (overwrite remote on next sync)");
-        println!("  [2] Keep remote version (discard local changes)");
-        println!("  [3] Merge (open editor with diff3 merge candidate)");
-        println!("  [4] Duplicate as separate note (keep remote and preserve local as new note)");
-        println!("  [q] Abort");
-        print!("\nSelect an option [1-4, q]: ");
-        io::stdout()
-            .flush()
-            .map_err(|e| CliError::Io(e.to_string()))?;
+            println!("\n=== CONFLICT RESOLUTION (DELETE-VS-EDIT) ===");
+            println!("Conflict ID:     {}", conflict.conflict_id);
+            println!("Note ID:         {}", conflict.object_id);
+            println!("Base revision:   {}", conflict.base_revision);
+            println!(
+                "Remote revision: {} (DELETED ON SERVER)",
+                conflict.remote_revision
+            );
+            println!("\nLocal version (your offline changes):");
+            println!("  Title:   {}", local_note.title);
+            println!(
+                "  Tags:    {}",
+                if local_note.tags.is_empty() {
+                    "-".to_string()
+                } else {
+                    local_note.tags.join(", ")
+                }
+            );
+            println!("  Updated: {}", local_note.updated_at);
+            println!("\nRemote status:");
+            println!(
+                "  The note was DELETED on the remote server (tombstone revision {}).",
+                conflict.remote_revision
+            );
+            println!("\nResolution options:");
+            println!("  [1] Restore at current revision (resurrect note on server with your local changes)");
+            println!(
+                "  [2] Accept remote deletion (discard local changes and delete note locally)"
+            );
+            println!("  [3] Restore as new note (preserve remote deletion, create new note with local content)");
+            println!("  [q] Abort");
+            print!("\nSelect an option [1-3, q]: ");
+            io::stdout()
+                .flush()
+                .map_err(|e| CliError::Io(e.to_string()))?;
 
-        let mut input = String::new();
-        let stdin = io::stdin();
-        stdin
-            .lock()
-            .read_line(&mut input)
-            .map_err(|e| CliError::Io(e.to_string()))?;
-        let choice = input.trim();
+            let mut input = String::new();
+            let stdin = io::stdin();
+            stdin
+                .lock()
+                .read_line(&mut input)
+                .map_err(|e| CliError::Io(e.to_string()))?;
+            let choice = input.trim();
 
-        let chosen_strategy = match choice {
-            "1" => ConflictResolutionStrategy::KeepLocal,
-            "2" => ConflictResolutionStrategy::KeepRemote,
-            "3" => {
-                let candidate_note = match &conflict.candidate_envelope {
-                    Some(cand_env) => PlaintextNote::decrypt(cand_env, &vault_key)?,
-                    None => {
-                        let (outcome, _) = generate_merge_candidate(
-                            conflict.base_envelope.as_ref(),
-                            &conflict.local_envelope,
-                            &conflict.remote_envelope,
-                            &vault_key,
-                        )?;
-                        outcome.candidate
+            match choice {
+                "1" => ConflictResolutionStrategy::RestoreResurrect,
+                "2" => ConflictResolutionStrategy::KeepRemote,
+                "3" => {
+                    print!(
+                        "Enter title for new note [default: \"{} (Restored)\"]: ",
+                        local_note.title
+                    );
+                    io::stdout()
+                        .flush()
+                        .map_err(|e| CliError::Io(e.to_string()))?;
+                    let mut title_input = String::new();
+                    stdin
+                        .lock()
+                        .read_line(&mut title_input)
+                        .map_err(|e| CliError::Io(e.to_string()))?;
+                    let trimmed_title = title_input.trim();
+                    let title = if trimmed_title.is_empty() {
+                        Some(format!("{} (Restored)", local_note.title))
+                    } else {
+                        Some(trimmed_title.to_string())
+                    };
+                    let new_object_id = uuid::Uuid::new_v4().to_string();
+                    ConflictResolutionStrategy::DuplicateAsSeparate {
+                        new_object_id,
+                        new_title: title,
                     }
-                };
-                let editor_cmd = if let Some(e) = editor_override {
-                    e.to_string()
-                } else if let Ok(e) = std::env::var("VISUAL") {
-                    e
-                } else if let Ok(e) = std::env::var("EDITOR") {
-                    e
-                } else {
-                    "nano".to_string()
-                };
-
-                let initial_text = note_to_edit_buffer(
-                    &candidate_note.title,
-                    &candidate_note.tags,
-                    &candidate_note.body,
-                );
-                let guard =
-                    TempFileGuard::create("zk-note-resolve-merge", initial_text.as_bytes())?;
-                println!("Opening conflict merge in editor ({editor_cmd})...");
-                run_editor(&editor_cmd, guard.path())?;
-                let edited_bytes = guard.read_bytes()?;
-                let edited_str = String::from_utf8(edited_bytes).map_err(|e| {
-                    CliError::Io(format!("invalid UTF-8 in edited merge note: {e}"))
-                })?;
-                let parsed =
-                    parse_edit_buffer(&edited_str, &candidate_note.title, &candidate_note.tags)?;
-                guard.cleanup();
-
-                let merged_note = NoteBuilder::new()
-                    .title(parsed.title)
-                    .body(parsed.body)
-                    .tags(parsed.tags)
-                    .build()?;
-                ConflictResolutionStrategy::Merge(merged_note)
-            }
-            "4" => {
-                print!(
-                    "Enter title for duplicate note [default: \"{} (Local Copy)\"]: ",
-                    local_note.title
-                );
-                io::stdout()
-                    .flush()
-                    .map_err(|e| CliError::Io(e.to_string()))?;
-                let mut title_input = String::new();
-                stdin
-                    .lock()
-                    .read_line(&mut title_input)
-                    .map_err(|e| CliError::Io(e.to_string()))?;
-                let trimmed_title = title_input.trim();
-                let title = if trimmed_title.is_empty() {
-                    Some(format!("{} (Local Copy)", local_note.title))
-                } else {
-                    Some(trimmed_title.to_string())
-                };
-                let new_object_id = uuid::Uuid::new_v4().to_string();
-                ConflictResolutionStrategy::DuplicateAsSeparate {
-                    new_object_id,
-                    new_title: title,
+                }
+                "q" | "Q" => {
+                    println!("Resolution aborted.");
+                    return Err(CliError::Io("resolution aborted by user".to_string()));
+                }
+                other => {
+                    return Err(CliError::Io(format!("invalid option: '{other}'")));
                 }
             }
-            "q" | "Q" => {
-                println!("Resolution aborted.");
-                return Err(CliError::Io("resolution aborted by user".to_string()));
+        } else if conflict.local_is_deleted {
+            // --- EDIT-VS-DELETE CONFLICT UX ---
+            let remote_note = PlaintextNote::decrypt(&conflict.remote_envelope, &vault_key)?;
+
+            println!("\n=== CONFLICT RESOLUTION (EDIT-VS-DELETE) ===");
+            println!("Conflict ID:     {}", conflict.conflict_id);
+            println!("Note ID:         {}", conflict.object_id);
+            println!("Base revision:   {}", conflict.base_revision);
+            println!("Remote revision: {}", conflict.remote_revision);
+            println!("\nLocal status:");
+            println!("  You marked this note for DELETION locally.");
+            println!("\nRemote version (server head):");
+            println!("  Title:   {}", remote_note.title);
+            println!(
+                "  Tags:    {}",
+                if remote_note.tags.is_empty() {
+                    "-".to_string()
+                } else {
+                    remote_note.tags.join(", ")
+                }
+            );
+            println!("  Updated: {}", remote_note.updated_at);
+            println!("\nResolution options:");
+            println!("  [1] Confirm deletion (delete note on server at current revision)");
+            println!(
+                "  [2] Keep remote edit (cancel local deletion and restore server's updated note)"
+            );
+            println!("  [q] Abort");
+            print!("\nSelect an option [1-2, q]: ");
+            io::stdout()
+                .flush()
+                .map_err(|e| CliError::Io(e.to_string()))?;
+
+            let mut input = String::new();
+            let stdin = io::stdin();
+            stdin
+                .lock()
+                .read_line(&mut input)
+                .map_err(|e| CliError::Io(e.to_string()))?;
+            let choice = input.trim();
+
+            match choice {
+                "1" => ConflictResolutionStrategy::KeepLocal,
+                "2" => ConflictResolutionStrategy::KeepRemote,
+                "q" | "Q" => {
+                    println!("Resolution aborted.");
+                    return Err(CliError::Io("resolution aborted by user".to_string()));
+                }
+                other => {
+                    return Err(CliError::Io(format!("invalid option: '{other}'")));
+                }
             }
-            other => {
-                return Err(CliError::Io(format!("invalid option: '{other}'")));
+        } else {
+            // --- EDIT-VS-EDIT CONFLICT UX ---
+            let local_note = PlaintextNote::decrypt(&conflict.local_envelope, &vault_key)?;
+            let remote_note = PlaintextNote::decrypt(&conflict.remote_envelope, &vault_key)?;
+
+            println!("\n=== CONFLICT RESOLUTION ===");
+            println!("Conflict ID:     {}", conflict.conflict_id);
+            println!("Note ID:         {}", conflict.object_id);
+            println!("Base revision:   {}", conflict.base_revision);
+            println!("Remote revision: {}", conflict.remote_revision);
+            println!("\nLocal version (your offline changes):");
+            println!("  Title:   {}", local_note.title);
+            println!(
+                "  Tags:    {}",
+                if local_note.tags.is_empty() {
+                    "-".to_string()
+                } else {
+                    local_note.tags.join(", ")
+                }
+            );
+            println!("  Updated: {}", local_note.updated_at);
+            println!("\nRemote version (server head):");
+            println!("  Title:   {}", remote_note.title);
+            println!(
+                "  Tags:    {}",
+                if remote_note.tags.is_empty() {
+                    "-".to_string()
+                } else {
+                    remote_note.tags.join(", ")
+                }
+            );
+            println!("  Updated: {}", remote_note.updated_at);
+            println!("\nResolution options:");
+            println!("  [1] Keep local version (overwrite remote on next sync)");
+            println!("  [2] Keep remote version (discard local changes)");
+            println!("  [3] Merge (open editor with diff3 merge candidate)");
+            println!(
+                "  [4] Duplicate as separate note (keep remote and preserve local as new note)"
+            );
+            println!("  [q] Abort");
+            print!("\nSelect an option [1-4, q]: ");
+            io::stdout()
+                .flush()
+                .map_err(|e| CliError::Io(e.to_string()))?;
+
+            let mut input = String::new();
+            let stdin = io::stdin();
+            stdin
+                .lock()
+                .read_line(&mut input)
+                .map_err(|e| CliError::Io(e.to_string()))?;
+            let choice = input.trim();
+
+            match choice {
+                "1" => ConflictResolutionStrategy::KeepLocal,
+                "2" => ConflictResolutionStrategy::KeepRemote,
+                "3" => {
+                    let candidate_note = match &conflict.candidate_envelope {
+                        Some(cand_env) => PlaintextNote::decrypt(cand_env, &vault_key)?,
+                        None => {
+                            let (outcome, _) = generate_merge_candidate(
+                                conflict.base_envelope.as_ref(),
+                                &conflict.local_envelope,
+                                &conflict.remote_envelope,
+                                &vault_key,
+                            )?;
+                            outcome.candidate
+                        }
+                    };
+                    let editor_cmd = if let Some(e) = editor_override {
+                        e.to_string()
+                    } else if let Ok(e) = std::env::var("VISUAL") {
+                        e
+                    } else if let Ok(e) = std::env::var("EDITOR") {
+                        e
+                    } else {
+                        "nano".to_string()
+                    };
+
+                    let initial_text = note_to_edit_buffer(
+                        &candidate_note.title,
+                        &candidate_note.tags,
+                        &candidate_note.body,
+                    );
+                    let guard =
+                        TempFileGuard::create("zk-note-resolve-merge", initial_text.as_bytes())?;
+                    println!("Opening conflict merge in editor ({editor_cmd})...");
+                    run_editor(&editor_cmd, guard.path())?;
+                    let edited_bytes = guard.read_bytes()?;
+                    let edited_str = String::from_utf8(edited_bytes).map_err(|e| {
+                        CliError::Io(format!("invalid UTF-8 in edited merge note: {e}"))
+                    })?;
+                    let parsed = parse_edit_buffer(
+                        &edited_str,
+                        &candidate_note.title,
+                        &candidate_note.tags,
+                    )?;
+                    guard.cleanup();
+
+                    let merged_note = NoteBuilder::new()
+                        .title(parsed.title)
+                        .body(parsed.body)
+                        .tags(parsed.tags)
+                        .build()?;
+                    ConflictResolutionStrategy::Merge(merged_note)
+                }
+                "4" => {
+                    print!(
+                        "Enter title for duplicate note [default: \"{} (Local Copy)\"]: ",
+                        local_note.title
+                    );
+                    io::stdout()
+                        .flush()
+                        .map_err(|e| CliError::Io(e.to_string()))?;
+                    let mut title_input = String::new();
+                    stdin
+                        .lock()
+                        .read_line(&mut title_input)
+                        .map_err(|e| CliError::Io(e.to_string()))?;
+                    let trimmed_title = title_input.trim();
+                    let title = if trimmed_title.is_empty() {
+                        Some(format!("{} (Local Copy)", local_note.title))
+                    } else {
+                        Some(trimmed_title.to_string())
+                    };
+                    let new_object_id = uuid::Uuid::new_v4().to_string();
+                    ConflictResolutionStrategy::DuplicateAsSeparate {
+                        new_object_id,
+                        new_title: title,
+                    }
+                }
+                "q" | "Q" => {
+                    println!("Resolution aborted.");
+                    return Err(CliError::Io("resolution aborted by user".to_string()));
+                }
+                other => {
+                    return Err(CliError::Io(format!("invalid option: '{other}'")));
+                }
             }
-        };
-        chosen_strategy
+        }
     };
 
     let queue = PendingMutationQueue::new(Arc::clone(&storage));
@@ -1356,16 +1542,30 @@ pub fn cmd_resolve(
         }
         None => match result.retry_mutation {
             Some(ref m) => {
-                println!(
-                    "Conflict '{}' resolved for note '{}'. Mutation enqueued with expected revision {} for sync retry.",
-                    result.conflict_id, result.object_id, m.expected_revision
-                );
+                if conflict.remote_is_deleted {
+                    println!(
+                        "Conflict '{}' resolved for note '{}'. Note restored/resurrected and mutation enqueued with expected revision {} for sync retry.",
+                        result.conflict_id, result.object_id, m.expected_revision
+                    );
+                } else {
+                    println!(
+                        "Conflict '{}' resolved for note '{}'. Mutation enqueued with expected revision {} for sync retry.",
+                        result.conflict_id, result.object_id, m.expected_revision
+                    );
+                }
             }
             None => {
-                println!(
-                    "Conflict '{}' resolved for note '{}'. Remote version accepted.",
-                    result.conflict_id, result.object_id
-                );
+                if conflict.remote_is_deleted {
+                    println!(
+                        "Conflict '{}' resolved for note '{}'. Remote deletion accepted; note marked deleted locally.",
+                        result.conflict_id, result.object_id
+                    );
+                } else {
+                    println!(
+                        "Conflict '{}' resolved for note '{}'. Remote version accepted.",
+                        result.conflict_id, result.object_id
+                    );
+                }
             }
         },
     }

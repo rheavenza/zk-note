@@ -179,6 +179,10 @@ pub enum Commands {
         #[arg(short = 'd', long)]
         duplicate: bool,
 
+        /// Explicitly restore/resurrect note at current revision (for delete-vs-edit conflicts)
+        #[arg(long)]
+        restore: bool,
+
         /// Custom title for duplicated note (when using --duplicate)
         #[arg(long)]
         duplicate_title: Option<String>,
@@ -268,6 +272,7 @@ fn run() -> Result<(), CliError> {
             remote,
             merge,
             duplicate,
+            restore,
             duplicate_title,
             editor,
             title,
@@ -281,6 +286,7 @@ fn run() -> Result<(), CliError> {
                 remote,
                 merge,
                 duplicate,
+                restore,
                 duplicate_title,
                 editor.as_deref(),
                 title,
@@ -1605,6 +1611,7 @@ mod tests {
             false, // remote
             false, // merge
             false, // duplicate
+            false, // restore
             None,
             None,
             None,
@@ -1639,6 +1646,7 @@ mod tests {
             Some(dir_path),
             &conf_id,
             true,
+            false,
             false,
             false,
             false,
@@ -1702,6 +1710,7 @@ mod tests {
             true,  // remote
             false, // merge
             false, // duplicate
+            false, // restore
             None,
             None,
             None,
@@ -1776,6 +1785,7 @@ mod tests {
             false, // remote
             true,  // merge
             false, // duplicate
+            false, // restore
             None,
             None,
             Some("Manually Merged Title".to_string()),
@@ -1849,6 +1859,7 @@ mod tests {
             false, // remote
             false, // merge
             true,  // duplicate
+            false, // restore
             Some("Important Idea (Branch Copy)".to_string()),
             None,
             None,
@@ -1918,6 +1929,7 @@ mod tests {
             true, // remote
             false,
             false,
+            false,
             None,
             None,
             None,
@@ -1932,6 +1944,7 @@ mod tests {
             Some(dir_path),
             "non-existent-conflict",
             true,
+            false,
             false,
             false,
             false,
@@ -1952,6 +1965,7 @@ mod tests {
             false,
             false,
             false,
+            false,
             None,
             None,
             None,
@@ -1960,6 +1974,181 @@ mod tests {
         )
         .expect("resolve by 4-char prefix");
         assert_eq!(prefix_res.conflict_id, conf_id);
+
+        let _ = fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn test_cli_delete_vs_edit_conflict_lifecycle() {
+        use zk_storage::models::ConflictRecord;
+        use zk_storage::traits::{ConflictStore, ObjectStore};
+
+        let test_dir = temp_test_dir("cli_del_vs_edit");
+        let dir_path = test_dir.as_path();
+        let pass = "test-passphrase-del-edit".to_string();
+
+        cmd_init(Some(dir_path), Some(pass), true).expect("init vault");
+        let sess_file = config::session_file(dir_path);
+        let vault_key = session::load_session_key(&sess_file).expect("load key");
+
+        let obj_id = uuid::Uuid::new_v4().to_string();
+        let local_note = PlaintextNote::new("My Offline Edit", "Local edited content");
+        let env_local = local_note.encrypt(&vault_key, &obj_id).expect("enc local");
+        // Remote deleted it: tombstone envelope
+        let dummy_remote = PlaintextNote::new("Deleted Note", "Old content");
+        let env_remote = dummy_remote
+            .encrypt(&vault_key, &obj_id)
+            .expect("enc remote");
+
+        let conf_id = format!("conf-del-{}", uuid::Uuid::new_v4());
+        let record = ConflictRecord::new(
+            &conf_id,
+            &obj_id,
+            OBJECT_KIND_NOTE,
+            9,
+            10,
+            None,
+            env_local.clone(),
+            env_remote,
+            None,
+            "2026-09-10T02:00:00Z",
+        )
+        .with_deletion_flags(false, true);
+
+        {
+            let storage = SqliteStorage::open(config::db_file(dir_path)).expect("open db");
+            storage.put_conflict(&record).expect("put");
+        }
+
+        // 1. Verify conflict listing distinguishes deletion
+        let items = cmd_conflicts(Some(dir_path), false, false).expect("list conflicts");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].conflict_id, conf_id);
+        assert!(items[0].remote_is_deleted);
+        assert!(!items[0].local_is_deleted);
+        assert!(items[0].is_delete_vs_edit());
+        assert_eq!(items[0].conflict_type, "Delete-vs-Edit");
+        assert_eq!(items[0].title, "My Offline Edit");
+
+        // 2. Verify merge is rejected on delete conflict
+        let merge_err = cmd_resolve(
+            Some(dir_path),
+            &conf_id,
+            false,
+            false,
+            true, // merge
+            false,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(merge_err, CliError::Io(_)));
+
+        // 3. Resolve by explicit restoration (--restore)
+        let res = cmd_resolve(
+            Some(dir_path),
+            &conf_id,
+            false,
+            false,
+            false,
+            false,
+            true, // restore
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("resolve restore");
+
+        assert_eq!(res.conflict_id, conf_id);
+        assert_eq!(res.object_id, obj_id);
+
+        let retry_mut = res.retry_mutation.expect("retry mutation");
+        assert_eq!(retry_mut.expected_revision, 10);
+        assert_eq!(
+            retry_mut.mutation_type,
+            zk_storage::models::MutationType::Upsert
+        );
+
+        // Verify local object is active (not deleted)
+        let storage = SqliteStorage::open(config::db_file(dir_path)).expect("open db");
+        let obj = storage.get_object(&obj_id).expect("get").expect("exists");
+        assert_eq!(obj.revision, 10);
+        assert!(!obj.is_deleted);
+
+        let _ = fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn test_cli_delete_vs_edit_keep_remote_accepts_deletion() {
+        use zk_storage::models::ConflictRecord;
+        use zk_storage::traits::{ConflictStore, ObjectStore};
+
+        let test_dir = temp_test_dir("cli_del_remote");
+        let dir_path = test_dir.as_path();
+        let pass = "test-passphrase-del-rem".to_string();
+
+        cmd_init(Some(dir_path), Some(pass), true).expect("init vault");
+        let sess_file = config::session_file(dir_path);
+        let vault_key = session::load_session_key(&sess_file).expect("load key");
+
+        let obj_id = uuid::Uuid::new_v4().to_string();
+        let local_note = PlaintextNote::new("My Offline Edit", "Local edited content");
+        let env_local = local_note.encrypt(&vault_key, &obj_id).expect("enc local");
+        let dummy_remote = PlaintextNote::new("Deleted Note", "Old content");
+        let env_remote = dummy_remote
+            .encrypt(&vault_key, &obj_id)
+            .expect("enc remote");
+
+        let conf_id = format!("conf-del-rem-{}", uuid::Uuid::new_v4());
+        let record = ConflictRecord::new(
+            &conf_id,
+            &obj_id,
+            OBJECT_KIND_NOTE,
+            9,
+            10,
+            None,
+            env_local,
+            env_remote,
+            None,
+            "2026-09-10T02:00:00Z",
+        )
+        .with_deletion_flags(false, true);
+
+        {
+            let storage = SqliteStorage::open(config::db_file(dir_path)).expect("open db");
+            storage.put_conflict(&record).expect("put");
+        }
+
+        // Resolve by keeping remote (--remote)
+        let res = cmd_resolve(
+            Some(dir_path),
+            &conf_id,
+            false,
+            true, // remote
+            false,
+            false,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("resolve keep remote");
+
+        assert!(res.retry_mutation.is_none());
+
+        // Verify local object is marked deleted (tombstone preserved locally)
+        let storage = SqliteStorage::open(config::db_file(dir_path)).expect("open db");
+        let obj = storage.get_object(&obj_id).expect("get").expect("exists");
+        assert_eq!(obj.revision, 10);
+        assert!(obj.is_deleted);
 
         let _ = fs::remove_dir_all(&test_dir);
     }

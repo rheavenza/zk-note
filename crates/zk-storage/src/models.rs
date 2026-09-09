@@ -171,6 +171,12 @@ pub struct ConflictRecord {
     pub candidate_envelope: Option<EncryptedEnvelope>,
     /// Whether this conflict has been resolved by the user or resolution policy.
     pub resolved: bool,
+    /// Whether the conflicting remote version was deleted (tombstone).
+    #[serde(default)]
+    pub remote_is_deleted: bool,
+    /// Whether the local mutation was a deletion tombstone.
+    #[serde(default)]
+    pub local_is_deleted: bool,
     /// Timestamp when this conflict record was created (RFC 3339 UTC).
     pub created_at: String,
     /// Timestamp when this conflict record was marked resolved, if resolved (RFC 3339 UTC).
@@ -203,8 +209,45 @@ impl ConflictRecord {
             remote_envelope,
             candidate_envelope,
             resolved: false,
+            remote_is_deleted: false,
+            local_is_deleted: false,
             created_at: created_at.into(),
             resolved_at: None,
+        }
+    }
+
+    /// Sets deletion flags for local and remote versions.
+    pub fn with_deletion_flags(mut self, local_is_deleted: bool, remote_is_deleted: bool) -> Self {
+        self.local_is_deleted = local_is_deleted;
+        self.remote_is_deleted = remote_is_deleted;
+        self
+    }
+
+    /// Whether this conflict involves a deletion on either remote or local side.
+    pub fn is_deletion_conflict(&self) -> bool {
+        self.remote_is_deleted || self.local_is_deleted
+    }
+
+    /// Whether remote deleted the note while local edited it.
+    pub fn is_delete_vs_edit(&self) -> bool {
+        self.remote_is_deleted && !self.local_is_deleted
+    }
+
+    /// Whether local deleted the note while remote edited it.
+    pub fn is_edit_vs_delete(&self) -> bool {
+        self.local_is_deleted && !self.remote_is_deleted
+    }
+
+    /// Returns a human-readable description of the conflict type.
+    pub fn conflict_type_str(&self) -> &'static str {
+        if self.remote_is_deleted && !self.local_is_deleted {
+            "Delete-vs-Edit"
+        } else if self.local_is_deleted && !self.remote_is_deleted {
+            "Edit-vs-Delete"
+        } else if self.local_is_deleted && self.remote_is_deleted {
+            "Delete-vs-Delete"
+        } else {
+            "Edit-vs-Edit"
         }
     }
 }

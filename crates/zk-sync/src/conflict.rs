@@ -80,6 +80,8 @@ pub enum ConflictResolutionStrategy {
         /// Optional modified title for the duplicate note (e.g. "My Note (Local Copy)").
         new_title: Option<String>,
     },
+    /// Explicitly resurrect a remotely deleted note at current revision (ZK-056).
+    RestoreResurrect,
 }
 
 /// The result of executing a conflict resolution strategy.
@@ -146,17 +148,25 @@ where
         push_conflict.mutation.expected_revision,
     )?;
 
-    let (merge_outcome, candidate_envelope) = match vault_key {
-        Some(key) => {
-            let (outcome, env) = generate_merge_candidate(
-                base_envelope.as_ref(),
-                &push_conflict.mutation.envelope,
-                &push_conflict.conflict.current_envelope,
-                key,
-            )?;
-            (Some(outcome), Some(env))
+    let local_is_deleted = push_conflict.mutation.mutation_type == MutationType::Delete;
+    let remote_is_deleted = push_conflict.conflict.is_deleted;
+
+    let (merge_outcome, candidate_envelope) = if local_is_deleted || remote_is_deleted {
+        // Deletions cannot be 3-way text merged
+        (None, None)
+    } else {
+        match vault_key {
+            Some(key) => {
+                let (outcome, env) = generate_merge_candidate(
+                    base_envelope.as_ref(),
+                    &push_conflict.mutation.envelope,
+                    &push_conflict.conflict.current_envelope,
+                    key,
+                )?;
+                (Some(outcome), Some(env))
+            }
+            None => (None, None),
         }
-        None => (None, None),
     };
 
     let conflict_record = ConflictRecord::new(
@@ -170,7 +180,8 @@ where
         push_conflict.conflict.current_envelope.clone(),
         candidate_envelope,
         now_utc_rfc3339(),
-    );
+    )
+    .with_deletion_flags(local_is_deleted, remote_is_deleted);
 
     storage.put_conflict(&conflict_record)?;
 
@@ -207,12 +218,20 @@ where
     let resolved_at = now_utc_rfc3339();
 
     match strategy {
-        ConflictResolutionStrategy::KeepLocal => {
+        ConflictResolutionStrategy::KeepLocal | ConflictResolutionStrategy::RestoreResurrect => {
             // Remove any stale mutation for this object
             let existing_mutations = storage.list_mutations_for_object(&conflict.object_id)?;
             for m in existing_mutations {
                 let _ = storage.remove_mutation(&m.mutation_id);
             }
+
+            // Determine if the local object is deleted or active
+            let is_del = conflict.local_is_deleted;
+            let mut_type = if is_del {
+                MutationType::Delete
+            } else {
+                MutationType::Upsert
+            };
 
             // Update local object to reflect the chosen local version at remote revision
             let local_obj = StoredEncryptedObject {
@@ -220,7 +239,7 @@ where
                 object_kind: conflict.object_kind,
                 revision: conflict.remote_revision,
                 server_seq: 0,
-                is_deleted: false,
+                is_deleted: is_del,
                 envelope: conflict.local_envelope.clone(),
                 updated_at: resolved_at.clone(),
             };
@@ -232,7 +251,7 @@ where
                 object_id: conflict.object_id.clone(),
                 expected_revision: conflict.remote_revision,
                 object_kind: conflict.object_kind,
-                mutation_type: MutationType::Upsert,
+                mutation_type: mut_type,
                 envelope: conflict.local_envelope.clone(),
                 created_at: resolved_at.clone(),
                 retry_count: 0,
@@ -260,13 +279,13 @@ where
                 let _ = storage.remove_mutation(&m.mutation_id);
             }
 
-            // Update local object to remote revision
+            // Update local object to remote revision and remote tombstone state
             let remote_obj = StoredEncryptedObject {
                 object_id: conflict.object_id.clone(),
                 object_kind: conflict.object_kind,
                 revision: conflict.remote_revision,
                 server_seq: 0,
-                is_deleted: false,
+                is_deleted: conflict.remote_is_deleted,
                 envelope: conflict.remote_envelope.clone(),
                 updated_at: resolved_at.clone(),
             };
@@ -286,6 +305,12 @@ where
             })
         }
         ConflictResolutionStrategy::Merge(merged_note) => {
+            if conflict.remote_is_deleted || conflict.local_is_deleted {
+                return Err(QueueError::InvalidState(
+                    "cannot merge a delete-vs-edit conflict; use KeepLocal/RestoreResurrect to restore, KeepRemote to accept deletion, or DuplicateAsSeparate to restore as a new note".to_string(),
+                ));
+            }
+
             // Encrypt merged note for conflict object ID
             let merged_envelope = merged_note
                 .encrypt(vault_key, &conflict.object_id)
@@ -340,7 +365,7 @@ where
             new_object_id,
             new_title,
         } => {
-            // 1. Accept remote as winner for existing note
+            // 1. Accept remote as winner for existing note (including remote tombstone state)
             let existing_mutations = storage.list_mutations_for_object(&conflict.object_id)?;
             for m in existing_mutations {
                 let _ = storage.remove_mutation(&m.mutation_id);
@@ -351,7 +376,7 @@ where
                 object_kind: conflict.object_kind,
                 revision: conflict.remote_revision,
                 server_seq: 0,
-                is_deleted: false,
+                is_deleted: conflict.remote_is_deleted,
                 envelope: conflict.remote_envelope.clone(),
                 updated_at: resolved_at.clone(),
             };
@@ -421,6 +446,8 @@ where
 ///    local version is archived in [`BaseVersionStore`], and the stale local mutation is dequeued.
 /// 4. An audit record is stored in [`ConflictStore`] marked as resolved.
 /// 5. Never silently drops or overwrites data without preserving the losing revision.
+/// 6. In accordance with SEC-008 and MASTER_SPEC.md § 11: does NOT automatically resurrect
+///    deleted notes. Any delete-vs-edit conflict fails closed and requires explicit user resolution.
 pub fn evaluate_guarded_lww<S>(
     storage: &S,
     _queue: &PendingMutationQueue<S>,
@@ -431,6 +458,14 @@ pub fn evaluate_guarded_lww<S>(
 where
     S: ObjectStore + MutationStore + BaseVersionStore + ConflictStore,
 {
+    // SEC-008: Deletions are revisioned tombstones. Stale clients must not be able to
+    // resurrect deleted objects without an explicit conflict-resolution path.
+    // Guarded LWW cannot automatically overwrite a remote tombstone with an offline edit.
+    if conflict.is_deleted || mutation.mutation_type == MutationType::Delete {
+        return Err(QueueError::InvalidState(
+            "delete-vs-edit conflict cannot be resolved automatically by Guarded LWW; explicit user resolution required (SEC-008)".to_string(),
+        ));
+    }
     let resolved_at = now_utc_rfc3339();
     let conflict_id = Uuid::new_v4().to_string();
 
