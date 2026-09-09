@@ -1008,7 +1008,7 @@ Completion notes:
 ---
 
 ## ZK-037 — Tombstone persistence server-side
-Status: TODO  
+Status: DONE  
 Priority: P0  
 Dependencies: ZK-034
 
@@ -1017,6 +1017,25 @@ Acceptance criteria:
 - delete mutation is revisioned;
 - stale edit against tombstone conflicts;
 - deleted object remains sync-visible.
+
+Completion notes:
+- Verified and enforced delete mutation revisioning in `apps/server/src/db/store.rs`:
+  - `POST /v1/sync/push` mutations with `is_deleted = true` require exact matching `expected_revision`;
+  - Accepted deletion increments object revision by exactly 1 (`current_revision + 1`), allocates the next monotonic account `server_seq`, archives previous active state into `object_history`, and updates `encrypted_objects` with `is_deleted: true` and the tombstone envelope;
+  - Delete mutations are fully idempotent under re-submission.
+- Verified and enforced conflict safety on tombstones (SEC-008):
+  - Stale edits based on prior revisions are rejected with HTTP 409 Conflict (`REVISION_CONFLICT`) containing current tombstone revision and envelope;
+  - Resurrection via duplicate create (`expected_revision = 0`) is rejected with HTTP 409 Conflict, preventing stale clients from silently resurrecting deleted objects;
+  - Explicit resurrection (un-delete with `expected_revision == tombstone_revision` and `is_deleted = false`) succeeds, incrementing revision and preserving the tombstone in `object_history`.
+- Verified sync visibility:
+  - Tombstones remain persisted in `encrypted_objects` with `is_deleted: true` and their allocated `server_seq`;
+  - `GET /v1/sync/changes` returns tombstones to syncing peer clients so peers observe and apply deletions.
+- Added integration test suite `apps/server/tests/server_tombstone_tests.rs`:
+  - Verified delete mutation revisioning, sequence allocation, and prior state archiving;
+  - Verified stale edits and duplicate creates conflict against tombstones;
+  - Verified tombstones are returned in `GET /v1/sync/changes` for full and incremental pulls;
+  - Verified explicit resurrection lifecycle and multi-revision history audit trail.
+- All quality gates passed via `./scripts/ci.sh` (formatting, clippy `-D warnings`, dependency check, and all 176 workspace tests).
 
 ---
 
