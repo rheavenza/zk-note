@@ -1,7 +1,8 @@
 //! Command execution implementations for `zk-note init`, `unlock`, `lock`, `status`,
-//! `new`, `show`, and `list`.
+//! `new`, `edit`, `show`, and `list`.
 
 use crate::config::{db_file, resolve_data_dir, session_file, vault_file};
+use crate::edit::{note_to_edit_buffer, parse_edit_buffer, run_editor, TempFileGuard};
 use crate::error::CliError;
 use crate::session::{clear_session, has_active_session, load_session_key, save_session_key};
 use serde::Serialize;
@@ -15,7 +16,7 @@ use zk_protocol::constants::{
     INITIAL_EXPECTED_REVISION, INITIAL_OBJECT_REVISION, INITIAL_SERVER_SEQ, OBJECT_KIND_NOTE,
 };
 use zk_protocol::vault::VaultBootstrap;
-use zk_storage::traits::{MutationStore, ObjectStore};
+use zk_storage::traits::{BaseVersionStore, MutationStore, ObjectStore};
 use zk_storage::{
     MutationStatus, MutationType, ObjectFilter, PendingMutation, SqliteStorage,
     StoredEncryptedObject,
@@ -307,6 +308,38 @@ pub fn cmd_new(
     Ok(note_id)
 }
 
+/// Helper to resolve a stored note object by exact ID or unique >=4 character prefix.
+fn find_note_object(
+    storage: &SqliteStorage,
+    note_id: &str,
+) -> Result<StoredEncryptedObject, CliError> {
+    let stored_opt = storage.get_object(note_id)?;
+    match stored_opt {
+        Some(obj) if !obj.is_deleted && obj.object_kind == OBJECT_KIND_NOTE => Ok(obj),
+        _ => {
+            if note_id.len() >= 4 {
+                let all = storage.list_objects(&ObjectFilter::for_kind(OBJECT_KIND_NOTE))?;
+                let mut matches: Vec<_> = all
+                    .into_iter()
+                    .filter(|o| o.object_id.starts_with(note_id) && !o.is_deleted)
+                    .collect();
+                if matches.len() == 1 {
+                    Ok(matches.remove(0))
+                } else if matches.len() > 1 {
+                    Err(CliError::Io(format!(
+                        "ambiguous note id prefix '{note_id}' matches {} notes",
+                        matches.len()
+                    )))
+                } else {
+                    Err(CliError::NoteNotFound(note_id.to_string()))
+                }
+            } else {
+                Err(CliError::NoteNotFound(note_id.to_string()))
+            }
+        }
+    }
+}
+
 /// Displays the decrypted contents of a note by its ID.
 pub fn cmd_show(
     custom_data_dir: Option<&Path>,
@@ -326,32 +359,7 @@ pub fn cmd_show(
     let vault_key = load_session_key(&sess_path)?;
 
     let storage = SqliteStorage::open(&db_path)?;
-    let stored_opt = storage.get_object(note_id)?;
-
-    let stored = match stored_opt {
-        Some(obj) if !obj.is_deleted && obj.object_kind == OBJECT_KIND_NOTE => obj,
-        _ => {
-            if note_id.len() >= 4 {
-                let all = storage.list_objects(&ObjectFilter::for_kind(OBJECT_KIND_NOTE))?;
-                let mut matches: Vec<_> = all
-                    .into_iter()
-                    .filter(|o| o.object_id.starts_with(note_id) && !o.is_deleted)
-                    .collect();
-                if matches.len() == 1 {
-                    matches.remove(0)
-                } else if matches.len() > 1 {
-                    return Err(CliError::Io(format!(
-                        "ambiguous note id prefix '{note_id}' matches {} notes",
-                        matches.len()
-                    )));
-                } else {
-                    return Err(CliError::NoteNotFound(note_id.to_string()));
-                }
-            } else {
-                return Err(CliError::NoteNotFound(note_id.to_string()));
-            }
-        }
-    };
+    let stored = find_note_object(&storage, note_id)?;
 
     let note = PlaintextNote::decrypt(&stored.envelope, &vault_key)?;
 
@@ -378,6 +386,145 @@ pub fn cmd_show(
     }
 
     Ok(note)
+}
+
+/// Edits an existing note using $EDITOR or programmatic overrides.
+pub fn cmd_edit(
+    custom_data_dir: Option<&Path>,
+    note_id: &str,
+    editor_override: Option<&str>,
+    title_override: Option<String>,
+    body_override: Option<String>,
+    tag_override: Option<Vec<String>>,
+) -> Result<PlaintextNote, CliError> {
+    let data_dir = resolve_data_dir(custom_data_dir);
+    let vault_path = vault_file(&data_dir);
+    let db_path = db_file(&data_dir);
+    let sess_path = session_file(&data_dir);
+
+    if !vault_path.exists() {
+        return Err(CliError::VaultUninitialized);
+    }
+
+    // Must be unlocked
+    let vault_key = load_session_key(&sess_path)?;
+
+    let storage = SqliteStorage::open(&db_path)?;
+    let stored = find_note_object(&storage, note_id)?;
+
+    // Decrypt current note
+    let current_note = PlaintextNote::decrypt(&stored.envelope, &vault_key)?;
+
+    let (new_title, new_tags, new_body) =
+        if title_override.is_some() || body_override.is_some() || tag_override.is_some() {
+            // Programmatic edit mode (useful for scripts and fast test execution)
+            let title = title_override.unwrap_or_else(|| current_note.title.clone());
+            let tags = tag_override.unwrap_or_else(|| current_note.tags.clone());
+            let body = body_override.unwrap_or_else(|| current_note.body.clone());
+            (title, tags, body)
+        } else {
+            // Interactive $EDITOR flow
+            let editor_cmd = if let Some(e) = editor_override {
+                e.to_string()
+            } else if let Ok(e) = std::env::var("VISUAL") {
+                e
+            } else if let Ok(e) = std::env::var("EDITOR") {
+                e
+            } else {
+                "nano".to_string()
+            };
+
+            let initial_text =
+                note_to_edit_buffer(&current_note.title, &current_note.tags, &current_note.body);
+            let guard = TempFileGuard::create("zk-note-edit", initial_text.as_bytes())?;
+
+            if guard.is_ram_backed() {
+                println!("Editing note in RAM-backed temporary buffer (/dev/shm)...");
+            } else {
+                println!("Editing note in temporary buffer...");
+            }
+
+            // Run editor - if it fails (non-zero exit), guard drops, wipes temp file, and returns Err
+            run_editor(&editor_cmd, guard.path())?;
+
+            // Read edited content
+            let edited_bytes = guard.read_bytes()?;
+            if edited_bytes == initial_text.as_bytes() {
+                println!("No changes made to note.");
+                guard.cleanup();
+                return Ok(current_note);
+            }
+
+            let edited_str = String::from_utf8(edited_bytes)
+                .map_err(|e| CliError::Io(format!("invalid UTF-8 in edited note: {e}")))?;
+
+            let parsed = parse_edit_buffer(&edited_str, &current_note.title, &current_note.tags)?;
+
+            // Explicit cleanup after successful read
+            guard.cleanup();
+
+            (parsed.title, parsed.tags, parsed.body)
+        };
+
+    // Check if actually modified compared to current_note
+    if new_title == current_note.title
+        && new_tags == current_note.tags
+        && new_body == current_note.body
+    {
+        println!("No changes made to note.");
+        return Ok(current_note);
+    }
+
+    let now = now_utc_rfc3339();
+    let updated_note = NoteBuilder::new()
+        .title(new_title)
+        .body(new_body)
+        .tags(new_tags)
+        .created_at(current_note.created_at.clone())
+        .updated_at(now.clone())
+        .build()?;
+
+    // Encrypt updated note
+    let new_envelope = updated_note.encrypt(&vault_key, &stored.object_id)?;
+
+    // Archive base version for three-way merge
+    storage.put_base_version(&stored.object_id, stored.revision, &stored.envelope)?;
+
+    // Save updated object
+    let new_revision = stored.revision + 1;
+    let updated_stored_obj = StoredEncryptedObject {
+        object_id: stored.object_id.clone(),
+        object_kind: OBJECT_KIND_NOTE,
+        revision: new_revision,
+        server_seq: stored.server_seq,
+        is_deleted: false,
+        envelope: new_envelope.clone(),
+        updated_at: now.clone(),
+    };
+    storage.put_object(&updated_stored_obj)?;
+
+    // Enqueue pending mutation
+    let mutation = PendingMutation {
+        mutation_id: uuid::Uuid::new_v4().to_string(),
+        object_id: stored.object_id.clone(),
+        expected_revision: stored.revision,
+        object_kind: OBJECT_KIND_NOTE,
+        mutation_type: MutationType::Upsert,
+        envelope: new_envelope,
+        created_at: now,
+        retry_count: 0,
+        status: MutationStatus::Pending,
+    };
+    storage.enqueue_mutation(&mutation)?;
+
+    println!("Updated note: {}", stored.object_id);
+    println!("Title:    {}", updated_note.title);
+    println!("Revision: {new_revision}");
+    if !updated_note.tags.is_empty() {
+        println!("Tags:     {}", updated_note.tags.join(", "));
+    }
+
+    Ok(updated_note)
 }
 
 /// Note summary row for decrypted list display and JSON output.

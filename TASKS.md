@@ -624,7 +624,7 @@ Completion notes:
 ---
 
 ## ZK-025 — `$EDITOR` edit flow
-Status: TODO  
+Status: DONE  
 Priority: P1  
 Dependencies: ZK-024
 
@@ -638,6 +638,16 @@ Acceptance criteria:
 Security note:
 
 Prefer secure temporary-file behavior. If plaintext temp files cannot be eliminated, document the native-client threat boundary and cleanup behavior.
+
+Completion notes:
+- Documented native client temporary edit threat boundaries, RAM-backed tmpfs vs physical disk lifecycles, and residual risks in `docs/threat-model/cli-editor-security.md`.
+- Authored `docs/adr/0004-cli-editor-workflow.md` documenting frontmatter format, permission enforcement, base version retention, and error handling.
+- Implemented `TempFileGuard` in `apps/cli/src/edit.rs` prioritizing RAM-backed tmpfs (`/dev/shm`, `$XDG_RUNTIME_DIR`), enforcing `0600` file permissions on Unix, and guaranteeing in-memory and on-disk zeroization with `sync_all()` prior to file unlinking via an RAII drop guard.
+- Implemented Markdown frontmatter serialization and parsing (`note_to_edit_buffer`, `parse_edit_buffer`) in `apps/cli/src/edit.rs` allowing simultaneous editing of title, tags, and body with fallback handling.
+- Implemented `zk-note edit <note-id>` with `$EDITOR`/`$VISUAL` integration, shell execution, and programmatic overrides (`--title`, `--body`, `--tag`, `--editor`) in `apps/cli/src/commands.rs` and `apps/cli/src/main.rs`.
+- Ensured atomic re-encryption: validates note schema, archives prior revision envelope into `BaseVersionStore` (`encrypted_base_versions`) for three-way conflict merge, increments object revision, saves re-encrypted envelope, and enqueues upsert into `pending_mutations`.
+- Guaranteed editor failure atomicity: non-zero editor exit status or validation errors drop the temp guard (zeroing and deleting the file) without writing to SQLite, keeping prior revisions intact and uncorrupted.
+- Added comprehensive unit tests in `apps/cli/src/edit.rs` and `apps/cli/src/main.rs`. Validated via `./scripts/ci.sh`.
 
 ---
 

@@ -2,11 +2,12 @@
 
 mod commands;
 mod config;
+mod edit;
 mod error;
 mod session;
 
 use clap::{Parser, Subcommand};
-use commands::{cmd_init, cmd_list, cmd_lock, cmd_new, cmd_show, cmd_status, cmd_unlock};
+use commands::{cmd_edit, cmd_init, cmd_list, cmd_lock, cmd_new, cmd_show, cmd_status, cmd_unlock};
 use error::CliError;
 use std::path::PathBuf;
 
@@ -69,6 +70,27 @@ pub enum Commands {
         #[arg(short = 'g', long = "tag", value_delimiter = ',')]
         tag: Vec<String>,
     },
+    /// Edit an existing note in $EDITOR
+    Edit {
+        /// Note identifier (or unique prefix)
+        note_id: String,
+
+        /// Custom editor command to override $EDITOR or $VISUAL
+        #[arg(long)]
+        editor: Option<String>,
+
+        /// Override note title (skips interactive editor if specified)
+        #[arg(short = 't', long)]
+        title: Option<String>,
+
+        /// Override note body (skips interactive editor if specified)
+        #[arg(short = 'b', long)]
+        body: Option<String>,
+
+        /// Override note tags (comma-separated, skips interactive editor if specified)
+        #[arg(short = 'g', long = "tag", value_delimiter = ',')]
+        tag: Option<Vec<String>>,
+    },
     /// Show a decrypted note
     Show {
         /// Note identifier (or unique prefix)
@@ -109,6 +131,16 @@ fn run() -> Result<(), CliError> {
             cmd_new(data_dir, title, body, tag)?;
             Ok(())
         }
+        Commands::Edit {
+            note_id,
+            editor,
+            title,
+            body,
+            tag,
+        } => {
+            cmd_edit(data_dir, &note_id, editor.as_deref(), title, body, tag)?;
+            Ok(())
+        }
         Commands::Show { note_id, json } => {
             cmd_show(data_dir, &note_id, json)?;
             Ok(())
@@ -132,6 +164,7 @@ fn main() {
 mod tests {
     use super::*;
     use std::fs;
+    use zk_storage::traits::{BaseVersionStore, ObjectStore};
 
     fn temp_test_dir(name: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
@@ -471,6 +504,175 @@ mod tests {
         assert!(!mut_envelope_json.contains(unique_title));
         assert!(!mut_envelope_json.contains(unique_body));
         assert!(!mut_envelope_json.contains(unique_tag));
+
+        let _ = fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn test_cli_edit_flow_with_custom_editor() {
+        let test_dir = temp_test_dir("edit_editor");
+        let dir_path = test_dir.as_path();
+        let pass = "edit-test-pass".to_string();
+
+        cmd_init(Some(dir_path), Some(pass), true).expect("init");
+
+        let note_id = cmd_new(
+            Some(dir_path),
+            Some("Draft Plan".to_string()),
+            Some("Initial draft.".to_string()),
+            vec!["planning".to_string()],
+        )
+        .expect("create note");
+
+        // Mock editor that updates frontmatter and body
+        let editor_script = r#"sh -c 'printf -- "---\ntitle: Updated Plan\ntags: [planning, v2]\n---\n\nNew edited content.\n" > "$1"' --"#;
+
+        let updated = cmd_edit(
+            Some(dir_path),
+            &note_id,
+            Some(editor_script),
+            None,
+            None,
+            None,
+        )
+        .expect("edit note with custom editor");
+
+        assert_eq!(updated.title, "Updated Plan");
+        assert_eq!(updated.tags, vec!["planning", "v2"]);
+        assert_eq!(updated.body, "New edited content.");
+
+        // Verify SQLite storage has revision 2 and base revision 1 is archived
+        let db_path = config::db_file(dir_path);
+        let storage = zk_storage::SqliteStorage::open(&db_path).expect("open storage");
+        let stored_obj = storage
+            .get_object(&note_id)
+            .expect("get object")
+            .expect("object exists");
+        assert_eq!(stored_obj.revision, 2);
+
+        // Check base version retention in BaseVersionStore
+        let base_env = storage
+            .get_base_version(&note_id, 1)
+            .expect("get base version")
+            .expect("base version 1 exists");
+        assert_eq!(base_env.envelope_version, 1);
+
+        // Verify decrypted base version matches initial state
+        let sess_path = config::session_file(dir_path);
+        let vault_key = session::load_session_key(&sess_path).expect("session key");
+        let base_note =
+            zk_core::note::PlaintextNote::decrypt(&base_env, &vault_key).expect("decrypt base");
+        assert_eq!(base_note.title, "Draft Plan");
+        assert_eq!(base_note.body, "Initial draft.");
+        assert_eq!(base_note.tags, vec!["planning"]);
+
+        // Verify show displays the updated note
+        let shown = cmd_show(Some(dir_path), &note_id, false).expect("show updated");
+        assert_eq!(shown.title, "Updated Plan");
+        assert_eq!(shown.body, "New edited content.");
+
+        let _ = fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn test_cli_edit_failure_does_not_corrupt_prior_note() {
+        let test_dir = temp_test_dir("edit_failure");
+        let dir_path = test_dir.as_path();
+        let pass = "edit-fail-pass".to_string();
+
+        cmd_init(Some(dir_path), Some(pass), true).expect("init");
+
+        let note_id = cmd_new(
+            Some(dir_path),
+            Some("Untouched Title".to_string()),
+            Some("Untouched body.".to_string()),
+            vec!["safe".to_string()],
+        )
+        .expect("create note");
+
+        // Mock editor that fails with exit status 13
+        let failing_editor = r#"sh -c 'exit 13' --"#;
+
+        let err = cmd_edit(
+            Some(dir_path),
+            &note_id,
+            Some(failing_editor),
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+
+        match err {
+            CliError::Io(msg) => assert!(msg.contains("exited with non-zero status")),
+            other => panic!("expected Io error for non-zero status, got {other:?}"),
+        }
+
+        // Verify note in database is completely untouched (revision still 1, content intact)
+        let shown = cmd_show(Some(dir_path), &note_id, false).expect("show after fail");
+        assert_eq!(shown.title, "Untouched Title");
+        assert_eq!(shown.body, "Untouched body.");
+        assert_eq!(shown.tags, vec!["safe"]);
+
+        let db_path = config::db_file(dir_path);
+        let storage = zk_storage::SqliteStorage::open(&db_path).expect("open storage");
+        let stored_obj = storage
+            .get_object(&note_id)
+            .expect("get object")
+            .expect("object exists");
+        assert_eq!(stored_obj.revision, 1);
+
+        let _ = fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn test_cli_edit_programmatic_and_locked_guards() {
+        let test_dir = temp_test_dir("edit_programmatic");
+        let dir_path = test_dir.as_path();
+        let pass = "edit-prog-pass".to_string();
+
+        cmd_init(Some(dir_path), Some(pass), true).expect("init");
+
+        let note_id = cmd_new(
+            Some(dir_path),
+            Some("Initial".to_string()),
+            Some("Body".to_string()),
+            vec![],
+        )
+        .expect("create");
+
+        // Programmatic edit
+        let updated = cmd_edit(
+            Some(dir_path),
+            &note_id,
+            None,
+            Some("New Title".to_string()),
+            Some("New Body".to_string()),
+            Some(vec!["tag-a".to_string()]),
+        )
+        .expect("edit programmatic");
+
+        assert_eq!(updated.title, "New Title");
+        assert_eq!(updated.body, "New Body");
+        assert_eq!(updated.tags, vec!["tag-a"]);
+
+        // Lock vault -> edit fails closed
+        cmd_lock(Some(dir_path)).expect("lock");
+
+        let locked_err = cmd_edit(
+            Some(dir_path),
+            &note_id,
+            None,
+            Some("Should Fail".to_string()),
+            None,
+            None,
+        )
+        .unwrap_err();
+
+        match locked_err {
+            CliError::VaultLocked => (),
+            other => panic!("expected VaultLocked, got {other:?}"),
+        }
 
         let _ = fs::remove_dir_all(&test_dir);
     }
