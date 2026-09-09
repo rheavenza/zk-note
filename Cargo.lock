@@ -1712,6 +1712,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "uuid",
  "zk-core",
  "zk-crypto",
  "zk-protocol",

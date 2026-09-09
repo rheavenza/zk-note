@@ -1105,7 +1105,7 @@ Completion notes:
 ---
 
 ## ZK-041 — Pending mutation queue
-Status: TODO  
+Status: DONE  
 Priority: P0  
 Dependencies: ZK-021, ZK-040
 
@@ -1115,6 +1115,15 @@ Acceptance criteria:
 - mutations survive process restart;
 - base revision recorded;
 - mutation removed only after durable accepted result.
+
+Completion notes:
+- Implemented `PendingMutationQueue` in `crates/zk-sync/src/queue.rs` wrapping local storage implementing `MutationStore`, `ObjectStore`, and `BaseVersionStore`.
+- Implemented automatic UUID v4 mutation ID generation and base revision recording on local creates, edits, and deletes (`enqueue_local_note_upsert`, `enqueue_local_note_delete`, `enqueue_upsert`, `enqueue_delete`).
+- Stored base versions in `BaseVersionStore` at edit time for downstream three-way conflict merge.
+- Enforced durable write sequencing in `acknowledge_accepted`: the mutation is deleted from `pending_mutations` ONLY AFTER `put_object` durably persists the accepted object state. If the durable storage write fails, the mutation remains safely queued.
+- Added `reset_in_flight` to recover interrupted in-flight mutations upon process restart, preserving the original mutation ID for SEC-007 idempotent retry.
+- Added comprehensive unit tests and integration tests in `crates/zk-sync/tests/pending_mutation_queue_tests.rs` verifying process restart persistence with disk-backed `SqliteStorage`, fault injection failure recovery, FIFO ordering, and tombstone recording.
+- Validated via `./scripts/ci.sh` (cargo fmt, clippy with `-D warnings`, cargo test --workspace).
 
 ---
 

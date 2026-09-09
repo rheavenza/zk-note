@@ -3,11 +3,13 @@
 
 pub mod adapter;
 pub mod error;
+pub mod queue;
 
 pub use adapter::{
     validate_no_plaintext_secrets, MockSyncAdapter, NativeHttpSyncAdapter, SyncServerAdapter,
 };
 pub use error::SyncNetworkError;
+pub use queue::{PendingMutationQueue, QueueError};
 pub use zk_core as core;
 pub use zk_crypto as crypto;
 pub use zk_protocol as protocol;
