@@ -1180,7 +1180,7 @@ Completion notes:
 ---
 
 ## ZK-044 — Push pending changes
-Status: TODO  
+Status: DONE  
 Priority: P0  
 Dependencies: ZK-041, ZK-043
 
@@ -1190,6 +1190,15 @@ Acceptance criteria:
 - accepted writes clear queue;
 - lost-response retry uses same mutation ID;
 - conflict leaves local mutation recoverable.
+
+Completion notes:
+- Implemented `push_pending_changes`, `PushOptions`, `PushReport`, and `PushError` in `crates/zk-sync/src/push.rs`.
+- Enforced CAS revision checks: `expected_revision` is transmitted with each mutation and checked by server/adapter.
+- Implemented queue cleanup and durable object store updates upon server acceptance.
+- Implemented idempotent retry: identical `mutation_id` is retransmitted during retries and replayed cleanly without duplicating revisions.
+- Conflicting mutations (revision mismatch) are preserved in the pending queue with base revision and envelopes intact for three-way merge resolution.
+- Added comprehensive unit tests in `push.rs` and integration tests in `crates/zk-sync/tests/push_pending_changes_tests.rs`.
+- Verified via `./scripts/ci.sh`.
 
 ---
 

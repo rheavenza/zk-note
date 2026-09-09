@@ -329,6 +329,7 @@ pub struct MockSyncAdapter {
     objects: Arc<RwLock<HashMap<String, zk_protocol::sync::ObjectChange>>>,
     sequence_counter: Arc<RwLock<u64>>,
     fail_next: Arc<RwLock<Option<SyncNetworkError>>>,
+    processed_mutations: Arc<RwLock<HashMap<String, (PushRequest, PushResponse)>>>,
 }
 
 impl MockSyncAdapter {
@@ -379,6 +380,26 @@ impl SyncServerAdapter for MockSyncAdapter {
 
     async fn push_mutation(&self, request: &PushRequest) -> Result<PushResponse, SyncNetworkError> {
         self.check_failure()?;
+
+        let mut processed = self
+            .processed_mutations
+            .write()
+            .map_err(|e| SyncNetworkError::Serialization(e.to_string()))?;
+
+        // SEC-007: Idempotent replay check
+        if let Some((prev_req, prev_resp)) = processed.get(&request.mutation_id) {
+            if prev_req.object_id == request.object_id
+                && prev_req.expected_revision == request.expected_revision
+                && prev_req.is_deleted == request.is_deleted
+                && prev_req.envelope == request.envelope
+            {
+                return Ok(prev_resp.clone());
+            } else {
+                return Err(SyncNetworkError::ReplayMismatch(
+                    "mutation_id reused with different payload".to_string(),
+                ));
+            }
+        }
 
         let mut objects = self
             .objects
@@ -434,11 +455,18 @@ impl SyncServerAdapter for MockSyncAdapter {
 
         objects.insert(request.object_id.clone(), change);
 
-        Ok(PushResponse {
+        let response = PushResponse {
             object_id: request.object_id.clone(),
             revision: new_rev,
             server_seq: new_seq,
-        })
+        };
+
+        processed.insert(
+            request.mutation_id.clone(),
+            (request.clone(), response.clone()),
+        );
+
+        Ok(response)
     }
 
     async fn pull_changes(
