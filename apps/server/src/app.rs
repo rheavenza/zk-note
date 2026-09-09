@@ -4,7 +4,7 @@ use crate::config::ServerConfig;
 use crate::db::ServerDb;
 use crate::logging::redacted_trace_middleware;
 use crate::routes::health::health_handler;
-use crate::routes::sync::push_mutation_handler;
+use crate::routes::sync::{pull_changes_handler, push_mutation_handler};
 use crate::routes::vault::{create_vault_bootstrap_handler, get_vault_bootstrap_handler};
 use axum::http::header::HeaderName;
 use axum::http::{HeaderValue, StatusCode};
@@ -83,6 +83,8 @@ pub fn create_app(state: AppState) -> Router {
             get(get_vault_bootstrap_handler).post(create_vault_bootstrap_handler),
         )
         .route("/v1/sync/push", post(push_mutation_handler))
+        .route("/v1/sync/changes", get(pull_changes_handler))
+        .route("/v1/sync/pull", get(pull_changes_handler))
         .fallback(fallback_not_found)
         .layer(axum::middleware::from_fn(redacted_trace_middleware))
         .layer(axum::middleware::from_fn(request_id_middleware))

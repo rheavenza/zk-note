@@ -10,7 +10,7 @@ use crate::auth::AuthenticatedAccount;
 use crate::db::PushOutcome;
 use crate::routes::vault::contains_forbidden_keys;
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{RawQuery, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
@@ -18,7 +18,7 @@ use base64ct::{Base64, Encoding};
 use uuid::Uuid;
 use zk_protocol::constants::{
     ENVELOPE_VERSION_V1, ERROR_CRYPTO_UNSUPPORTED_VERSION, ERROR_INVALID_ENVELOPE,
-    ERROR_OBJECT_NOT_FOUND, ERROR_SERVER_FAILURE,
+    ERROR_OBJECT_NOT_FOUND, ERROR_SERVER_FAILURE, ERROR_SYNC_CURSOR_INVALID,
 };
 use zk_protocol::sync::PushRequest;
 
@@ -172,6 +172,87 @@ pub async fn push_mutation_handler(
             Json(ErrorResponse {
                 code: ERROR_SERVER_FAILURE.to_string(),
                 message: format!("Failed to process push mutation: {e}"),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+/// Handler for `GET /v1/sync/changes` and `GET /v1/sync/pull`.
+///
+/// Query parameters:
+/// - `after`: u64 sequence cursor (defaults to 0); returns records where `server_seq > after`.
+/// - `limit`: maximum number of records to return (defaults to 50, clamped to 1..=500).
+pub async fn pull_changes_handler(
+    State(state): State<AppState>,
+    auth: AuthenticatedAccount,
+    RawQuery(raw_query): RawQuery,
+) -> impl IntoResponse {
+    let mut after = 0u64;
+    let mut limit = 50usize;
+
+    if let Some(query_str) = raw_query {
+        for pair in query_str.split('&') {
+            if pair.is_empty() {
+                continue;
+            }
+            let mut parts = pair.splitn(2, '=');
+            let key = parts.next().unwrap_or("");
+            let val = parts.next().unwrap_or("");
+            match key {
+                "after" => match val.parse::<u64>() {
+                    Ok(v) => after = v,
+                    Err(e) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(ErrorResponse {
+                                code: ERROR_SYNC_CURSOR_INVALID.to_string(),
+                                message: format!("Invalid 'after' cursor parameter: {e}"),
+                            }),
+                        )
+                            .into_response();
+                    }
+                },
+                "limit" => match val.parse::<u32>() {
+                    Ok(v) => {
+                        limit = if v == 0 {
+                            50
+                        } else if v > 500 {
+                            500
+                        } else {
+                            v as usize
+                        };
+                    }
+                    Err(e) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(ErrorResponse {
+                                code: ERROR_SYNC_CURSOR_INVALID.to_string(),
+                                message: format!("Invalid 'limit' parameter: {e}"),
+                            }),
+                        )
+                            .into_response();
+                    }
+                },
+                _ => {}
+            }
+        }
+    }
+
+    tracing::info!(
+        account_id = %auth.account_id,
+        after = after,
+        limit = limit,
+        "processing pull changes request"
+    );
+
+    match state.db.pull_changes(auth.account_id, after, limit).await {
+        Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                code: ERROR_SERVER_FAILURE.to_string(),
+                message: format!("Failed to pull changes: {e}"),
             }),
         )
             .into_response(),

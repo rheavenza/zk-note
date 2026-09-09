@@ -969,7 +969,7 @@ Completion notes:
 ---
 
 ## ZK-036 — Pull changes endpoint
-Status: TODO  
+Status: DONE  
 Priority: P0  
 Dependencies: ZK-033, ZK-034
 
@@ -980,6 +980,30 @@ Acceptance criteria:
 - cursor semantics documented;
 - tombstones included;
 - no missed rows under concurrent writes.
+
+Completion notes:
+- Added `PullChangesQuery` model in `crates/zk-protocol/src/sync.rs` and re-exported it in `zk-protocol`.
+- Implemented `ServerDb::pull_changes(&self, account_id: Uuid, after: u64, limit: usize) -> Result<PullChangesResponse, DbError>` in `apps/server/src/db/store.rs`:
+  - Queries `encrypted_objects` with `account_id = ?1 AND server_seq > ?2 ORDER BY server_seq ASC LIMIT ?3` accelerated by `encrypted_objects_account_seq_idx`;
+  - Fetches `limit + 1` rows to accurately evaluate `has_more` and calculates `next_cursor`;
+  - Deserializes encrypted envelopes into `ObjectChange` maintaining zero-knowledge invariants (SEC-001/SEC-002);
+  - Includes deletion tombstones (`is_deleted: true`).
+- Implemented `pull_changes_handler` in `apps/server/src/routes/sync.rs` mounted on both `GET /v1/sync/changes` and `GET /v1/sync/pull` in `apps/server/src/app.rs`:
+  - Enforces `AuthenticatedAccount` bearer token authentication with cross-account access isolation;
+  - Parses and validates `after` (default 0) and `limit` (default 50, clamped to 1..=500);
+  - Returns HTTP 400 Bad Request with `SYNC_CURSOR_INVALID` on malformed query parameters;
+  - Emits redacted diagnostic logs without secrets (SEC-003).
+- Documented cursor and pagination semantics in `docs/protocol/v1.md` §3.3.4 (monotonic cursor definition, pagination advancement, empty page behavior, tombstone visibility, and client durability invariant before cursor update).
+- Added unit tests in `apps/server/src/db/store.rs` and 9 integration tests in `apps/server/tests/server_pull_changes_tests.rs`:
+  - Verified empty account behavior (`changes: []`, `next_cursor == 0`, `has_more == false`);
+  - Verified changes are returned in strictly ascending `server_seq` order;
+  - Verified multi-page pagination flow with `has_more` and `next_cursor` advancing contiguously;
+  - Verified tombstone (`is_deleted: true`) presence and ordering;
+  - Verified `/v1/sync/changes` and `/v1/sync/pull` endpoint aliases;
+  - Verified cross-account isolation and unauthenticated access rejection;
+  - Verified query parameter validation and error handling (`SYNC_CURSOR_INVALID`);
+  - Concurrency test: 30 concurrent writes and 5 concurrent readers reading concurrently observed all 30 objects across contiguous sequences `1..=30` with zero missed rows.
+- All quality gates passed via `./scripts/ci.sh` (formatting, clippy `-D warnings`, dependency check, and all 172 workspace tests).
 
 ---
 

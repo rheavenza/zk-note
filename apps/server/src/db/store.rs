@@ -10,7 +10,9 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 use zk_protocol::envelope::{EncryptedEnvelope, EncryptedKeyContainer, EncryptedPayloadContainer};
-use zk_protocol::sync::{ConflictResponse, PushRequest, PushResponse};
+use zk_protocol::sync::{
+    ConflictResponse, ObjectChange, PullChangesResponse, PushRequest, PushResponse,
+};
 use zk_protocol::vault::{KdfParams, VaultBootstrap, WrappedVaultKey};
 
 use blake2::{Blake2s256, Digest};
@@ -689,6 +691,80 @@ impl ServerDb {
 
         Ok(rows)
     }
+
+    /// Pulls current object changes for the given account strictly after the specified cursor.
+    ///
+    /// Fetches up to `limit + 1` rows to determine `has_more` and calculates `next_cursor`.
+    /// Returned changes are ordered strictly ascending by `server_seq`.
+    /// Includes tombstones (`is_deleted = true`).
+    pub async fn pull_changes(
+        &self,
+        account_id: Uuid,
+        after: u64,
+        limit: usize,
+    ) -> Result<PullChangesResponse, DbError> {
+        self.ensure_account(account_id).await?;
+        let conn = self.conn.lock().await;
+        let acc_str = account_id.to_string();
+
+        let mut stmt = conn.prepare(
+            "SELECT object_id, object_kind, revision, server_seq, envelope_version, wrapped_key, payload, is_deleted
+             FROM encrypted_objects
+             WHERE account_id = ?1 AND server_seq > ?2
+             ORDER BY server_seq ASC
+             LIMIT ?3",
+        )?;
+
+        let fetch_limit = (limit.saturating_add(1)) as i64;
+        let mut rows = stmt.query(rusqlite::params![acc_str, after as i64, fetch_limit])?;
+
+        let mut items = Vec::with_capacity(limit);
+        let mut has_more = false;
+
+        while let Some(row) = rows.next()? {
+            if items.len() >= limit {
+                has_more = true;
+                break;
+            }
+
+            let obj_id_str: String = row.get(0)?;
+            let object_kind: i16 = row.get(1)?;
+            let revision: i64 = row.get(2)?;
+            let server_seq: i64 = row.get(3)?;
+            let envelope_version: i32 = row.get(4)?;
+            let wrapped_key_bytes: Vec<u8> = row.get(5)?;
+            let payload_bytes: Vec<u8> = row.get(6)?;
+            let is_deleted: bool = row.get(7)?;
+
+            let wrapped_key: EncryptedKeyContainer = serde_json::from_slice(&wrapped_key_bytes)?;
+            let payload: EncryptedPayloadContainer = serde_json::from_slice(&payload_bytes)?;
+
+            let envelope = EncryptedEnvelope {
+                envelope_version: envelope_version as u32,
+                object_id: obj_id_str.clone(),
+                object_kind: object_kind as u16,
+                wrapped_key,
+                payload,
+            };
+
+            items.push(ObjectChange {
+                server_seq: server_seq as u64,
+                object_id: obj_id_str,
+                revision: revision as u64,
+                object_kind: object_kind as u16,
+                is_deleted,
+                envelope,
+            });
+        }
+
+        let next_cursor = items.last().map(|c| c.server_seq).unwrap_or(after);
+
+        Ok(PullChangesResponse {
+            changes: items,
+            next_cursor,
+            has_more,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1206,5 +1282,106 @@ mod tests {
             }
             other => panic!("expected ReplayMismatch, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn test_pull_changes_empty_account() {
+        let db = ServerDb::new_in_memory().unwrap();
+        let acc_id = Uuid::new_v4();
+
+        let resp = db.pull_changes(acc_id, 0, 50).await.unwrap();
+        assert!(resp.changes.is_empty());
+        assert_eq!(resp.next_cursor, 0);
+        assert!(!resp.has_more);
+    }
+
+    #[tokio::test]
+    async fn test_pull_changes_ordering_and_pagination() {
+        let db = ServerDb::new_in_memory().unwrap();
+        let acc_id = Uuid::new_v4();
+
+        let obj1 = Uuid::new_v4().to_string();
+        let obj2 = Uuid::new_v4().to_string();
+        let obj3 = Uuid::new_v4().to_string();
+
+        db.push_mutation(acc_id, &sample_push_req(&obj1, 0, "n1"))
+            .await
+            .unwrap();
+        db.push_mutation(acc_id, &sample_push_req(&obj2, 0, "n2"))
+            .await
+            .unwrap();
+        db.push_mutation(acc_id, &sample_push_req(&obj3, 0, "n3"))
+            .await
+            .unwrap();
+
+        // Page 1: limit 2
+        let page1 = db.pull_changes(acc_id, 0, 2).await.unwrap();
+        assert_eq!(page1.changes.len(), 2);
+        assert_eq!(page1.changes[0].server_seq, 1);
+        assert_eq!(page1.changes[0].object_id, obj1);
+        assert_eq!(page1.changes[1].server_seq, 2);
+        assert_eq!(page1.changes[1].object_id, obj2);
+        assert_eq!(page1.next_cursor, 2);
+        assert!(page1.has_more);
+
+        // Page 2: after cursor 2, limit 2
+        let page2 = db.pull_changes(acc_id, page1.next_cursor, 2).await.unwrap();
+        assert_eq!(page2.changes.len(), 1);
+        assert_eq!(page2.changes[0].server_seq, 3);
+        assert_eq!(page2.changes[0].object_id, obj3);
+        assert_eq!(page2.next_cursor, 3);
+        assert!(!page2.has_more);
+
+        // Page 3: after cursor 3
+        let page3 = db.pull_changes(acc_id, page2.next_cursor, 2).await.unwrap();
+        assert!(page3.changes.is_empty());
+        assert_eq!(page3.next_cursor, 3);
+        assert!(!page3.has_more);
+    }
+
+    #[tokio::test]
+    async fn test_pull_changes_includes_tombstones() {
+        let db = ServerDb::new_in_memory().unwrap();
+        let acc_id = Uuid::new_v4();
+        let obj_id = Uuid::new_v4().to_string();
+
+        // 1. Create note
+        db.push_mutation(acc_id, &sample_push_req(&obj_id, 0, "initial note"))
+            .await
+            .unwrap();
+
+        // 2. Delete note (is_deleted = true, expected_revision = 1)
+        let mut del_req = sample_push_req(&obj_id, 1, "tombstone");
+        del_req.is_deleted = true;
+        db.push_mutation(acc_id, &del_req).await.unwrap();
+
+        // 3. Pull changes
+        let pull = db.pull_changes(acc_id, 0, 50).await.unwrap();
+        assert_eq!(pull.changes.len(), 1);
+        assert_eq!(pull.changes[0].object_id, obj_id);
+        assert_eq!(pull.changes[0].revision, 2);
+        assert_eq!(pull.changes[0].server_seq, 2);
+        assert!(
+            pull.changes[0].is_deleted,
+            "tombstone must be marked deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pull_changes_cross_account_isolation() {
+        let db = ServerDb::new_in_memory().unwrap();
+        let acc_a = Uuid::new_v4();
+        let acc_b = Uuid::new_v4();
+
+        let obj_a = Uuid::new_v4().to_string();
+        db.push_mutation(acc_a, &sample_push_req(&obj_a, 0, "note for A"))
+            .await
+            .unwrap();
+
+        let pull_b = db.pull_changes(acc_b, 0, 50).await.unwrap();
+        assert!(
+            pull_b.changes.is_empty(),
+            "account B must not see account A's changes"
+        );
     }
 }

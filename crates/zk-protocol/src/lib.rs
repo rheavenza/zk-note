@@ -12,7 +12,10 @@ pub use constants::*;
 pub use envelope::{EncryptedEnvelope, EncryptedKeyContainer, EncryptedPayloadContainer};
 pub use kind::{ObjectKind, UnknownObjectKind};
 pub use note::PlaintextNote;
-pub use sync::{ConflictResponse, ObjectChange, PullChangesResponse, PushRequest, PushResponse};
+pub use sync::{
+    ConflictResponse, ObjectChange, PullChangesQuery, PullChangesResponse, PushRequest,
+    PushResponse,
+};
 pub use vault::{KdfParams, VaultBootstrap, WrappedVaultKey};
 
 /// Returns the crate name as a sanity check.
@@ -217,6 +220,16 @@ mod tests {
         let parsed_pull: PullChangesResponse =
             serde_json::from_str(&pull_json).expect("deserialize pull changes response");
         assert_eq!(pull_resp, parsed_pull);
+
+        // Pull Changes Query
+        let query = PullChangesQuery {
+            after: Some(108),
+            limit: Some(50),
+        };
+        let query_json = serde_json::to_string(&query).expect("serialize pull query");
+        let parsed_query: PullChangesQuery =
+            serde_json::from_str(&query_json).expect("deserialize pull query");
+        assert_eq!(query, parsed_query);
     }
 
     #[test]

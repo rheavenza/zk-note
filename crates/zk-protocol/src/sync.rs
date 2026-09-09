@@ -76,3 +76,14 @@ pub struct PullChangesResponse {
     /// Indicates if more changes remain after next_cursor.
     pub has_more: bool,
 }
+
+/// Query parameters for pulling changes (GET /v1/sync/changes).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PullChangesQuery {
+    /// Cursor sequence number; changes with server_seq > after are returned.
+    #[serde(default)]
+    pub after: Option<u64>,
+    /// Maximum number of changes to return in one page.
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
