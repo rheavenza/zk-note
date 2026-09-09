@@ -545,7 +545,7 @@ Completion notes:
 ---
 
 ## ZK-022 — SQLite encrypted cache
-Status: TODO  
+Status: DONE  
 Priority: P0  
 Dependencies: ZK-021
 
@@ -556,6 +556,17 @@ Acceptance criteria:
 - no plaintext title/body/tag columns;
 - reopen preserves encrypted objects;
 - tests inspect DB schema/content for plaintext leakage.
+
+Completion notes:
+- Created initial SQLite migration in `migrations/001_initial_local_storage.sql` establishing tables for `local_objects`, `pending_mutations`, `encrypted_base_versions`, and `sync_state` with index coverage and idempotent migration tracking via `_schema_migrations`.
+- Implemented `SqliteStorage` in `crates/zk-storage/src/sqlite.rs` backing all storage traits (`ObjectStore`, `MutationStore`, `BaseVersionStore`, `SyncStateStore`, and `LocalStorage`).
+- Confirmed zero-knowledge local persistence (SEC-009): tables store strictly opaque encrypted envelopes without plaintext columns for title, body, or tags.
+- Added tests verifying:
+  - Database schema inspection (`PRAGMA table_info`) verifying complete absence of plaintext column names across all tables.
+  - Raw binary disk inspection confirming no plaintext canary strings leak into SQLite database files.
+  - Full CRUD operations and kind filtering.
+  - Persistence across database close and reopen from disk.
+- Validated via `./scripts/ci.sh`.
 
 ---
 

@@ -9,7 +9,12 @@ description = "Storage abstraction traits for encrypted notes, mutations, and sy
 [lints]
 workspace = true
 
+[features]
+default = ["sqlite"]
+sqlite = ["dep:rusqlite"]
+
 [dependencies]
+rusqlite = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 zk-protocol = { workspace = true }

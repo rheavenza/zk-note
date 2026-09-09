@@ -3,12 +3,17 @@ pub mod memory;
 pub mod models;
 pub mod traits;
 
+#[cfg(feature = "sqlite")]
+pub mod sqlite;
+
 pub use error::StorageError;
 pub use memory::MemoryStorage;
 pub use models::{
     BaseVersion, MutationStatus, MutationType, ObjectFilter, PendingMutation,
     StoredEncryptedObject, SyncState,
 };
+#[cfg(feature = "sqlite")]
+pub use sqlite::SqliteStorage;
 pub use traits::{BaseVersionStore, LocalStorage, MutationStore, ObjectStore, SyncStateStore};
 
 pub use zk_protocol as protocol;
