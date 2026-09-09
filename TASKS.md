@@ -1152,7 +1152,7 @@ Completion notes:
 ---
 
 ## ZK-043 — Pull remote changes
-Status: TODO  
+Status: DONE  
 Priority: P0  
 Dependencies: ZK-040, ZK-042
 
@@ -1166,6 +1166,16 @@ Acceptance criteria:
 Recommended V1 locked behavior:
 
 Store remote ciphertext durably and defer plaintext reconciliation until unlock.
+
+Completion notes:
+- Implemented `pull_remote_changes`, `pull_with_session`, and `decrypt_stored_objects_on_unlock` in `crates/zk-sync/src/pull.rs`.
+- Implemented paginated pull requests looping through `SyncServerAdapter::pull_changes` until `has_more == false`.
+- Enforced storing encrypted changes first into `ObjectStore` and updating the durable cursor via `DurableSyncCursor` before any decryption is attempted.
+- Defined locked sync behavior (`LockedSyncBehavior::StoreCiphertextDeferDecryption`): pulls persist remote ciphertext and advance cursor while locked, deferring plaintext decryption and search index updates until user unlock (`decrypt_stored_objects_on_unlock`).
+- Unlocked clients decrypt remote notes into memory, handle deletion tombstones, and update the session's in-memory search index.
+- Enforced SEC-010 fail-closed semantics: corrupted or tampered envelopes fail closed without partial returns.
+- Added comprehensive unit tests and integration tests in `crates/zk-sync/tests/pull_remote_changes_tests.rs` covering multi-page pulls, locked sync deferral, tombstone handling, and fail-closed crypto verification.
+- Validated via `./scripts/ci.sh` (cargo fmt, clippy with `-D warnings`, cargo test --workspace).
 
 ---
 

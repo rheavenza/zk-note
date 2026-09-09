@@ -4,6 +4,7 @@
 pub mod adapter;
 pub mod cursor;
 pub mod error;
+pub mod pull;
 pub mod queue;
 
 pub use adapter::{
@@ -11,6 +12,10 @@ pub use adapter::{
 };
 pub use cursor::{CursorError, DurableSyncCursor};
 pub use error::SyncNetworkError;
+pub use pull::{
+    decrypt_stored_objects_on_unlock, pull_remote_changes, pull_with_session, DecryptedPullItem,
+    LockedSyncBehavior, PullError, PullOptions, PullReport,
+};
 pub use queue::{PendingMutationQueue, QueueError};
 pub use zk_core as core;
 pub use zk_crypto as crypto;
