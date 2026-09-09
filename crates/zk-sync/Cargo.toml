@@ -6,6 +6,9 @@ license.workspace = true
 authors.workspace = true
 description = "Synchronization engine, mutation queues, conflict detection, and merge algorithms"
 
+[lints]
+workspace = true
+
 [dependencies]
 zk-core = { workspace = true }
 zk-crypto = { workspace = true }

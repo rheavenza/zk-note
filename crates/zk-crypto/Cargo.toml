@@ -6,5 +6,8 @@ license.workspace = true
 authors.workspace = true
 description = "Cryptographic primitives, KDF, key wrapping, and envelope encryption"
 
+[lints]
+workspace = true
+
 [dependencies]
 zk-protocol = { workspace = true }

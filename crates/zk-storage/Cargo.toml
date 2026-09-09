@@ -6,5 +6,8 @@ license.workspace = true
 authors.workspace = true
 description = "Storage abstraction traits for encrypted notes, mutations, and sync state"
 
+[lints]
+workspace = true
+
 [dependencies]
 zk-protocol = { workspace = true }

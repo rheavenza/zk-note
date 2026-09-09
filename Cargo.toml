@@ -30,6 +30,16 @@ authors = ["Zero-Knowledge Notes Team"]
 # apps/cli (depends on zk-core, zk-crypto, zk-protocol, zk-storage, zk-sync)
 # apps/server (depends on zk-protocol only - server has no crypto/plaintext keys)
 
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+
 [workspace.dependencies]
 zk-protocol = { path = "crates/zk-protocol" }
 zk-crypto = { path = "crates/zk-crypto" }

@@ -10,5 +10,8 @@ description = "Zero-knowledge ciphertext store and sync coordination server"
 name = "zk-server"
 path = "src/main.rs"
 
+[lints]
+workspace = true
+
 [dependencies]
 zk-protocol = { workspace = true }

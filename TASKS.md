@@ -106,7 +106,7 @@ Completion notes:
 ---
 
 ## ZK-003 — Define repository lint/error conventions
-Status: TODO  
+Status: DONE  
 Priority: P1  
 Dependencies: ZK-001
 
@@ -116,6 +116,13 @@ Acceptance criteria:
 - no production `unwrap()` on external input;
 - clippy policy configured;
 - conventions documented in README/ADR.
+
+Completion notes:
+- Configured workspace-level compiler and clippy lints in root `Cargo.toml` (`unsafe_code = "forbid"`, `clippy::unwrap_used = "warn"`, `clippy::expect_used = "warn"`, `clippy::panic = "warn"`, `missing_debug_implementations = "warn"`).
+- Enabled `[lints] workspace = true` across all 7 workspace crates and application binaries.
+- Established ADR-0001 (`docs/adr/0001-lint-and-error-conventions.md`) defining the typed error hierarchy, alignment with `MASTER_SPEC.md` §20 error taxonomy, fail-closed principles (SEC-010), and prohibition of production panics and stringly typed errors.
+- Updated `README.md` summarizing lint and error conventions with link to ADR-0001.
+- Validated via `./scripts/ci.sh`.
 
 ---
 

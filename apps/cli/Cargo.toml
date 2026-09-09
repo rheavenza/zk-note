@@ -10,6 +10,9 @@ description = "Terminal/CLI client for zero-knowledge notes"
 name = "zk-note"
 path = "src/main.rs"
 
+[lints]
+workspace = true
+
 [dependencies]
 zk-core = { workspace = true }
 zk-crypto = { workspace = true }

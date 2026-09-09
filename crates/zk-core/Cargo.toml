@@ -6,6 +6,9 @@ license.workspace = true
 authors.workspace = true
 description = "Core note domain model, vault lifecycle, and encryption orchestration"
 
+[lints]
+workspace = true
+
 [dependencies]
 zk-crypto = { workspace = true }
 zk-protocol = { workspace = true }
