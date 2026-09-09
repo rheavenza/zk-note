@@ -185,7 +185,7 @@ Completion notes:
 ---
 
 ## ZK-006 — Define binary/serialization conventions
-Status: TODO  
+Status: DONE  
 Priority: P0  
 Dependencies: ZK-004, ZK-005
 
@@ -203,6 +203,13 @@ Acceptance criteria:
 - `docs/protocol/v1.md` exists;
 - example payloads included;
 - round-trip serialization unit tests.
+
+Completion notes:
+- Authored `docs/protocol/v1.md` defining RFC 4122 lowercase UUID encoding, RFC 4648 §4 Standard Base64 byte encoding with padding, RFC 3339 UTC timestamps (`YYYY-MM-DDTHH:MM:SS.sssZ`), protocol/envelope/crypto/schema version fields, and canonical plaintext note expectations (UTF-8, no BOM, Unix newlines, sorted unique lowercase tags).
+- Documented full example payloads for `EncryptedEnvelope`, `VaultBootstrap`, CAS push request, push response, revision conflict response, pull changes response, and plaintext note schema.
+- Added serde serialization models in `crates/zk-protocol` (`envelope.rs`, `vault.rs`, `sync.rs`, `note.rs`).
+- Implemented comprehensive unit tests verifying round-trip JSON serialization/deserialization across all protocol models and rejecting malformed inputs.
+- Validated via `./scripts/ci.sh` (M0 gate passed).
 
 ---
 

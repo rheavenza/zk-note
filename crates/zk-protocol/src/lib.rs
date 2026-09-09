@@ -2,10 +2,18 @@
 //! for the zero-knowledge notes system.
 
 pub mod constants;
+pub mod envelope;
 pub mod kind;
+pub mod note;
+pub mod sync;
+pub mod vault;
 
 pub use constants::*;
+pub use envelope::{EncryptedEnvelope, EncryptedKeyContainer, EncryptedPayloadContainer};
 pub use kind::{ObjectKind, UnknownObjectKind};
+pub use note::PlaintextNote;
+pub use sync::{ConflictResponse, ObjectChange, PullChangesResponse, PushRequest, PushResponse};
+pub use vault::{KdfParams, VaultBootstrap, WrappedVaultKey};
 
 /// Returns the crate name as a sanity check.
 #[must_use]
@@ -14,6 +22,7 @@ pub fn crate_name() -> &'static str {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -82,5 +91,158 @@ mod tests {
         assert_eq!(ERROR_NETWORK_UNAVAILABLE, "NETWORK_UNAVAILABLE");
         assert_eq!(ERROR_LOCAL_STORAGE_FAILURE, "LOCAL_STORAGE_FAILURE");
         assert_eq!(ERROR_SERVER_FAILURE, "SERVER_FAILURE");
+    }
+
+    #[test]
+    fn test_encrypted_envelope_serialization_round_trip() {
+        let envelope = EncryptedEnvelope {
+            envelope_version: ENVELOPE_VERSION_V1,
+            object_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+            object_kind: OBJECT_KIND_NOTE,
+            wrapped_key: EncryptedKeyContainer {
+                nonce: "dGhpcyBpcyBhIDI0LWJ5dGUgbm9uY2U=".to_string(),
+                ciphertext: "c29tZSBjaXBoZXJ0ZXh0IGJ5dGVzIHdpdGggYXV0aCB0YWc=".to_string(),
+            },
+            payload: EncryptedPayloadContainer {
+                nonce: "YW5vdGhlciAyNC1ieXRlIG5vbmNl".to_string(),
+                ciphertext: "ZW5jcnlwdGVkIHBheWxvYWQgYnl0ZXMgd2l0aCBhdXRoIHRhZw==".to_string(),
+            },
+        };
+
+        let json = serde_json::to_string_pretty(&envelope).expect("serialize envelope");
+        let parsed: EncryptedEnvelope = serde_json::from_str(&json).expect("deserialize envelope");
+
+        assert_eq!(envelope, parsed);
+        assert_eq!(parsed.kind().ok(), Some(ObjectKind::Note));
+    }
+
+    #[test]
+    fn test_vault_bootstrap_serialization_round_trip() {
+        let bootstrap = VaultBootstrap {
+            crypto_version: 1,
+            kdf: KdfParams {
+                algorithm: "argon2id".to_string(),
+                salt: "cmFuZG9tLXNhbHQtMTZieXRlcw==".to_string(),
+                memory_kib: 65536,
+                iterations: 3,
+                parallelism: 1,
+            },
+            wrapped_vault_key: WrappedVaultKey {
+                cipher_suite: "xchacha20poly1305".to_string(),
+                nonce: "dGhpcyBpcyBhIDI0LWJ5dGUgbm9uY2U=".to_string(),
+                ciphertext: "d3JhcHBlZCB2YXVsdCBrZXkgY2lwaGVydGV4dA==".to_string(),
+            },
+            recovery_wrapped_vault_key: WrappedVaultKey {
+                cipher_suite: "xchacha20poly1305".to_string(),
+                nonce: "cmVjb3ZlcnkgMjQtYnl0ZSBub25jZQ==".to_string(),
+                ciphertext: "cmVjb3Zlcnkgd3JhcHBlZCB2YXVsdCBrZXk=".to_string(),
+            },
+        };
+
+        let json = serde_json::to_string(&bootstrap).expect("serialize bootstrap");
+        let parsed: VaultBootstrap = serde_json::from_str(&json).expect("deserialize bootstrap");
+
+        assert_eq!(bootstrap, parsed);
+    }
+
+    #[test]
+    fn test_sync_models_serialization_round_trip() {
+        let envelope = EncryptedEnvelope {
+            envelope_version: ENVELOPE_VERSION_V1,
+            object_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+            object_kind: OBJECT_KIND_NOTE,
+            wrapped_key: EncryptedKeyContainer {
+                nonce: "bm9uY2UtMjQtYnl0ZXM=".to_string(),
+                ciphertext: "d3JhcHBlZC1rZXk=".to_string(),
+            },
+            payload: EncryptedPayloadContainer {
+                nonce: "cGF5bG9hZC1ub25jZQ==".to_string(),
+                ciphertext: "ZW5jcnlwdGVkLXBheWxvYWQ=".to_string(),
+            },
+        };
+
+        // Push Request
+        let push_req = PushRequest {
+            mutation_id: "c73bcdcc-2669-4bf6-81d3-e4ae73fb11fd".to_string(),
+            object_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+            expected_revision: 0,
+            object_kind: OBJECT_KIND_NOTE,
+            envelope: envelope.clone(),
+        };
+        let push_json = serde_json::to_string(&push_req).expect("serialize push request");
+        let parsed_push: PushRequest =
+            serde_json::from_str(&push_json).expect("deserialize push request");
+        assert_eq!(push_req, parsed_push);
+
+        // Push Response
+        let push_resp = PushResponse {
+            object_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+            revision: 1,
+            server_seq: 42,
+        };
+        let resp_json = serde_json::to_string(&push_resp).expect("serialize push response");
+        let parsed_resp: PushResponse =
+            serde_json::from_str(&resp_json).expect("deserialize push response");
+        assert_eq!(push_resp, parsed_resp);
+
+        // Conflict Response
+        let conflict = ConflictResponse {
+            error: ERROR_REVISION_CONFLICT.to_string(),
+            object_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+            expected_revision: 3,
+            current_revision: 5,
+            current_server_seq: 108,
+            current_envelope: envelope.clone(),
+        };
+        let conflict_json = serde_json::to_string(&conflict).expect("serialize conflict response");
+        let parsed_conflict: ConflictResponse =
+            serde_json::from_str(&conflict_json).expect("deserialize conflict response");
+        assert_eq!(conflict, parsed_conflict);
+
+        // Pull Changes Response
+        let pull_resp = PullChangesResponse {
+            changes: vec![ObjectChange {
+                server_seq: 109,
+                object_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+                revision: 5,
+                object_kind: OBJECT_KIND_NOTE,
+                is_deleted: false,
+                envelope,
+            }],
+            next_cursor: 109,
+            has_more: false,
+        };
+        let pull_json = serde_json::to_string(&pull_resp).expect("serialize pull changes response");
+        let parsed_pull: PullChangesResponse =
+            serde_json::from_str(&pull_json).expect("deserialize pull changes response");
+        assert_eq!(pull_resp, parsed_pull);
+    }
+
+    #[test]
+    fn test_plaintext_note_serialization_round_trip() {
+        let note = PlaintextNote {
+            schema_version: 1,
+            title: "Meeting Notes".to_string(),
+            body: "# Architecture Review\n\nAll security invariants hold.".to_string(),
+            tags: vec!["architecture".to_string(), "security".to_string()],
+            created_at: "2026-09-09T05:00:00.000Z".to_string(),
+            updated_at: "2026-09-09T05:30:00.000Z".to_string(),
+            attachments: vec![],
+        };
+
+        let json = serde_json::to_string_pretty(&note).expect("serialize note");
+        let parsed: PlaintextNote = serde_json::from_str(&json).expect("deserialize note");
+
+        assert_eq!(note, parsed);
+    }
+
+    #[test]
+    fn test_malformed_envelope_rejected() {
+        assert!(serde_json::from_str::<EncryptedEnvelope>("not valid json").is_err());
+        assert!(serde_json::from_str::<EncryptedEnvelope>("{}").is_err());
+        assert!(serde_json::from_str::<EncryptedEnvelope>(
+            r#"{"envelope_version": 1, "object_id": "test"}"#
+        )
+        .is_err());
     }
 }

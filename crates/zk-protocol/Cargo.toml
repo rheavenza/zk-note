@@ -10,3 +10,5 @@ description = "Zero-knowledge note-taking protocol types, constants, and wire fo
 workspace = true
 
 [dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
