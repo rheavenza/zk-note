@@ -23,5 +23,17 @@ export * from "./context/ConflictContext.js";
 export * from "./utils/markdown.js";
 export * from "./utils/diff3.js";
 export * from "./utils/uuid.js";
+export * from "./App.js";
 
+import React from "react";
+import { createRoot } from "react-dom/client";
+import { App } from "./App.js";
 
+// Mount root if running in a browser DOM environment with a #root container
+if (typeof document !== "undefined") {
+  const rootElement = document.getElementById("root");
+  if (rootElement) {
+    const root = createRoot(rootElement);
+    root.render(React.createElement(App));
+  }
+}
