@@ -1649,7 +1649,7 @@ Completion notes:
 ---
 
 ## ZK-062 — Web Worker boundary
-Status: TODO  
+Status: DONE  
 Priority: P0  
 Dependencies: ZK-060
 
@@ -1658,6 +1658,22 @@ Acceptance criteria:
 - crypto/decrypt/search/sync heavy operations run in worker where practical;
 - React does not own persistent key state;
 - message API documented.
+
+Completion notes:
+- Implemented Web Worker cryptographic boundary in `apps/web/src/worker/`:
+  - `protocol.ts`: Strongly typed RPC message protocol with discriminated unions (`WorkerRequest`, `WorkerResponse`, `WorkerBroadcastEvent`, `WorkerErrorCode`).
+  - `vault-handler.ts`: Encapsulates `zk-wasm` execution and holds the active `WasmVaultSession` exclusively within worker memory. Heavy operations (Argon2id KDF derivation, note envelope encryption, single and batch note decryption, in-memory search indexing, full-text search querying, passphrase rewrapping, and vault locking) are executed entirely off the main thread.
+  - `worker.ts`: Dual-runtime worker entrypoint supporting both browser Web Workers (`self.onmessage` / `self.postMessage`) and Node.js `worker_threads` for automated CI testing.
+  - `client.ts`: Typed `VaultWorkerClient` providing a Promise-based API with request correlation ID matching, timeout handling, and `onLock` broadcast subscription.
+- React and UI layer isolation:
+  - React components and main thread state never possess raw `VaultKey`, KEKs, or the `WasmVaultSession` handle (SEC-001, SEC-002, Criterion 2).
+  - React state only receives safe DTOs (`PlaintextNoteDto`, `SearchResultDto`, `VaultStatusDto`).
+  - Locking zeroizes WASM session memory, flushes search index terms, and broadcasts `VAULT_LOCKED` to clear UI note states.
+- Documented message API in `docs/protocol/worker-api.md`, specifying security invariants, message envelopes, error codes, and the complete 12-operation catalog.
+- Added comprehensive unit and end-to-end multi-threaded test suites in `apps/web/test/`:
+  - `worker-protocol.test.ts`: Serialization, error codes, and broadcast validation.
+  - `worker-client.test.ts`: Multi-threaded worker tests verifying initialization, note encryption/decryption/batch, search indexing/querying, rewrapping, fail-closed locking, recovery unlocks, correlation ID concurrency, and client key isolation.
+- Integrated Web target into `./scripts/ci.sh` (Step 8: `npm run typecheck && npm test`). All 8 CI quality gates pass cleanly.
 
 ---
 

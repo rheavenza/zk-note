@@ -24,4 +24,7 @@ wasm-pack build --target web crates/zk-wasm --out-dir pkg
 cargo build --bin native_compat_harness
 node --test tests/wasm_crypto_compat.test.mjs
 
+echo "==> 8. Running Web worker checks and test suite (npm run typecheck && npm test)..."
+(cd apps/web && npm run typecheck && npm test)
+
 echo "==> All CI quality gates passed successfully!"
