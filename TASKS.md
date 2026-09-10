@@ -1863,6 +1863,9 @@ Completion notes:
 
 ### M6 Gate
 
+Status: PASSED  
+Automated verification in `tests/wasm_crypto_compat.test.mjs::"M6 Gate: CLI create -> sync -> web pull/decrypt -> web edit offline -> sync -> CLI pull/decrypt"`.
+
 Same account can:
 
 ```text
@@ -1872,6 +1875,10 @@ CLI pull/decrypt
 ```
 
 Native/WASM compatibility suite must pass.
+- Full cross-runtime cycle verified: CLI creates note -> syncs -> Web pulls and decrypts via WASM -> Web edits offline and re-encrypts -> syncs -> CLI pulls and decrypts updated note.
+- Native/WASM compatibility suite: 28/28 tests passed (`./scripts/ci.sh` step 7).
+- Web application test suite: 64/64 tests passed (`./scripts/ci.sh` step 8).
+- All 8 repository CI quality gates pass cleanly.
 
 ---
 
