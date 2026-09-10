@@ -7,7 +7,7 @@
  * - Top navbar: App brand, offline indicator, vault status, and lock button.
  */
 
-import React from "react";
+import React, { useState } from "react";
 import { NotesList } from "./NotesList.js";
 import { MarkdownEditor } from "./MarkdownEditor.js";
 import { LockVaultButton, VaultStatusBadge } from "./UnlockScreen.js";
@@ -15,12 +15,15 @@ import { SearchBar } from "./SearchBar.js";
 import { SearchModal } from "./SearchModal.js";
 import { SyncStatusIndicator } from "./SyncStatusIndicator.js";
 import { ConflictResolverModal } from "./ConflictResolverModal.js";
+import { SecurityRecoveryModal } from "./SecurityRecoveryModal.js";
 
 export interface NotesWorkspaceProps {
   className?: string;
 }
 
 export const NotesWorkspace: React.FC<NotesWorkspaceProps> = ({ className }) => {
+  const [isSecurityModalOpen, setIsSecurityModalOpen] = useState(false);
+
   return (
     <div
       className={className || "zk-notes-workspace"}
@@ -42,6 +45,16 @@ export const NotesWorkspace: React.FC<NotesWorkspaceProps> = ({ className }) => 
 
         <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
           <VaultStatusBadge />
+          <button
+            type="button"
+            onClick={() => setIsSecurityModalOpen(true)}
+            title="Security & Recovery"
+            style={securityButtonStyle}
+            aria-label="Security and recovery settings"
+            className="zk-security-recovery-btn"
+          >
+            🛡️ Security
+          </button>
           <LockVaultButton />
         </div>
       </header>
@@ -62,6 +75,12 @@ export const NotesWorkspace: React.FC<NotesWorkspaceProps> = ({ className }) => 
 
       {/* Sync Conflict Resolver Modal */}
       <ConflictResolverModal />
+
+      {/* Security & Recovery Invariants Modal (ZK-073) */}
+      <SecurityRecoveryModal
+        isOpen={isSecurityModalOpen}
+        onClose={() => setIsSecurityModalOpen(false)}
+      />
     </div>
   );
 };
@@ -93,4 +112,18 @@ const mainSplitStyle: React.CSSProperties = {
   flex: 1,
   display: "flex",
   overflow: "hidden",
+};
+
+const securityButtonStyle: React.CSSProperties = {
+  padding: "6px 12px",
+  borderRadius: "6px",
+  border: "1px solid #d1d5db",
+  backgroundColor: "#ffffff",
+  color: "#374151",
+  cursor: "pointer",
+  fontSize: "13px",
+  fontWeight: 500,
+  display: "inline-flex",
+  alignItems: "center",
+  gap: "6px",
 };

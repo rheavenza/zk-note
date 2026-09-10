@@ -26,6 +26,7 @@ import {
   UnlockScreen,
   LockVaultButton,
   VaultStatusBadge,
+  SecurityRecoveryModal,
 } from "../src/index.js";
 import { IndexedDbStorage } from "../src/storage/indexeddb.js";
 import { VaultWorkerClient, WorkerError } from "../src/worker/client.js";
@@ -82,6 +83,12 @@ function createMockClient(options: {
       }
       unlocked = true;
       return { success: true };
+    },
+    rewrapPassphrase: async (_newPassphrase: string) => {
+      return {
+        newWrappedVaultKey: JSON.stringify({ v: 1, ct: "mock-rewrapped-key" }),
+        newKdfParamsJson: TEST_KDF_PARAMS,
+      };
     },
     lockVault: async () => {
       unlocked = false;
@@ -352,3 +359,101 @@ test("End-to-end integration: VaultProvider with real Worker thread", async () =
     await storage.close();
   }
 });
+
+test("Security & Recovery: Recovery warnings and passphrase rewrap lifecycle (ZK-073)", async () => {
+  const worker = new Worker(WORKER_PATH);
+  const client = new VaultWorkerClient(worker);
+  const storage = new IndexedDbStorage("test-db-recovery-ux");
+
+  try {
+    let ctxRef: VaultContextType | null = null;
+    const Consumer: React.FC = () => {
+      ctxRef = useVault();
+      return <div>Consumer</div>;
+    };
+
+    renderToString(
+      <VaultProvider client={client} storage={storage} initialBootstrap={null}>
+        <Consumer />
+      </VaultProvider>
+    );
+
+    const ctx = ctxRef! as VaultContextType;
+    const initRes = await ctx.initVault("initial-passphrase-abc", TEST_KDF_PARAMS);
+    const recoveryKey = initRes.recoveryPhrase;
+
+    // Encrypt note under current VaultKey
+    const encRes = await client.encryptNote(
+      "note-recovery-1",
+      "Confidential Note",
+      "Top secret content that must survive recovery and rewrapping.",
+      ["secret"]
+    );
+
+    // 1. Rewrap passphrase
+    await ctx.rewrapPassphrase("new-passphrase-xyz", TEST_KDF_PARAMS);
+
+    // 2. Lock vault
+    await ctx.lock();
+    assert.equal(ctx.vaultState, "LOCKED");
+
+    // 3. Old passphrase fails closed
+    await assert.rejects(
+      async () => {
+        await ctx.unlockWithPassphrase("initial-passphrase-abc");
+      },
+      (err: Error) => {
+        assert.equal(err.message, "Incorrect passphrase or invalid recovery key.");
+        return true;
+      }
+    );
+
+    // 4. New passphrase unlocks successfully
+    await ctx.unlockWithPassphrase("new-passphrase-xyz");
+    assert.equal(ctx.vaultState, "UNLOCKED");
+
+    // 5. Existing note remains decryptable (VaultKey unchanged)
+    const decRes = await client.decryptNote(encRes.envelopeJson);
+    assert.equal(decRes.title, "Confidential Note");
+    assert.equal(decRes.body, "Top secret content that must survive recovery and rewrapping.");
+    assert.deepEqual(decRes.tags, ["secret"]);
+
+    // 6. Lock and verify recovery key still unlocks and decrypts
+    await ctx.lock();
+    await ctx.unlockWithRecoveryKey(recoveryKey);
+    assert.equal(ctx.vaultState, "UNLOCKED");
+    const decRes2 = await client.decryptNote(encRes.envelopeJson);
+    assert.equal(decRes2.title, "Confidential Note");
+    assert.equal(decRes2.body, "Top secret content that must survive recovery and rewrapping.");
+  } finally {
+    client.dispose();
+    await worker.terminate();
+    await storage.close();
+  }
+});
+
+test("SecurityRecoveryModal renders security guarantees, invariants, and warnings (ZK-073)", () => {
+  const { client } = createMockClient({ isUnlocked: true });
+  const storage = new IndexedDbStorage("test-db-modal");
+
+  const html = renderToString(
+    <VaultProvider client={client} storage={storage} initialBootstrap={null}>
+      <SecurityRecoveryModal isOpen={true} onClose={() => {}} />
+    </VaultProvider>
+  );
+
+  // Verifies zero-knowledge warning
+  assert.ok(html.includes("Zero-Knowledge Architecture Warning"));
+  assert.ok(html.includes("exclusively encrypted ciphertext"));
+  assert.ok(html.includes("mathematically impossible"));
+
+  // Verifies recovery invariants
+  assert.ok(html.includes("Recovery Key Invariants"));
+  assert.ok(html.includes("Single Vault Key"));
+  assert.ok(html.includes("Passphrase Rotation"));
+
+  // Verifies tabs
+  assert.ok(html.includes("Security Guarantees"));
+  assert.ok(html.includes("Change Passphrase"));
+});
+

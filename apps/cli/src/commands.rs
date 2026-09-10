@@ -19,7 +19,7 @@ use zk_core::note::{NoteBuilder, NoteHistoryItem, PlaintextNote};
 use zk_core::search::{InMemorySearchIndex, SearchResult};
 use zk_core::time::now_utc_rfc3339;
 use zk_core::vault::VaultManager;
-use zk_crypto::kdf::KdfParams;
+use zk_crypto::kdf::{KdfParams, TEST_MEMORY_KIB};
 use zk_protocol::constants::{
     INITIAL_EXPECTED_REVISION, INITIAL_OBJECT_REVISION, INITIAL_SERVER_SEQ, OBJECT_KIND_NOTE,
 };
@@ -118,10 +118,12 @@ pub fn cmd_init(
 }
 
 /// Unlocks the vault using either the master passphrase or recovery key.
+/// Optionally sets a new master passphrase if provided (ZK-073).
 pub fn cmd_unlock(
     custom_data_dir: Option<&Path>,
     explicit_passphrase: Option<String>,
     explicit_recovery_key: Option<String>,
+    new_passphrase: Option<String>,
 ) -> Result<(), CliError> {
     let data_dir = resolve_data_dir(custom_data_dir);
     let vault_path = vault_file(&data_dir);
@@ -131,7 +133,7 @@ pub fn cmd_unlock(
         return Err(CliError::VaultUninitialized);
     }
 
-    if has_active_session(&sess_path) {
+    if has_active_session(&sess_path) && new_passphrase.is_none() {
         println!("Vault is already unlocked.");
         return Ok(());
     }
@@ -161,8 +163,172 @@ pub fn cmd_unlock(
         VaultManager::unlock_with_passphrase(&bootstrap, pass.as_bytes())?
     };
 
+    if let Some(new_pass) = new_passphrase {
+        if new_pass.len() < 8 {
+            return Err(CliError::Io(
+                "new passphrase must be at least 8 characters long".to_string(),
+            ));
+        }
+        let existing_kdf: KdfParams = bootstrap.kdf.clone().into();
+        let kdf_params = if existing_kdf.memory_kib == TEST_MEMORY_KIB {
+            KdfParams::new_test()
+        } else {
+            KdfParams::new_production()
+        };
+        let updated_bootstrap = VaultManager::set_new_passphrase(
+            &bootstrap,
+            &vault_key,
+            new_pass.as_bytes(),
+            &kdf_params,
+        )?;
+        let updated_json = serde_json::to_string_pretty(&updated_bootstrap)
+            .map_err(|e| CliError::Io(format!("serialize vault bootstrap: {e}")))?;
+        let tmp_path = data_dir.join(format!("vault.json.tmp.{}", std::process::id()));
+        std::fs::write(&tmp_path, updated_json)
+            .map_err(|e| CliError::Io(format!("failed to write temporary vault file: {e}")))?;
+        std::fs::rename(&tmp_path, &vault_path)
+            .map_err(|e| CliError::Io(format!("failed to atomically update vault.json: {e}")))?;
+        println!("New master passphrase set successfully! Existing note ciphertexts remain valid.");
+    }
+
     save_session_key(&sess_path, &vault_key)?;
     println!("Vault unlocked successfully.");
+
+    Ok(())
+}
+
+/// Recovers vault access using a 288-bit recovery key and allows resetting the master passphrase (ZK-073).
+pub fn cmd_recover(
+    custom_data_dir: Option<&Path>,
+    explicit_recovery_key: Option<String>,
+    explicit_new_passphrase: Option<String>,
+    export_receipt: Option<&Path>,
+    test_kdf: bool,
+) -> Result<(), CliError> {
+    let data_dir = resolve_data_dir(custom_data_dir);
+    let vault_path = vault_file(&data_dir);
+    let sess_path = session_file(&data_dir);
+
+    if !vault_path.exists() {
+        return Err(CliError::VaultUninitialized);
+    }
+
+    println!("\n================================================================");
+    println!("             ZERO-KNOWLEDGE VAULT RECOVERY (ZK-073)");
+    println!("================================================================");
+    println!("CRITICAL ZERO-KNOWLEDGE INVARIANT:");
+    println!("  - The server stores ONLY encrypted ciphertext envelopes.");
+    println!("  - The server CANNOT decrypt your data or reset lost keys.");
+    println!("  - If both passphrase and recovery key are lost, data recovery");
+    println!("    is mathematically impossible.");
+    println!("================================================================\n");
+
+    let vault_bytes = std::fs::read(&vault_path).map_err(|e| {
+        CliError::Io(format!(
+            "failed to read vault file {}: {e}",
+            vault_path.display()
+        ))
+    })?;
+
+    let bootstrap: VaultBootstrap = serde_json::from_slice(&vault_bytes)
+        .map_err(|e| CliError::Io(format!("corrupted vault.json: {e}")))?;
+
+    let interactive = explicit_recovery_key.is_none();
+    let rec_key = if let Some(k) = explicit_recovery_key {
+        k
+    } else if std::io::stdin().is_terminal() {
+        rpassword::prompt_password("Enter your 288-bit recovery key: ")
+            .map_err(|e| CliError::Io(format!("failed to read recovery key: {e}")))?
+    } else {
+        return Err(CliError::Io(
+            "recovery key must be provided via --recovery-key in non-interactive mode".to_string(),
+        ));
+    };
+
+    println!("Unwrapping vault master key with recovery key...");
+    let vault_key = VaultManager::unlock_with_recovery_key(&bootstrap, rec_key.trim())?;
+    println!("Vault master key restored successfully!");
+
+    let new_pass = if let Some(p) = explicit_new_passphrase {
+        if p.len() < 8 {
+            return Err(CliError::Io(
+                "new passphrase must be at least 8 characters long".to_string(),
+            ));
+        }
+        Some(p)
+    } else if interactive && std::io::stdin().is_terminal() {
+        let p1 = rpassword::prompt_password(
+            "Enter new vault passphrase (minimum 8 characters, or leave blank to skip): ",
+        )
+        .map_err(|e| CliError::Io(format!("failed to read passphrase: {e}")))?;
+        if p1.is_empty() {
+            None
+        } else {
+            if p1.len() < 8 {
+                return Err(CliError::Io(
+                    "new passphrase must be at least 8 characters long".to_string(),
+                ));
+            }
+            let p2 = rpassword::prompt_password("Confirm new vault passphrase: ")
+                .map_err(|e| CliError::Io(format!("failed to read confirmation: {e}")))?;
+            if p1 != p2 {
+                return Err(CliError::PassphraseMismatch);
+            }
+            Some(p1)
+        }
+    } else {
+        None
+    };
+
+    let mut passphrase_reset = false;
+    if let Some(ref pass) = new_pass {
+        let existing_kdf: KdfParams = bootstrap.kdf.clone().into();
+        let kdf_params = if test_kdf || existing_kdf.memory_kib == TEST_MEMORY_KIB {
+            KdfParams::new_test()
+        } else {
+            KdfParams::new_production()
+        };
+
+        println!("Re-wrapping vault key under new passphrase KEK...");
+        let updated_bootstrap =
+            VaultManager::set_new_passphrase(&bootstrap, &vault_key, pass.as_bytes(), &kdf_params)?;
+
+        let updated_json = serde_json::to_string_pretty(&updated_bootstrap)
+            .map_err(|e| CliError::Io(format!("serialize vault bootstrap: {e}")))?;
+
+        let tmp_path = data_dir.join(format!("vault.json.tmp.{}", std::process::id()));
+        std::fs::write(&tmp_path, updated_json)
+            .map_err(|e| CliError::Io(format!("failed to write temporary vault file: {e}")))?;
+        std::fs::rename(&tmp_path, &vault_path)
+            .map_err(|e| CliError::Io(format!("failed to atomically update vault.json: {e}")))?;
+
+        println!("Master passphrase updated successfully!");
+        println!("Existing note ciphertexts remain valid (VaultKey preserved).");
+        passphrase_reset = true;
+    }
+
+    save_session_key(&sess_path, &vault_key)?;
+    println!("Vault is now unlocked for this session.\n");
+
+    if let Some(export_path) = export_receipt {
+        let receipt = format!(
+            "ZERO-KNOWLEDGE VAULT RECOVERY RECEIPT\n\
+             =====================================\n\
+             Data directory: {}\n\
+             Status: Access restored successfully\n\
+             Passphrase reset: {}\n\
+             Note: Server stores only ciphertext. Server decryption capability: ZERO.\n",
+            data_dir.display(),
+            if passphrase_reset { "YES" } else { "NO" }
+        );
+        std::fs::write(export_path, receipt).map_err(|e| {
+            CliError::Io(format!(
+                "failed to write recovery receipt to {}: {e}",
+                export_path.display()
+            ))
+        })?;
+        println!("Recovery receipt written to: {}", export_path.display());
+    }
 
     Ok(())
 }

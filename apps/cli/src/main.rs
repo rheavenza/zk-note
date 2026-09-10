@@ -10,7 +10,8 @@ mod session;
 use clap::{Parser, Subcommand};
 use commands::{
     cmd_conflicts, cmd_delete, cmd_edit, cmd_history, cmd_init, cmd_list, cmd_lock, cmd_login,
-    cmd_logout, cmd_new, cmd_resolve, cmd_search, cmd_show, cmd_status, cmd_unlock, cmd_whoami,
+    cmd_logout, cmd_new, cmd_recover, cmd_resolve, cmd_search, cmd_show, cmd_status, cmd_unlock,
+    cmd_whoami,
 };
 use error::CliError;
 use std::path::PathBuf;
@@ -54,6 +55,28 @@ pub enum Commands {
         /// Unlock using formatted recovery key instead of passphrase
         #[arg(long)]
         recovery_key: Option<String>,
+
+        /// Set a new master passphrase when unlocking
+        #[arg(long)]
+        new_passphrase: Option<String>,
+    },
+    /// Recover vault access using 288-bit recovery key and reset passphrase (ZK-073)
+    Recover {
+        /// Formatted 288-bit recovery key
+        #[arg(short = 'k', long)]
+        recovery_key: Option<String>,
+
+        /// New master passphrase to set after recovering
+        #[arg(long)]
+        new_passphrase: Option<String>,
+
+        /// Export safe recovery receipt to a file
+        #[arg(long)]
+        export_receipt: Option<PathBuf>,
+
+        /// Use fast test KDF parameters (for testing only)
+        #[arg(long, hide = true)]
+        test_kdf: bool,
     },
     /// Lock the vault and clear active session
     Lock,
@@ -248,7 +271,20 @@ async fn run() -> Result<(), CliError> {
         Commands::Unlock {
             passphrase,
             recovery_key,
-        } => cmd_unlock(data_dir, passphrase, recovery_key),
+            new_passphrase,
+        } => cmd_unlock(data_dir, passphrase, recovery_key, new_passphrase),
+        Commands::Recover {
+            recovery_key,
+            new_passphrase,
+            export_receipt,
+            test_kdf,
+        } => cmd_recover(
+            data_dir,
+            recovery_key,
+            new_passphrase,
+            export_receipt.as_deref(),
+            test_kdf,
+        ),
         Commands::Lock => cmd_lock(data_dir),
         Commands::Status => cmd_status(data_dir),
         Commands::Login {
@@ -395,8 +431,13 @@ mod tests {
         )));
 
         // 5. Unlock with wrong password fails closed
-        let wrong_err =
-            cmd_unlock(Some(dir_path), Some("wrong-password".to_string()), None).unwrap_err();
+        let wrong_err = cmd_unlock(
+            Some(dir_path),
+            Some("wrong-password".to_string()),
+            None,
+            None,
+        )
+        .unwrap_err();
         match wrong_err {
             CliError::AuthenticationFailed => (),
             other => panic!("expected AuthenticationFailed, got {other:?}"),
@@ -406,7 +447,7 @@ mod tests {
         )));
 
         // 6. Unlock with correct password succeeds
-        cmd_unlock(Some(dir_path), Some(pass), None).expect("unlock vault");
+        cmd_unlock(Some(dir_path), Some(pass), None, None).expect("unlock vault");
         assert!(session::has_active_session(&config::session_file(dir_path)));
 
         // 7. Verify session key can be loaded and matches valid 32-byte key
@@ -450,6 +491,7 @@ mod tests {
             Some(dir_path),
             None,
             Some("1234-5678-90AB-CDEF-1234-5678-90AB-CDEF-1234".to_string()),
+            None,
         )
         .unwrap_err();
 
@@ -459,7 +501,8 @@ mod tests {
         }
 
         // Correct recovery key succeeds
-        cmd_unlock(Some(dir_path), None, Some(recovery_str)).expect("unlock with recovery key");
+        cmd_unlock(Some(dir_path), None, Some(recovery_str), None)
+            .expect("unlock with recovery key");
         assert!(session::has_active_session(&config::session_file(dir_path)));
 
         // Lock
@@ -609,7 +652,7 @@ mod tests {
         }
 
         // 10. Unlock again -> show and list succeed
-        cmd_unlock(Some(dir_path), Some(pass), None).expect("unlock");
+        cmd_unlock(Some(dir_path), Some(pass), None, None).expect("unlock");
 
         let unlocked_show = cmd_show(Some(dir_path), &note1_id, false).expect("show unlocked");
         assert_eq!(unlocked_show.title, "Architecture Plan");
@@ -998,7 +1041,7 @@ mod tests {
         assert!(matches!(locked_hist, CliError::VaultLocked));
 
         // 12. Unlock and test purge
-        cmd_unlock(Some(dir_path), Some(pass), None).expect("unlock");
+        cmd_unlock(Some(dir_path), Some(pass), None, None).expect("unlock");
         cmd_delete(Some(dir_path), &note_id, true).expect("purge");
         assert!(storage.get_object(&note_id).expect("get").is_none());
         assert!(storage
@@ -1383,7 +1426,7 @@ mod tests {
         assert!(matches!(locked_rev, CliError::VaultLocked));
 
         // Unlock and verify access restored
-        cmd_unlock(Some(dir_path), Some(pass), None).expect("unlock");
+        cmd_unlock(Some(dir_path), Some(pass), None, None).expect("unlock");
         let unlocked_rev =
             cmd_history(Some(dir_path), &note_id, Some(2), false).expect("unlocked r2");
         assert_eq!(unlocked_rev[0].revision, 2);
@@ -1448,7 +1491,7 @@ mod tests {
         cmd_status(Some(dir_path)).expect("5. reopen status");
 
         // 6. unlock
-        cmd_unlock(Some(dir_path), Some(pass), None).expect("6. unlock");
+        cmd_unlock(Some(dir_path), Some(pass), None, None).expect("6. unlock");
 
         // 7. search
         let search_results = cmd_search(Some(dir_path), canary_term, false).expect("7. search");
@@ -2377,6 +2420,136 @@ mod tests {
             CliError::SessionRevoked => {}
             other => panic!("expected SessionRevoked error, got: {other:?}"),
         }
+
+        let _ = fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn test_cli_recover_restores_vault_and_resets_passphrase() {
+        let test_dir = temp_test_dir("cli_recover_passphrase");
+        let dir_path = test_dir.as_path();
+        let initial_pass = "initial-passphrase-123".to_string();
+        let new_pass = "brand-new-passphrase-456".to_string();
+
+        // 1. Initialize vault and capture recovery key
+        let (bootstrap, recovery_str, _vault_key) = zk_core::vault::VaultManager::init_vault(
+            initial_pass.as_bytes(),
+            &zk_crypto::kdf::KdfParams::new_test(),
+        )
+        .expect("init vault");
+
+        let bootstrap_json = serde_json::to_string_pretty(&bootstrap).expect("serialize");
+        fs::write(config::vault_file(dir_path), bootstrap_json).expect("write vault");
+        let _ = zk_storage::SqliteStorage::open(config::db_file(dir_path)).expect("open db");
+
+        // Unlock to create a note
+        cmd_unlock(Some(dir_path), Some(initial_pass.clone()), None, None).expect("unlock");
+        let note_id = cmd_new(
+            Some(dir_path),
+            Some("Secret Project".to_string()),
+            Some("Highly sensitive architectural blueprints.".to_string()),
+            vec!["blueprints".to_string()],
+        )
+        .expect("create note");
+
+        // 2. Lock vault
+        cmd_lock(Some(dir_path)).expect("lock");
+        assert!(!session::has_active_session(&config::session_file(
+            dir_path
+        )));
+
+        // 3. Recover vault using recovery key and set new passphrase
+        cmd_recover(
+            Some(dir_path),
+            Some(recovery_str.clone()),
+            Some(new_pass.clone()),
+            None,
+            true,
+        )
+        .expect("recover and set new passphrase");
+
+        // Vault is unlocked immediately
+        assert!(session::has_active_session(&config::session_file(dir_path)));
+
+        // Verify note ciphertexts remain completely intact and decryptable
+        let note = cmd_show(Some(dir_path), &note_id, false).expect("show note after recovery");
+        assert_eq!(note.title, "Secret Project");
+        assert_eq!(note.body, "Highly sensitive architectural blueprints.");
+
+        // 4. Lock vault
+        cmd_lock(Some(dir_path)).expect("lock");
+
+        // 5. Old passphrase must FAIL closed
+        let old_err = cmd_unlock(Some(dir_path), Some(initial_pass), None, None).unwrap_err();
+        match old_err {
+            CliError::AuthenticationFailed => (),
+            other => panic!("expected AuthenticationFailed on old passphrase, got {other:?}"),
+        }
+
+        // 6. New passphrase unlocks successfully
+        cmd_unlock(Some(dir_path), Some(new_pass), None, None).expect("unlock with new passphrase");
+        let note_again = cmd_show(Some(dir_path), &note_id, false).expect("show note again");
+        assert_eq!(note_again.title, "Secret Project");
+
+        // 7. Recovery key STILL unlocks successfully
+        cmd_lock(Some(dir_path)).expect("lock");
+        cmd_unlock(Some(dir_path), None, Some(recovery_str), None)
+            .expect("unlock with recovery key after rotation");
+
+        let _ = fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn test_cli_recover_export_receipt_and_safe_diagnostics() {
+        let test_dir = temp_test_dir("cli_recover_receipt");
+        let dir_path = test_dir.as_path();
+        let pass = "test-receipt-passphrase".to_string();
+
+        let (bootstrap, recovery_str, _vault_key) = zk_core::vault::VaultManager::init_vault(
+            pass.as_bytes(),
+            &zk_crypto::kdf::KdfParams::new_test(),
+        )
+        .expect("init vault");
+
+        let bootstrap_json = serde_json::to_string_pretty(&bootstrap).expect("serialize");
+        fs::write(config::vault_file(dir_path), bootstrap_json).expect("write vault");
+        let _ = zk_storage::SqliteStorage::open(config::db_file(dir_path)).expect("open db");
+
+        // Invalid recovery key checksum fails closed
+        let bad_err = cmd_recover(
+            Some(dir_path),
+            Some("1111-2222-3333-4444-5555-6666-7777-8888-9999".to_string()),
+            None,
+            None,
+            true,
+        )
+        .unwrap_err();
+        match bad_err {
+            CliError::InvalidRecoveryKey(_) => (),
+            other => panic!("expected InvalidRecoveryKey, got {other:?}"),
+        }
+        assert!(!session::has_active_session(&config::session_file(
+            dir_path
+        )));
+
+        // Valid recovery with receipt export
+        let receipt_path = dir_path.join("receipt.txt");
+        cmd_recover(
+            Some(dir_path),
+            Some(recovery_str),
+            None,
+            Some(&receipt_path),
+            true,
+        )
+        .expect("recover with receipt");
+
+        assert!(receipt_path.exists());
+        let receipt_content = fs::read_to_string(&receipt_path).expect("read receipt");
+        assert!(receipt_content.contains("ZERO-KNOWLEDGE VAULT RECOVERY RECEIPT"));
+        assert!(receipt_content.contains("Server decryption capability: ZERO"));
+        // Never log or write secrets into receipt (SEC-003)
+        assert!(!receipt_content.contains(&pass));
+        assert!(!receipt_content.contains("vault_key"));
 
         let _ = fs::remove_dir_all(&test_dir);
     }

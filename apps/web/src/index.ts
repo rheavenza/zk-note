@@ -21,6 +21,7 @@ export * from "./components/SearchModal.js";
 export * from "./components/SyncStatusIndicator.js";
 export * from "./components/NotesWorkspace.js";
 export * from "./components/ConflictResolverModal.js";
+export * from "./components/SecurityRecoveryModal.js";
 export * from "./context/ConflictContext.js";
 export * from "./utils/markdown.js";
 export * from "./utils/diff3.js";

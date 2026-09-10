@@ -40,6 +40,7 @@ export interface VaultContextType {
   initVault: (passphrase: string, kdfParamsJson?: string) => Promise<{ recoveryPhrase: string }>;
   unlockWithPassphrase: (passphrase: string) => Promise<void>;
   unlockWithRecoveryKey: (recoveryPhrase: string) => Promise<void>;
+  rewrapPassphrase: (newPassphrase: string, kdfParamsJson?: string) => Promise<void>;
   lock: () => Promise<void>;
   client: VaultWorkerClient;
   storage: IndexedDbStorage;
@@ -260,6 +261,36 @@ export class VaultStore {
     }
   }
 
+  public async rewrapPassphrase(
+    newPassphrase: string,
+    kdfParamsJson?: string
+  ): Promise<void> {
+    if (!this.bootstrap) {
+      this.error = "Vault is not initialized.";
+      this.notify();
+      return;
+    }
+
+    this.error = null;
+    try {
+      const res = await this.client.rewrapPassphrase(newPassphrase, kdfParamsJson);
+      const newBootstrap: VaultBootstrapData = {
+        wrappedVaultKey: res.newWrappedVaultKey,
+        kdfParamsJson: res.newKdfParamsJson,
+        wrappedRecoveryKey: this.bootstrap.wrappedRecoveryKey,
+      };
+
+      persistBootstrap(newBootstrap);
+      this.bootstrap = newBootstrap;
+      this.notify();
+    } catch (err) {
+      const msg = this.sanitizeError(err);
+      this.error = msg;
+      this.notify();
+      throw new Error(msg);
+    }
+  }
+
   public async lock(): Promise<void> {
     try {
       await this.client.lockVault();
@@ -321,6 +352,7 @@ export const VaultProvider: React.FC<VaultProviderProps> = ({
       initVault: (p: string, k?: string) => store.initVault(p, k),
       unlockWithPassphrase: (p: string) => store.unlockWithPassphrase(p),
       unlockWithRecoveryKey: (r: string) => store.unlockWithRecoveryKey(r),
+      rewrapPassphrase: (p: string, k?: string) => store.rewrapPassphrase(p, k),
       lock: () => store.lock(),
       client: store.client,
       storage: store.storage,

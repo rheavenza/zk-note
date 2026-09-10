@@ -77,6 +77,25 @@ impl VaultManager {
         let vault_key = unwrap_vault_key_recovery(&wrapped, &recovery_key)?;
         Ok(vault_key)
     }
+
+    /// Sets a new master passphrase for the vault using the existing [`VaultKey`] (ZK-073, ZK-074).
+    ///
+    /// Preserves the exact same [`VaultKey`] and existing recovery wrapping,
+    /// generating a fresh salt, fresh nonce, and new wrapped vault key envelope.
+    pub fn set_new_passphrase(
+        bootstrap: &VaultBootstrap,
+        vault_key: &VaultKey,
+        new_passphrase: &[u8],
+        new_kdf_params: &KdfParams,
+    ) -> Result<VaultBootstrap, CoreError> {
+        let new_kek = derive_kek(new_passphrase, new_kdf_params)?;
+        let new_wrapped = wrap_vault_key(vault_key, &new_kek)?;
+
+        let mut updated = bootstrap.clone();
+        updated.kdf = new_kdf_params.clone().into();
+        updated.wrapped_vault_key = new_wrapped.into();
+        Ok(updated)
+    }
 }
 
 use crate::search::InMemorySearchIndex;
@@ -232,5 +251,35 @@ mod tests {
         assert!(!session.is_unlocked());
         assert_eq!(session.active_key().unwrap_err(), CoreError::VaultLocked);
         assert_eq!(session.search_index().unwrap_err(), CoreError::VaultLocked);
+    }
+
+    #[test]
+    fn test_vault_set_new_passphrase_lifecycle() {
+        let params = KdfParams::new_test();
+        let old_passphrase = b"initial-secret-passphrase";
+        let (bootstrap, recovery_key_str, vault_key) =
+            VaultManager::init_vault(old_passphrase, &params).expect("init vault");
+
+        let new_passphrase = b"new-super-secure-passphrase";
+        let new_params = KdfParams::new_test();
+
+        let updated_bootstrap =
+            VaultManager::set_new_passphrase(&bootstrap, &vault_key, new_passphrase, &new_params)
+                .expect("set new passphrase");
+
+        // 1. New passphrase unlocks the same VaultKey
+        let unlocked_with_new =
+            VaultManager::unlock_with_passphrase(&updated_bootstrap, new_passphrase)
+                .expect("unlock new");
+        assert_eq!(vault_key, unlocked_with_new);
+
+        // 2. Old passphrase fails closed
+        assert!(VaultManager::unlock_with_passphrase(&updated_bootstrap, old_passphrase).is_err());
+
+        // 3. Original recovery key STILL restores the same VaultKey
+        let recovered_after_pass_change =
+            VaultManager::unlock_with_recovery_key(&updated_bootstrap, &recovery_key_str)
+                .expect("unlock recovery");
+        assert_eq!(vault_key, recovered_after_pass_change);
     }
 }

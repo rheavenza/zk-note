@@ -30,6 +30,7 @@ export const UnlockScreen: React.FC<UnlockScreenProps> = ({
     initVault,
     unlockWithPassphrase,
     unlockWithRecoveryKey,
+    rewrapPassphrase,
     lock,
   } = useVault();
 
@@ -43,6 +44,12 @@ export const UnlockScreen: React.FC<UnlockScreenProps> = ({
   const [pendingRecoveryPhrase, setPendingRecoveryPhrase] = useState<string | null>(null);
   const [acknowledgedSaved, setAcknowledgedSaved] = useState(false);
   const [copied, setCopied] = useState(false);
+
+  // Post-recovery passphrase configuration state (ZK-073)
+  const [recoveryUnlocked, setRecoveryUnlocked] = useState(false);
+  const [newPassphrase, setNewPassphrase] = useState("");
+  const [confirmNewPassphrase, setConfirmNewPassphrase] = useState("");
+  const [isRewrapping, setIsRewrapping] = useState(false);
 
   // Active error (prefer local validation error, then sanitized context error)
   const activeError = validationError || contextError;
@@ -121,10 +128,48 @@ export const UnlockScreen: React.FC<UnlockScreenProps> = ({
 
     try {
       await unlockWithRecoveryKey(trimmed);
-      onUnlocked?.();
+      setRecoveryUnlocked(true);
     } catch {
       // Error handled by context
     }
+  };
+
+  // Handler for setting a new passphrase after recovery (ZK-073)
+  const handleSetNewPassphrase = async (e: React.FormEvent) => {
+    e.preventDefault();
+    handleClearError();
+
+    if (newPassphrase.length < 8) {
+      setValidationError("Passphrase must be at least 8 characters long.");
+      return;
+    }
+
+    if (newPassphrase !== confirmNewPassphrase) {
+      setValidationError("Passphrases do not match.");
+      return;
+    }
+
+    const pass = newPassphrase;
+    setNewPassphrase("");
+    setConfirmNewPassphrase("");
+    setIsRewrapping(true);
+
+    try {
+      await rewrapPassphrase(pass);
+      setRecoveryUnlocked(false);
+      onUnlocked?.();
+    } catch {
+      // Error handled by context
+    } finally {
+      setIsRewrapping(false);
+    }
+  };
+
+  const handleSkipNewPassphrase = () => {
+    setNewPassphrase("");
+    setConfirmNewPassphrase("");
+    setRecoveryUnlocked(false);
+    onUnlocked?.();
   };
 
   // Handler when user confirms they've stored their recovery key
@@ -148,6 +193,40 @@ export const UnlockScreen: React.FC<UnlockScreenProps> = ({
     }
   };
 
+  const handleDownloadRecoveryKey = () => {
+    if (!pendingRecoveryPhrase) return;
+    const content = [
+      "================================================================",
+      "             ZERO-KNOWLEDGE NOTES — VAULT RECOVERY KEY",
+      "================================================================",
+      "",
+      "RECOVERY KEY:",
+      pendingRecoveryPhrase,
+      "",
+      "CRITICAL SECURITY WARNING:",
+      "- The zero-knowledge server CANNOT recover your lost passphrase or recovery key.",
+      "- Plaintext notes, titles, and encryption keys never touch the server.",
+      "- If both your passphrase and this recovery key are lost, your encrypted",
+      "  data is permanently unrecoverable by mathematical design.",
+      "- Store this file on a secure offline device or print it on paper.",
+      "",
+      `Exported: ${new Date().toISOString()}`,
+      "================================================================",
+    ].join("\n");
+
+    if (typeof document !== "undefined") {
+      const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "zk-notes-recovery-key.txt";
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    }
+  };
+
   // 1. Post-initialization Recovery Key Screen
   if (pendingRecoveryPhrase) {
     return (
@@ -163,6 +242,23 @@ export const UnlockScreen: React.FC<UnlockScreenProps> = ({
           </div>
 
           <div
+            style={{
+              backgroundColor: "#fef3c7",
+              border: "1px solid #f59e0b",
+              borderRadius: "6px",
+              padding: "10px 14px",
+              marginBottom: "16px",
+              fontSize: "13px",
+              color: "#92400e",
+              textAlign: "left",
+            }}
+          >
+            ⚠️ <strong>Permanent Data Loss Warning:</strong> The server stores only ciphertext and
+            cannot decrypt your data or reset lost keys. If both your passphrase and recovery key
+            are lost, your notes are permanently unrecoverable.
+          </div>
+
+          <div
             className="zk-recovery-key-display"
             style={recoveryBoxStyle}
             aria-label="Recovery Key"
@@ -170,7 +266,7 @@ export const UnlockScreen: React.FC<UnlockScreenProps> = ({
             <code style={codeStyle}>{pendingRecoveryPhrase}</code>
           </div>
 
-          <div style={{ display: "flex", justifyContent: "center", margin: "16px 0" }}>
+          <div style={{ display: "flex", justifyContent: "center", gap: "12px", margin: "16px 0" }}>
             <button
               type="button"
               onClick={handleCopyRecoveryPhrase}
@@ -178,6 +274,14 @@ export const UnlockScreen: React.FC<UnlockScreenProps> = ({
               className="zk-copy-button"
             >
               {copied ? "✓ Copied to clipboard" : "Copy Recovery Key"}
+            </button>
+            <button
+              type="button"
+              onClick={handleDownloadRecoveryKey}
+              style={secondaryButtonStyle}
+              className="zk-download-button"
+            >
+              Download (.txt)
             </button>
           </div>
 
@@ -204,6 +308,128 @@ export const UnlockScreen: React.FC<UnlockScreenProps> = ({
           >
             Enter Vault
           </button>
+        </div>
+      </div>
+    );
+  }
+
+  // 1b. Post-recovery Set New Passphrase Screen (ZK-073)
+  if (recoveryUnlocked) {
+    return (
+      <div className="zk-unlock-container" style={containerStyle}>
+        <div className="zk-unlock-card" style={cardStyle}>
+          <div style={{ textAlign: "center", marginBottom: 20 }}>
+            <span style={{ ...iconBadgeStyle, background: "#e6f4ea", color: "#137333" }}>🔑</span>
+            <h2 style={headingStyle}>Vault Recovered!</h2>
+            <p style={subheadingStyle}>
+              Your Vault Key was successfully restored using your recovery key.
+            </p>
+          </div>
+
+          <div
+            style={{
+              backgroundColor: "#eff6ff",
+              border: "1px solid #3b82f6",
+              borderRadius: "6px",
+              padding: "10px 14px",
+              marginBottom: "16px",
+              fontSize: "13px",
+              color: "#1e40af",
+              textAlign: "left",
+            }}
+          >
+            ℹ️ <strong>Set New Master Passphrase:</strong> Set a new passphrase now so you can
+            unlock easily in the future without needing your recovery key. Your existing recovery key
+            remains valid.
+          </div>
+
+          {activeError && (
+            <div role="alert" style={errorAlertStyle} className="zk-error-alert">
+              <span>{activeError}</span>
+              <button
+                type="button"
+                onClick={handleClearError}
+                style={closeErrorButtonStyle}
+                aria-label="Dismiss error"
+              >
+                ×
+              </button>
+            </div>
+          )}
+
+          <form
+            onSubmit={handleSetNewPassphrase}
+            style={{ display: "flex", flexDirection: "column", gap: 16 }}
+          >
+            <div>
+              <label htmlFor="recovery-new-passphrase" style={labelStyle}>
+                New Master Passphrase (min 8 characters)
+              </label>
+              <input
+                id="recovery-new-passphrase"
+                type="password"
+                autoComplete="new-password"
+                spellCheck={false}
+                autoCorrect="off"
+                autoCapitalize="off"
+                value={newPassphrase}
+                onChange={(e) => {
+                  setNewPassphrase(e.target.value);
+                  if (activeError) handleClearError();
+                }}
+                disabled={isRewrapping}
+                placeholder="Enter new master passphrase"
+                style={inputStyle}
+                required
+              />
+            </div>
+
+            <div>
+              <label htmlFor="recovery-confirm-passphrase" style={labelStyle}>
+                Confirm New Passphrase
+              </label>
+              <input
+                id="recovery-confirm-passphrase"
+                type="password"
+                autoComplete="new-password"
+                spellCheck={false}
+                autoCorrect="off"
+                autoCapitalize="off"
+                value={confirmNewPassphrase}
+                onChange={(e) => {
+                  setConfirmNewPassphrase(e.target.value);
+                  if (activeError) handleClearError();
+                }}
+                disabled={isRewrapping}
+                placeholder="Re-enter new master passphrase"
+                style={inputStyle}
+                required
+              />
+            </div>
+
+            <button
+              type="submit"
+              disabled={isRewrapping}
+              style={{
+                ...primaryButtonStyle,
+                opacity: isRewrapping ? 0.6 : 1,
+                cursor: isRewrapping ? "not-allowed" : "pointer",
+              }}
+              className="zk-set-passphrase-button"
+            >
+              {isRewrapping ? "Updating Passphrase..." : "Set New Passphrase & Enter Vault"}
+            </button>
+
+            <button
+              type="button"
+              onClick={handleSkipNewPassphrase}
+              disabled={isRewrapping}
+              style={secondaryButtonStyle}
+              className="zk-skip-passphrase-button"
+            >
+              Skip for Now & Enter Vault
+            </button>
+          </form>
         </div>
       </div>
     );

@@ -1993,7 +1993,7 @@ Completion notes:
 ---
 
 ## ZK-073 — Recovery UX
-Status: TODO  
+Status: DONE  
 Priority: P0  
 Dependencies: ZK-013, M6
 
@@ -2003,6 +2003,20 @@ Acceptance criteria:
 - user warned server cannot recover lost key;
 - recovery flow restores Vault Key;
 - new passphrase can be set.
+
+Completion notes:
+- Core (`crates/zk-core/src/vault.rs`): Added `VaultManager::set_new_passphrase` which rewraps the existing `VaultKey` under a fresh KEK derived from a new master passphrase and fresh salt/nonce, preserving the VaultKey and existing recovery key envelope unchanged.
+- Web UI (`apps/web`):
+  - In `UnlockScreen.tsx`: Added formatted export download (`zk-notes-recovery-key.txt`) and clipboard copy with prominent warning that the zero-knowledge server cannot recover lost keys and data loss is permanent if both credentials are lost.
+  - In `UnlockScreen.tsx`: Added post-recovery flow (`recoveryUnlocked`) prompting the user to set a new master passphrase (minimum 8 characters with confirmation) using `rewrapPassphrase`, with an option to skip and enter directly.
+  - In `SecurityRecoveryModal.tsx`: Created modal presenting zero-knowledge security guarantees, recovery key invariants, safe offline storage guidelines, and in-vault passphrase rotation without touching stored ciphertexts.
+  - Wired `SecurityRecoveryModal` into `NotesWorkspace.tsx` and exported from `apps/web/src/index.ts`.
+  - Added unit and worker integration tests in `apps/web/test/unlock-screen.test.tsx` verifying safe export, warning display, and passphrase rewrap preserving note decryptability and recovery key validity (72/72 passing).
+- CLI (`apps/cli`):
+  - In `commands.rs`: Updated `cmd_unlock` to support optional `--new-passphrase` rotation upon unlock.
+  - In `commands.rs`: Implemented `cmd_recover` (`zk-note recover`) with clear zero-knowledge warning banner, 288-bit recovery key restoration of `VaultKey`, optional interactive or flag-based new passphrase prompt/reset via atomic temporary file rename, immediate session unlock, and optional `--export-receipt` safe file output with zero secret leakage.
+  - In `main.rs`: Added `Commands::Recover` and updated `Commands::Unlock` with `--new-passphrase`. Added comprehensive CLI tests for recovery UX, note decryptability, old passphrase rejection, and receipt export (36/36 passing).
+- Verified with `./scripts/ci.sh` (all 8 quality gates passing cleanly).
 
 ---
 
