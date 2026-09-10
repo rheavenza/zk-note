@@ -1,5 +1,6 @@
 //! Terminal/CLI client for zero-knowledge notes (`zk-note`).
 
+mod auth;
 mod commands;
 mod config;
 mod edit;
@@ -8,8 +9,8 @@ mod session;
 
 use clap::{Parser, Subcommand};
 use commands::{
-    cmd_conflicts, cmd_delete, cmd_edit, cmd_history, cmd_init, cmd_list, cmd_lock, cmd_new,
-    cmd_resolve, cmd_search, cmd_show, cmd_status, cmd_unlock,
+    cmd_conflicts, cmd_delete, cmd_edit, cmd_history, cmd_init, cmd_list, cmd_lock, cmd_login,
+    cmd_logout, cmd_new, cmd_resolve, cmd_search, cmd_show, cmd_status, cmd_unlock, cmd_whoami,
 };
 use error::CliError;
 use std::path::PathBuf;
@@ -56,8 +57,38 @@ pub enum Commands {
     },
     /// Lock the vault and clear active session
     Lock,
-    /// Display vault status (UNINITIALIZED, LOCKED, or UNLOCKED)
+    /// Display vault and sync server status
     Status,
+    /// Log in to a sync server and authorize this device (ZK-072)
+    Login {
+        /// Server base URL (defaults to http://127.0.0.1:8080 or $ZK_SERVER_URL)
+        #[arg(short = 's', long)]
+        server: Option<String>,
+
+        /// Account identifier (UUID)
+        #[arg(short = 'a', long)]
+        account_id: Option<String>,
+
+        /// Human-readable device label (defaults to hostname/username)
+        #[arg(short = 'd', long)]
+        device_name: Option<String>,
+
+        /// Explicit device UUID (defaults to persistent local device ID)
+        #[arg(long)]
+        device_id: Option<String>,
+
+        /// Pre-provisioned personal access token or session token
+        #[arg(short = 't', long)]
+        token: Option<String>,
+    },
+    /// Log out from the sync server and revoke active session (ZK-072)
+    Logout,
+    /// Display authenticated account and device identity (ZK-072)
+    Whoami {
+        /// Output whoami details in raw JSON format
+        #[arg(long)]
+        json: bool,
+    },
     /// Create a new encrypted note
     #[command(alias = "create")]
     New {
@@ -205,7 +236,7 @@ pub enum Commands {
     },
 }
 
-fn run() -> Result<(), CliError> {
+async fn run() -> Result<(), CliError> {
     let cli = Cli::parse();
     let data_dir = cli.data_dir.as_deref();
 
@@ -220,6 +251,15 @@ fn run() -> Result<(), CliError> {
         } => cmd_unlock(data_dir, passphrase, recovery_key),
         Commands::Lock => cmd_lock(data_dir),
         Commands::Status => cmd_status(data_dir),
+        Commands::Login {
+            server,
+            account_id,
+            device_name,
+            device_id,
+            token,
+        } => cmd_login(data_dir, server, account_id, device_name, device_id, token).await,
+        Commands::Logout => cmd_logout(data_dir).await,
+        Commands::Whoami { json } => cmd_whoami(data_dir, json).await,
         Commands::New { title, body, tag } => {
             cmd_new(data_dir, title, body, tag)?;
             Ok(())
@@ -298,8 +338,9 @@ fn run() -> Result<(), CliError> {
     }
 }
 
-fn main() {
-    if let Err(e) = run() {
+#[tokio::main]
+async fn main() {
+    if let Err(e) = run().await {
         eprintln!("Error: {e}");
         std::process::exit(1);
     }
@@ -310,6 +351,7 @@ fn main() {
 mod tests {
     use super::*;
     use std::fs;
+    use uuid::Uuid;
     use zk_core::note::PlaintextNote;
     use zk_protocol::constants::OBJECT_KIND_NOTE;
     use zk_storage::traits::{BaseVersionStore, ObjectStore};
@@ -2149,6 +2191,192 @@ mod tests {
         let obj = storage.get_object(&obj_id).expect("get").expect("exists");
         assert_eq!(obj.revision, 10);
         assert!(obj.is_deleted);
+
+        let _ = fs::remove_dir_all(&test_dir);
+    }
+
+    async fn start_test_server() -> (
+        String,
+        zk_server::AppState,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let config = zk_server::ServerConfig::default();
+        let state = zk_server::AppState::new_in_memory(config).expect("create test app state");
+        let app = zk_server::create_app(state.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let local_addr = listener.local_addr().expect("get local addr");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await;
+        });
+
+        (format!("http://{}", local_addr), state, shutdown_tx)
+    }
+
+    #[tokio::test]
+    async fn test_cli_login_and_whoami_lifecycle() {
+        let (server_url, _state, _shutdown) = start_test_server().await;
+        let test_dir = temp_test_dir("cli_login_lifecycle");
+        let dir_path = test_dir.as_path();
+
+        // 1. Initially not logged in
+        let auth_path = config::auth_session_file(dir_path);
+        assert!(!auth::has_auth_session(&auth_path));
+
+        // 2. Perform CLI device authorization
+        let account_id = Uuid::new_v4();
+        cmd_login(
+            Some(dir_path),
+            Some(server_url.clone()),
+            Some(account_id.to_string()),
+            Some("My CLI Workstation".to_string()),
+            None,
+            None,
+        )
+        .await
+        .expect("login succeeds");
+
+        // 3. Verify session file is created and has 0600 permissions
+        assert!(auth::has_auth_session(&auth_path));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let meta = fs::metadata(&auth_path).unwrap();
+            let mode = meta.permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "session file must be restricted to 0600");
+        }
+
+        // 4. Verify loaded session and secret redaction (SEC-003)
+        let loaded = auth::load_auth_session(&auth_path).expect("load session");
+        assert_eq!(loaded.account_id, account_id);
+        assert_eq!(loaded.server_url, server_url);
+        let debug_str = format!("{loaded:?}");
+        assert!(!debug_str.contains(loaded.token.expose_secret()));
+        assert!(debug_str.contains("[REDACTED]"));
+
+        // 5. Run whoami and status
+        cmd_whoami(Some(dir_path), false)
+            .await
+            .expect("whoami succeeds");
+        cmd_whoami(Some(dir_path), true)
+            .await
+            .expect("whoami json succeeds");
+        cmd_status(Some(dir_path)).expect("status succeeds");
+
+        // 6. Logout and verify credentials revocation and file deletion
+        cmd_logout(Some(dir_path)).await.expect("logout succeeds");
+        assert!(!auth::has_auth_session(&auth_path));
+
+        let _ = fs::remove_dir_all(&test_dir);
+    }
+
+    #[tokio::test]
+    async fn test_cli_token_login_flow() {
+        let (server_url, state, _shutdown) = start_test_server().await;
+        let test_dir = temp_test_dir("cli_token_login");
+        let dir_path = test_dir.as_path();
+
+        let account_id = Uuid::new_v4();
+        let device_id = Uuid::new_v4();
+
+        // Register device and provision session token on server
+        state
+            .db
+            .register_device(account_id, device_id, Some("Token Device"))
+            .await
+            .unwrap();
+        let (_sess, tok) = state
+            .db
+            .create_session(
+                account_id,
+                Some(device_id),
+                Some("Token Device".to_string()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let token_str = tok.expose_secret().to_string();
+
+        // Perform CLI login via --token
+        cmd_login(
+            Some(dir_path),
+            Some(server_url.clone()),
+            None,
+            None,
+            Some(device_id.to_string()),
+            Some(token_str),
+        )
+        .await
+        .expect("token login succeeds");
+
+        let auth_path = config::auth_session_file(dir_path);
+        assert!(auth::has_auth_session(&auth_path));
+
+        cmd_whoami(Some(dir_path), false)
+            .await
+            .expect("whoami succeeds");
+
+        cmd_logout(Some(dir_path)).await.expect("logout succeeds");
+        assert!(!auth::has_auth_session(&auth_path));
+
+        let _ = fs::remove_dir_all(&test_dir);
+    }
+
+    #[tokio::test]
+    async fn test_cli_remote_session_and_device_revocation() {
+        let (server_url, state, _shutdown) = start_test_server().await;
+        let test_dir = temp_test_dir("cli_remote_revocation");
+        let dir_path = test_dir.as_path();
+
+        let account_id = Uuid::new_v4();
+        let device_id = Uuid::new_v4();
+
+        // 1. Authorize device
+        cmd_login(
+            Some(dir_path),
+            Some(server_url.clone()),
+            Some(account_id.to_string()),
+            Some("Laptop".to_string()),
+            Some(device_id.to_string()),
+            None,
+        )
+        .await
+        .expect("login succeeds");
+
+        // 2. Revoke device on server
+        state.db.revoke_device(account_id, device_id).await.unwrap();
+
+        // 3. whoami detects revocation
+        cmd_whoami(Some(dir_path), false)
+            .await
+            .expect("whoami handles revocation gracefully");
+
+        // 4. Attempting to re-authorize a revoked device fails closed
+        let reauth_err = cmd_login(
+            Some(dir_path),
+            Some(server_url),
+            Some(account_id.to_string()),
+            Some("Laptop".to_string()),
+            Some(device_id.to_string()),
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        match reauth_err {
+            CliError::SessionRevoked => {}
+            other => panic!("expected SessionRevoked error, got: {other:?}"),
+        }
 
         let _ = fs::remove_dir_all(&test_dir);
     }

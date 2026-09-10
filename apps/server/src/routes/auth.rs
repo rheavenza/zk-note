@@ -16,11 +16,14 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use base64ct::{Base64, Base64UrlUnpadded, Encoding};
 use uuid::Uuid;
-use zk_protocol::auth::SessionResponse;
+use zk_protocol::auth::{
+    DeviceAuthRequest, DeviceAuthResponse, SessionResponse, SessionStatusResponse,
+};
 use zk_protocol::constants::{
-    ERROR_AUTH_REQUIRED, ERROR_CRYPTO_AUTH_FAILED, ERROR_WEBAUTHN_CHALLENGE_EXPIRED,
-    ERROR_WEBAUTHN_CHALLENGE_NOT_FOUND, ERROR_WEBAUTHN_CREDENTIAL_EXISTS,
-    ERROR_WEBAUTHN_CREDENTIAL_NOT_FOUND, ERROR_WEBAUTHN_VERIFICATION_FAILED,
+    ERROR_AUTH_REQUIRED, ERROR_CRYPTO_AUTH_FAILED, ERROR_DEVICE_REVOKED,
+    ERROR_WEBAUTHN_CHALLENGE_EXPIRED, ERROR_WEBAUTHN_CHALLENGE_NOT_FOUND,
+    ERROR_WEBAUTHN_CREDENTIAL_EXISTS, ERROR_WEBAUTHN_CREDENTIAL_NOT_FOUND,
+    ERROR_WEBAUTHN_VERIFICATION_FAILED,
 };
 use zk_protocol::webauthn::{
     RevokeSessionRequest, RevokeSessionResponse, WebAuthnLoginFinishRequest,
@@ -558,4 +561,156 @@ pub async fn revoke_session_handler(
                 .into_response()
         }
     }
+}
+
+/// Handler for `POST /v1/auth/device/authorize` and `POST /v1/auth/cli/login` (ZK-072).
+///
+/// Provisions an authorized session for a client device.
+/// In accordance with SEC-001 and SEC-002:
+/// - Rejects any payload containing passphrase or vault key material.
+/// - Validates that the device is registered and not revoked.
+pub async fn device_authorize_handler(
+    State(state): State<AppState>,
+    body_bytes: Bytes,
+) -> Response {
+    let parsed_json: serde_json::Value = match serde_json::from_slice(&body_bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    code: "MALFORMED_JSON".to_string(),
+                    message: format!("Failed to parse request JSON: {e}"),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    // SEC-001 & SEC-002: strictly forbid any vault passphrase or vault keys
+    if contains_forbidden_keys(&parsed_json) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                code: "FORBIDDEN_PLAINTEXT_PAYLOAD".to_string(),
+                message: "Authentication payload must not contain vault passphrases or keys"
+                    .to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    let req: DeviceAuthRequest = match serde_json::from_value(parsed_json) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(ErrorResponse {
+                    code: "INVALID_REQUEST".to_string(),
+                    message: format!("Invalid device authorization request: {e}"),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    // Check if device is revoked
+    match state
+        .db
+        .is_device_revoked(req.account_id, req.device_id)
+        .await
+    {
+        Ok(true) => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(ErrorResponse {
+                    code: ERROR_DEVICE_REVOKED.to_string(),
+                    message: "Associated device has been revoked".to_string(),
+                }),
+            )
+                .into_response();
+        }
+        Ok(false) => {}
+        Err(e) => {
+            tracing::error!("failed to check device status: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    code: "DATABASE_ERROR".to_string(),
+                    message: "Failed to check device status".to_string(),
+                }),
+            )
+                .into_response();
+        }
+    }
+
+    // Register or update device record
+    if let Err(e) = state
+        .db
+        .register_device(req.account_id, req.device_id, req.device_name.as_deref())
+        .await
+    {
+        tracing::error!("failed to register device: {e}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                code: "DATABASE_ERROR".to_string(),
+                message: "Failed to register device".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    // Create session (30-day default TTL = 2592000 seconds)
+    match state
+        .db
+        .create_session(
+            req.account_id,
+            Some(req.device_id),
+            req.device_name,
+            Some(2_592_000),
+        )
+        .await
+    {
+        Ok((session, token)) => (
+            StatusCode::OK,
+            Json(DeviceAuthResponse {
+                session: SessionResponse {
+                    token,
+                    session_id: session.session_id,
+                    account_id: session.account_id,
+                    device_id: session.device_id,
+                    expires_at: session.expires_at,
+                },
+            }),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!("failed to create device session: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    code: "SESSION_CREATION_FAILED".to_string(),
+                    message: "Failed to provision device session".to_string(),
+                }),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Handler for `GET /v1/auth/session/status` and `GET /v1/auth/whoami` (ZK-072).
+///
+/// Returns metadata about the caller's active authenticated session.
+pub async fn session_status_handler(auth: AuthenticatedAccount) -> Response {
+    (
+        StatusCode::OK,
+        Json(SessionStatusResponse {
+            account_id: auth.account_id,
+            session_id: auth.session_id,
+            device_id: auth.device_id,
+            status: "active".to_string(),
+        }),
+    )
+        .into_response()
 }

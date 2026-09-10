@@ -37,3 +37,15 @@ pub fn db_file(data_dir: &Path) -> PathBuf {
 pub fn session_file(data_dir: &Path) -> PathBuf {
     data_dir.join(".session")
 }
+
+/// Returns the path to the stored auth session file (ZK-072).
+#[must_use]
+pub fn auth_session_file(data_dir: &Path) -> PathBuf {
+    data_dir.join(".auth_session")
+}
+
+/// Returns the path to the local device identity file (ZK-072).
+#[must_use]
+pub fn device_file(data_dir: &Path) -> PathBuf {
+    data_dir.join("device.json")
+}

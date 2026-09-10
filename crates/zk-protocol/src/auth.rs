@@ -138,6 +138,37 @@ pub struct SessionResponse {
     pub expires_at: Option<String>,
 }
 
+/// Request to authorize and register a client device (ZK-072).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceAuthRequest {
+    /// Owning account ID.
+    pub account_id: Uuid,
+    /// Device identifier for this client.
+    pub device_id: Uuid,
+    /// Human-readable device name or hostname.
+    pub device_name: Option<String>,
+}
+
+/// Response returned when a device is authorized (ZK-072).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceAuthResponse {
+    /// Provisioned session details and bearer token.
+    pub session: SessionResponse,
+}
+
+/// Status of the current authentication session (ZK-072).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionStatusResponse {
+    /// Owning account ID.
+    pub account_id: Uuid,
+    /// Active session ID, if present.
+    pub session_id: Option<Uuid>,
+    /// Associated device ID, if present.
+    pub device_id: Option<Uuid>,
+    /// Status description ("active", etc.).
+    pub status: String,
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -194,5 +225,45 @@ mod tests {
         let parsed: SessionResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.session_id, resp.session_id);
         assert_eq!(parsed.token.expose_secret(), "super_secret_session_token");
+    }
+
+    #[test]
+    fn test_device_auth_models_serialization() {
+        let acc_id = Uuid::new_v4();
+        let dev_id = Uuid::new_v4();
+        let req = DeviceAuthRequest {
+            account_id: acc_id,
+            device_id: dev_id,
+            device_name: Some("laptop-cli".to_string()),
+        };
+
+        let req_json = serde_json::to_string(&req).unwrap();
+        let parsed_req: DeviceAuthRequest = serde_json::from_str(&req_json).unwrap();
+        assert_eq!(parsed_req, req);
+
+        let resp = DeviceAuthResponse {
+            session: SessionResponse {
+                token: AuthToken::new("cli_tok_12345"),
+                session_id: Uuid::new_v4(),
+                account_id: acc_id,
+                device_id: Some(dev_id),
+                expires_at: None,
+            },
+        };
+
+        let resp_json = serde_json::to_string(&resp).unwrap();
+        let parsed_resp: DeviceAuthResponse = serde_json::from_str(&resp_json).unwrap();
+        assert_eq!(parsed_resp.session.account_id, acc_id);
+        assert_eq!(parsed_resp.session.token.expose_secret(), "cli_tok_12345");
+
+        let status = SessionStatusResponse {
+            account_id: acc_id,
+            session_id: Some(resp.session.session_id),
+            device_id: Some(dev_id),
+            status: "active".to_string(),
+        };
+        let status_json = serde_json::to_string(&status).unwrap();
+        let parsed_status: SessionStatusResponse = serde_json::from_str(&status_json).unwrap();
+        assert_eq!(parsed_status, status);
     }
 }

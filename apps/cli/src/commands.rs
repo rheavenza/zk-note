@@ -1,7 +1,12 @@
 //! Command execution implementations for `zk-note init`, `unlock`, `lock`, `status`,
 //! `new`, `edit`, `show`, `search`, `delete`, `history`, and `list`.
 
-use crate::config::{db_file, resolve_data_dir, session_file, vault_file};
+use crate::auth::{
+    api_device_authorize, api_query_status, api_revoke_session, api_verify_token,
+    clear_auth_session, get_or_create_device_id, has_auth_session, load_auth_session,
+    save_auth_session,
+};
+use crate::config::{auth_session_file, db_file, resolve_data_dir, session_file, vault_file};
 use crate::edit::{note_to_edit_buffer, parse_edit_buffer, run_editor, TempFileGuard};
 use crate::error::CliError;
 use crate::session::{clear_session, has_active_session, load_session_key, save_session_key};
@@ -9,6 +14,7 @@ use serde::Serialize;
 use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::Path;
 use std::sync::Arc;
+use uuid::Uuid;
 use zk_core::note::{NoteBuilder, NoteHistoryItem, PlaintextNote};
 use zk_core::search::{InMemorySearchIndex, SearchResult};
 use zk_core::time::now_utc_rfc3339;
@@ -196,6 +202,20 @@ pub fn cmd_status(custom_data_dir: Option<&Path>) -> Result<(), CliError> {
         println!("Vault status: LOCKED");
         println!("Path: {}", data_dir.display());
         println!("Run 'zk-note unlock' to unlock the vault.");
+    }
+
+    let auth_path = auth_session_file(&data_dir);
+    if has_auth_session(&auth_path) {
+        if let Ok(auth) = load_auth_session(&auth_path) {
+            println!(
+                "Server auth:  Logged in as account {} (device {}) at {}",
+                auth.account_id, auth.device_id, auth.server_url
+            );
+        } else {
+            println!("Server auth:  Logged in (corrupted .auth_session file)");
+        }
+    } else {
+        println!("Server auth:  Not logged in (run 'zk-note login' to connect)");
     }
 
     Ok(())
@@ -1571,4 +1591,195 @@ pub fn cmd_resolve(
     }
 
     Ok(result)
+}
+
+/// Logs in to a sync server and persists authorized session credentials (ZK-072).
+pub async fn cmd_login(
+    custom_data_dir: Option<&Path>,
+    server_opt: Option<String>,
+    account_id_opt: Option<String>,
+    device_name_opt: Option<String>,
+    device_id_opt: Option<String>,
+    token_opt: Option<String>,
+) -> Result<(), CliError> {
+    let data_dir = resolve_data_dir(custom_data_dir);
+    std::fs::create_dir_all(&data_dir).map_err(|e| CliError::Io(e.to_string()))?;
+
+    let server_url = if let Some(s) = server_opt {
+        s
+    } else if let Ok(env_s) = std::env::var("ZK_SERVER_URL") {
+        env_s
+    } else if io::stdin().is_terminal() {
+        print!("Enter server URL [http://127.0.0.1:8080]: ");
+        let _ = io::stdout().flush();
+        let mut line = String::new();
+        let _ = io::stdin().read_line(&mut line);
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            "http://127.0.0.1:8080".to_string()
+        } else {
+            trimmed.to_string()
+        }
+    } else {
+        "http://127.0.0.1:8080".to_string()
+    };
+
+    let explicit_dev_id = if let Some(d_str) = device_id_opt {
+        Some(
+            Uuid::parse_str(&d_str)
+                .map_err(|e| CliError::AuthError(format!("invalid device-id UUID: {e}")))?,
+        )
+    } else {
+        None
+    };
+
+    let device_id = get_or_create_device_id(&data_dir, explicit_dev_id)?;
+
+    let auth_session = if let Some(token_str) = token_opt {
+        println!("Verifying authentication token with {server_url}...");
+        api_verify_token(&server_url, &token_str, device_id).await?
+    } else {
+        let acc_id_str = if let Some(a) = account_id_opt {
+            a
+        } else if io::stdin().is_terminal() {
+            print!("Enter Account ID (or press Enter to provide Bearer Token): ");
+            let _ = io::stdout().flush();
+            let mut line = String::new();
+            let _ = io::stdin().read_line(&mut line);
+            line.trim().to_string()
+        } else {
+            return Err(CliError::AuthError(
+                "Missing required argument: --account-id or --token. Run 'zk-note login --help' for details.".to_string(),
+            ));
+        };
+
+        if acc_id_str.is_empty() {
+            let tok_str = rpassword::prompt_password("Enter Bearer Token: ")
+                .map_err(|e| CliError::Io(format!("failed to read token: {e}")))?;
+            if tok_str.trim().is_empty() {
+                return Err(CliError::AuthError(
+                    "Either Account ID or Bearer Token is required".to_string(),
+                ));
+            }
+            println!("Verifying authentication token with {server_url}...");
+            api_verify_token(&server_url, tok_str.trim(), device_id).await?
+        } else {
+            let account_id = Uuid::parse_str(&acc_id_str)
+                .map_err(|e| CliError::AuthError(format!("invalid account-id UUID: {e}")))?;
+
+            let dev_name = device_name_opt.or_else(|| {
+                std::env::var("HOSTNAME")
+                    .or_else(|_| std::env::var("USER").map(|u| format!("{u}-cli")))
+                    .ok()
+            });
+
+            println!("Authorizing device with {server_url}...");
+            api_device_authorize(&server_url, account_id, device_id, dev_name).await?
+        }
+    };
+
+    let auth_path = auth_session_file(&data_dir);
+    save_auth_session(&auth_path, &auth_session)?;
+
+    println!("Successfully authenticated!");
+    println!("Server:     {}", auth_session.server_url);
+    println!("Account ID: {}", auth_session.account_id);
+    println!("Device ID:  {}", auth_session.device_id);
+    if let Some(sess_id) = auth_session.session_id {
+        println!("Session ID: {}", sess_id);
+    }
+    println!("Session credentials saved with restricted permissions (0600).");
+
+    Ok(())
+}
+
+/// Revokes the current session on the server and clears local credentials (ZK-072).
+pub async fn cmd_logout(custom_data_dir: Option<&Path>) -> Result<(), CliError> {
+    let data_dir = resolve_data_dir(custom_data_dir);
+    let auth_path = auth_session_file(&data_dir);
+
+    if !has_auth_session(&auth_path) {
+        println!("Not logged in.");
+        return Ok(());
+    }
+
+    if let Ok(session) = load_auth_session(&auth_path) {
+        println!("Revoking session with {}...", session.server_url);
+        let _ = api_revoke_session(&session).await;
+    }
+
+    clear_auth_session(&auth_path)?;
+    println!("Logged out successfully. Local credentials cleared.");
+    Ok(())
+}
+
+/// Displays active account and session identity without leaking token (ZK-072).
+pub async fn cmd_whoami(custom_data_dir: Option<&Path>, json_output: bool) -> Result<(), CliError> {
+    let data_dir = resolve_data_dir(custom_data_dir);
+    let auth_path = auth_session_file(&data_dir);
+
+    if !has_auth_session(&auth_path) {
+        if json_output {
+            println!("{}", serde_json::json!({ "authenticated": false }));
+        } else {
+            println!("Not logged in. Run 'zk-note login' to authenticate.");
+        }
+        return Ok(());
+    }
+
+    let session = load_auth_session(&auth_path)?;
+
+    // Verify active status with server
+    let status_res = api_query_status(&session).await;
+
+    if json_output {
+        match status_res {
+            Ok(status) => {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "authenticated": true,
+                        "server_url": session.server_url,
+                        "account_id": status.account_id,
+                        "device_id": status.device_id.unwrap_or(session.device_id),
+                        "session_id": status.session_id.or(session.session_id),
+                        "status": status.status,
+                    })
+                );
+            }
+            Err(e) => {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "authenticated": false,
+                        "server_url": session.server_url,
+                        "account_id": session.account_id,
+                        "device_id": session.device_id,
+                        "error": e.to_string(),
+                    })
+                );
+            }
+        }
+    } else {
+        println!("Server:     {}", session.server_url);
+        println!("Account ID: {}", session.account_id);
+        println!("Device ID:  {}", session.device_id);
+        if let Some(sid) = session.session_id {
+            println!("Session ID: {}", sid);
+        }
+        match status_res {
+            Ok(status) => {
+                println!("Status:     Active ({})", status.status);
+            }
+            Err(CliError::SessionRevoked) => {
+                println!("Status:     REVOKED (session or device revoked on server)");
+                println!("Run 'zk-note login' to re-authenticate.");
+            }
+            Err(e) => {
+                println!("Status:     UNREACHABLE / ERROR ({e})");
+            }
+        }
+    }
+
+    Ok(())
 }

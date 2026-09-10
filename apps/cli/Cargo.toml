@@ -24,6 +24,10 @@ zk-protocol = { workspace = true }
 zk-storage = { workspace = true }
 zk-sync = { workspace = true }
 uuid = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
 
 [dev-dependencies]
 rusqlite = { workspace = true }
+axum = { workspace = true }
+zk-server = { path = "../server" }

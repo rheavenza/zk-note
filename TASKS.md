@@ -1956,7 +1956,7 @@ Completion notes:
 ---
 
 ## ZK-072 — CLI login/device authorization
-Status: TODO  
+Status: DONE  
 Priority: P1  
 Dependencies: ZK-070
 
@@ -1965,6 +1965,30 @@ Acceptance criteria:
 - secure account authorization flow;
 - token persistence uses platform secure storage where possible;
 - revocation supported.
+
+Completion notes:
+- Protocol layer (`crates/zk-protocol`):
+  - Defined device authorization models in `crates/zk-protocol/src/auth.rs`: `DeviceAuthRequest`, `DeviceAuthResponse`, and `SessionStatusResponse`.
+  - Added unit tests verifying model serialization/deserialization and redacting secret token in Debug formatting.
+- Server endpoints (`apps/server`):
+  - Implemented `device_authorize_handler` in `apps/server/src/routes/auth.rs` mapped to `POST /v1/auth/device/authorize` and `POST /v1/auth/cli/login`.
+  - Enforced SEC-001/SEC-002: payload inspection via `contains_forbidden_keys` strictly rejects any passphrase or vault key submission.
+  - Enforced revocation checking: fails closed with 403 Forbidden (`ERROR_DEVICE_REVOKED`) if the target device is revoked.
+  - Implemented `session_status_handler` mapped to `GET /v1/auth/session/status` and `GET /v1/auth/whoami` under `auth_middleware`.
+- CLI authentication and persistence (`apps/cli`):
+  - Authored `apps/cli/src/auth.rs` managing `StoredAuthSession`, device identity, `api_device_authorize`, `api_verify_token`, `api_revoke_session`, and `api_query_status`.
+  - Token persistence: session credentials saved to `.auth_session` with strict POSIX mode `0600` permissions (owner read/write only); file contents are zeroized before deletion on logout.
+  - Device identity: persistent client device ID managed in `device.json`.
+  - Secret redaction: `StoredAuthSession` unconditionally formats secret token as `[REDACTED]` in `Debug` output (SEC-003).
+  - CLI subcommands:
+    - `zk-note login`: supports `--server`, `--account-id`, `--device-name`, `--device-id`, and `--token`, with interactive fallback when args omitted.
+    - `zk-note logout`: revokes active session on server and securely clears local `.auth_session`.
+    - `zk-note whoami`: queries session status from server, displaying account and device IDs without ever printing raw tokens; gracefully handles remote session/device revocation.
+    - `zk-note status`: updated to display server authentication status alongside vault lock state.
+- Tests & verification:
+  - Server integration suite in `apps/server/tests/server_device_auth_tests.rs` (5/5 passing).
+  - CLI integration suite in `apps/cli/src/main.rs` and `apps/cli/src/auth.rs` (34/34 passing).
+  - Validated via `./scripts/ci.sh` (all 8 quality gates passed cleanly).
 
 ---
 

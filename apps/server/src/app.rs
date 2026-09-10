@@ -159,12 +159,28 @@ pub fn create_app(state: AppState) -> Router {
             "/v1/auth/logout",
             post(crate::routes::auth::revoke_session_handler),
         )
+        .route(
+            "/v1/auth/session/status",
+            get(crate::routes::auth::session_status_handler),
+        )
+        .route(
+            "/v1/auth/whoami",
+            get(crate::routes::auth::session_status_handler),
+        )
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             crate::auth::auth_middleware,
         ));
 
     let public_auth_routes = Router::new()
+        .route(
+            "/v1/auth/device/authorize",
+            post(crate::routes::auth::device_authorize_handler),
+        )
+        .route(
+            "/v1/auth/cli/login",
+            post(crate::routes::auth::device_authorize_handler),
+        )
         .route(
             "/v1/auth/webauthn/register/start",
             post(crate::routes::auth::webauthn_register_start_handler),

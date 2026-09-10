@@ -1759,15 +1759,19 @@ dependencies = [
 name = "zk-cli"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "clap",
+ "reqwest",
  "rpassword",
  "rusqlite",
  "serde",
  "serde_json",
+ "tokio",
  "uuid",
  "zk-core",
  "zk-crypto",
  "zk-protocol",
+ "zk-server",
  "zk-storage",
  "zk-sync",
 ]

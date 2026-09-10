@@ -40,6 +40,14 @@ pub enum CliError {
     Storage(zk_storage::error::StorageError),
     /// File system or I/O error.
     Io(String),
+    /// Client is not logged in to a sync server.
+    NotLoggedIn,
+    /// Server authentication error.
+    AuthError(String),
+    /// Active session or device was revoked on the server.
+    SessionRevoked,
+    /// Network or HTTP connection error.
+    Network(String),
 }
 
 impl fmt::Display for CliError {
@@ -73,11 +81,26 @@ impl fmt::Display for CliError {
             Self::Core(e) => write!(f, "{e}"),
             Self::Storage(e) => write!(f, "{e}"),
             Self::Io(msg) => write!(f, "I/O error: {msg}"),
+            Self::NotLoggedIn => {
+                write!(f, "not logged in to any server; run 'zk-note login' first")
+            }
+            Self::AuthError(msg) => write!(f, "authentication error: {msg}"),
+            Self::SessionRevoked => write!(
+                f,
+                "session or device has been revoked on the server; please re-authenticate"
+            ),
+            Self::Network(msg) => write!(f, "network error: {msg}"),
         }
     }
 }
 
 impl std::error::Error for CliError {}
+
+impl From<reqwest::Error> for CliError {
+    fn from(e: reqwest::Error) -> Self {
+        Self::Network(e.to_string())
+    }
+}
 
 impl From<zk_core::error::CoreError> for CliError {
     fn from(e: zk_core::error::CoreError) -> Self {
