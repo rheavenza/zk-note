@@ -22,6 +22,7 @@ pub const TABLE_OBJECT_HISTORY: &str = "object_history";
 pub const TABLE_PROCESSED_MUTATIONS: &str = "processed_mutations";
 pub const TABLE_DEVICES: &str = "devices";
 pub const TABLE_ACCOUNT_SEQUENCES: &str = "account_sequences";
+pub const TABLE_SESSIONS: &str = "sessions";
 pub const TABLE_SCHEMA_MIGRATIONS: &str = "schema_migrations";
 
 /// Index name constants.
@@ -29,6 +30,8 @@ pub const INDEX_ENCRYPTED_OBJECTS_ACCOUNT_SEQ: &str = "encrypted_objects_account
 pub const INDEX_OBJECT_HISTORY_ACCOUNT_SEQ: &str = "idx_object_history_account_seq";
 pub const INDEX_PROCESSED_MUTATIONS_ACCOUNT_OBJECT: &str = "idx_processed_mutations_account_object";
 pub const INDEX_DEVICES_ACCOUNT_LAST_ACK: &str = "idx_devices_account_last_ack";
+pub const INDEX_SESSIONS_ACCOUNT_ID: &str = "idx_sessions_account_id";
+pub const INDEX_SESSIONS_DEVICE_ID: &str = "idx_sessions_device_id";
 
 /// All required table names defined in the schema.
 pub const ALL_TABLES: &[&str] = &[
@@ -40,6 +43,7 @@ pub const ALL_TABLES: &[&str] = &[
     TABLE_PROCESSED_MUTATIONS,
     TABLE_DEVICES,
     TABLE_ACCOUNT_SEQUENCES,
+    TABLE_SESSIONS,
 ];
 
 /// All required indexes defined in the schema.
@@ -48,6 +52,8 @@ pub const ALL_INDEXES: &[&str] = &[
     INDEX_OBJECT_HISTORY_ACCOUNT_SEQ,
     INDEX_PROCESSED_MUTATIONS_ACCOUNT_OBJECT,
     INDEX_DEVICES_ACCOUNT_LAST_ACK,
+    INDEX_SESSIONS_ACCOUNT_ID,
+    INDEX_SESSIONS_DEVICE_ID,
 ];
 
 /// Account record in database.
@@ -197,6 +203,30 @@ pub struct AccountSequenceRow {
     pub current_seq: i64,
     /// Last update timestamp.
     pub updated_at: String,
+}
+
+/// Authentication session record in database (ZK-070).
+///
+/// In accordance with SEC-003, raw tokens are NEVER stored in this table;
+/// only 32-byte cryptographic digests (`token_hash`) are persisted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRow {
+    /// Session unique identifier.
+    pub session_id: Uuid,
+    /// Owning account ID.
+    pub account_id: Uuid,
+    /// Optional associated device identifier.
+    pub device_id: Option<Uuid>,
+    /// Cryptographic digest (BLAKE2s) of the bearer token.
+    pub token_hash: Vec<u8>,
+    /// Optional human-readable label for the session.
+    pub display_name: Option<String>,
+    /// Session creation timestamp.
+    pub created_at: String,
+    /// Expiration timestamp, if configured.
+    pub expires_at: Option<String>,
+    /// Revocation timestamp, if revoked.
+    pub revoked_at: Option<String>,
 }
 
 /// Verifies that all expected tables and indexes exist in the connected database.

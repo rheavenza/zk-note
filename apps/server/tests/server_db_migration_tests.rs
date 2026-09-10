@@ -19,11 +19,11 @@ fn test_migrations_reproducible_clean_state_and_idempotent() {
     conn.execute_batch("PRAGMA foreign_keys = ON;")
         .expect("enable foreign keys");
 
-    // Clean run applies migrations 2, 3, and 4
+    // Clean run applies migrations 2, 3, 4, and 7
     let applied = run_server_migrations(&mut conn).expect("run migrations");
-    assert_eq!(applied, vec![2, 3, 4]);
+    assert_eq!(applied, vec![2, 3, 4, 7]);
 
-    // Verify all 8 tables and 4 indexes exist
+    // Verify all 9 tables and 6 indexes exist
     verify_database_schema(&conn).expect("schema verification");
 
     // Check schema_migrations rows
@@ -56,6 +56,16 @@ fn test_migrations_reproducible_clean_state_and_idempotent() {
         .expect("query migration 4 row");
     assert_eq!(v4, 4);
     assert_eq!(n4, "004_mutation_idempotency");
+
+    let (v7, n7): (i32, String) = conn
+        .query_row(
+            "SELECT version, name FROM schema_migrations WHERE version = 7",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("query migration 7 row");
+    assert_eq!(v7, 7);
+    assert_eq!(n7, "007_server_sessions");
 
     // Second run is idempotent
     let second_run = run_server_migrations(&mut conn).expect("second run");

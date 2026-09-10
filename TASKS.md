@@ -1885,7 +1885,7 @@ Native/WASM compatibility suite must pass.
 # M7 — Authentication, recovery, and device security
 
 ## ZK-070 — Authentication abstraction
-Status: TODO  
+Status: DONE  
 Priority: P0  
 Dependencies: M3
 
@@ -1894,6 +1894,29 @@ Acceptance criteria:
 - server auth independent of vault passphrase;
 - access tokens never logged;
 - auth middleware owns account identity.
+
+Completion notes:
+- Protocol layer (`crates/zk-protocol`):
+  - Defined `AuthToken` in `crates/zk-protocol/src/auth.rs` implementing `Zeroize` and `ZeroizeOnDrop` for automatic memory scrubbing, with custom `fmt::Debug` and `fmt::Display` implementations unconditionally redacting secrets as `[REDACTED]` (SEC-003).
+  - Defined protocol session models `AuthenticatedSession` and `SessionResponse` for strongly-typed server session exchange.
+  - Added protocol canonical error constants `ERROR_AUTH_EXPIRED`, `ERROR_AUTH_REVOKED`, and `ERROR_DEVICE_REVOKED` in `crates/zk-protocol/src/constants.rs`.
+- Client sync adapter (`crates/zk-sync`):
+  - Updated `NativeHttpSyncAdapter` with custom `fmt::Debug` redacting active auth tokens.
+  - Added typed `set_token(Option<AuthToken>)` and `get_token() -> Option<AuthToken>` alongside existing string APIs.
+- Database & migrations (`apps/server`):
+  - Created migration `migrations/007_server_sessions.sql` establishing the `sessions` table (with `session_id`, `account_id`, `device_id`, `token_hash`, `display_name`, `created_at`, `expires_at`, `revoked_at`) and indexes on `account_id` and `(account_id, device_id)`.
+  - Registered migration 7 in `apps/server/src/db/migrations.rs` and added `TABLE_SESSIONS`, `INDEX_SESSIONS_ACCOUNT_ID`, `INDEX_SESSIONS_DEVICE_ID`, and `SessionRow` in `apps/server/src/db/schema.rs`.
+  - Added session and device methods to `ServerDb`: `create_session` (generating 256-bit CSPRNG tokens and persisting only BLAKE2s digests `token_hash`), `validate_session_token`, `revoke_session`, `revoke_all_sessions_for_account`, `revoke_device_sessions`, `register_device`, `revoke_device`, `is_device_revoked`, `list_devices`, and `list_sessions`.
+- Server authentication & middleware (`apps/server`):
+  - Enhanced `AuthenticatedAccount` with `device_id` and `session_id`.
+  - Enhanced `AuthError` with `ExpiredToken`, `RevokedToken`, and `DeviceRevoked`, mapping to generic HTTP 401/403 responses that never echo tokens.
+  - Implemented `authenticate_bearer_token` verifying cryptographic session digests against `sessions` (and legacy account UUID fallback for backwards test compatibility).
+  - Implemented `auth_middleware` intercepting all protected routes (`/v1/vault/bootstrap`, `/v1/sync/*`), verifying tokens, validating cross-account and cross-device boundaries, and injecting `AuthenticatedAccount` into request extensions. Handlers consume `AuthenticatedAccount` from extensions directly.
+  - Public health endpoints (`/health`, `/v1/health`) bypass authentication.
+- Tests & verification:
+  - Added unit tests in `crates/zk-protocol/src/auth.rs`, `crates/zk-sync/src/adapter.rs`, and `apps/server/src/auth.rs`.
+  - Added integration test suite in `apps/server/tests/server_authentication_abstraction_tests.rs` covering passphrase independence, token logging redaction, full auth middleware lifecycle, expiration, revocation, and device cascading revocation.
+  - Validated via `./scripts/ci.sh` (all 8 quality gates passed cleanly).
 
 ---
 

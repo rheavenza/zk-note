@@ -12,6 +12,7 @@ use reqwest::{Client, Method, Response, StatusCode};
 use serde::de::DeserializeOwned;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use zk_protocol::auth::{AuthToken, REDACTED_TOKEN};
 use zk_protocol::constants::{
     ERROR_MUTATION_REPLAY_MISMATCH, ERROR_REVISION_CONFLICT, ERROR_SYNC_CURSOR_INVALID,
 };
@@ -90,11 +91,25 @@ struct ServerErrorJson {
 }
 
 /// Concrete native HTTP synchronization adapter using `reqwest`.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct NativeHttpSyncAdapter {
     base_url: String,
     auth_token: Arc<RwLock<Option<String>>>,
     client: Client,
+}
+
+impl std::fmt::Debug for NativeHttpSyncAdapter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let has_token = self
+            .auth_token
+            .read()
+            .ok()
+            .and_then(|t| t.as_ref().map(|_| ()));
+        f.debug_struct("NativeHttpSyncAdapter")
+            .field("base_url", &self.base_url)
+            .field("auth_token", &has_token.map(|_| REDACTED_TOKEN))
+            .finish()
+    }
 }
 
 impl NativeHttpSyncAdapter {
@@ -145,9 +160,19 @@ impl NativeHttpSyncAdapter {
         }
     }
 
+    /// Sets or updates the active authorization token via [`AuthToken`].
+    pub fn set_token(&self, token: Option<AuthToken>) {
+        self.set_auth_token(token.map(|t| t.expose_secret().to_string()));
+    }
+
     /// Returns a copy of the current authorization token, if set.
     pub fn auth_token(&self) -> Option<String> {
         self.auth_token.read().ok().and_then(|lock| lock.clone())
+    }
+
+    /// Returns the current authorization token wrapped in [`AuthToken`].
+    pub fn get_token(&self) -> Option<AuthToken> {
+        self.auth_token().map(AuthToken::new)
     }
 
     /// Internal helper to construct an authenticated request builder.
@@ -577,6 +602,26 @@ mod tests {
         assert_eq!(adapter.auth_token(), None);
 
         assert!(NativeHttpSyncAdapter::new("", None).is_err());
+    }
+
+    #[test]
+    fn test_native_adapter_redacts_auth_token_in_debug() {
+        let secret = "zk_live_token_secret_12345";
+        let adapter =
+            NativeHttpSyncAdapter::new("http://127.0.0.1:8080", Some(secret.to_string())).unwrap();
+
+        let debug_str = format!("{adapter:?}");
+        assert!(!debug_str.contains(secret));
+        assert!(debug_str.contains(REDACTED_TOKEN));
+
+        // Typed AuthToken setter/getter
+        adapter.set_token(Some(AuthToken::new("new_secret_456")));
+        let typed_tok = adapter.get_token().unwrap();
+        assert_eq!(typed_tok.expose_secret(), "new_secret_456");
+
+        let debug_str2 = format!("{adapter:?}");
+        assert!(!debug_str2.contains("new_secret_456"));
+        assert!(debug_str2.contains(REDACTED_TOKEN));
     }
 
     #[tokio::test]

@@ -36,6 +36,12 @@ pub const OBJECT_KIND_RESERVED: u16 = 5;
 pub const ERROR_AUTH_REQUIRED: &str = "AUTH_REQUIRED";
 /// Caller is not authorized to access this resource or account.
 pub const ERROR_AUTH_FORBIDDEN: &str = "AUTH_FORBIDDEN";
+/// Provided authentication token has expired.
+pub const ERROR_AUTH_EXPIRED: &str = "AUTH_EXPIRED";
+/// Provided authentication token or session has been revoked.
+pub const ERROR_AUTH_REVOKED: &str = "AUTH_REVOKED";
+/// Originating device has been revoked and cannot authenticate.
+pub const ERROR_DEVICE_REVOKED: &str = "DEVICE_REVOKED";
 /// Local operation rejected because the vault is locked.
 pub const ERROR_VAULT_LOCKED: &str = "VAULT_LOCKED";
 /// Cryptographic envelope or parameter version is unsupported.

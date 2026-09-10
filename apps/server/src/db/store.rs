@@ -1,7 +1,7 @@
 //! Server database handle and vault bootstrap persistence.
 
 use crate::db::migrations::create_in_memory_db;
-use crate::db::schema::{EncryptedObjectRow, ObjectHistoryRow};
+use crate::db::schema::{DeviceRow, EncryptedObjectRow, ObjectHistoryRow, SessionRow};
 use crate::error::DbError;
 use base64ct::{Base64, Encoding};
 use rusqlite::Connection;
@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use uuid::Uuid;
+use zk_protocol::auth::{AuthToken, AuthenticatedSession};
 use zk_protocol::envelope::{EncryptedEnvelope, EncryptedKeyContainer, EncryptedPayloadContainer};
 use zk_protocol::sync::{
     ConflictResponse, ObjectChange, PullChangesResponse, PushRequest, PushResponse,
@@ -28,6 +29,26 @@ pub enum PushOutcome {
     ObjectNotFound(String),
     /// Mutation ID was previously processed with an incompatible payload.
     ReplayMismatch(String),
+}
+
+/// Result of validating a bearer session token against the database (ZK-070).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionValidationResult {
+    /// Token is valid and maps to an active session.
+    Valid {
+        /// Account ID owning the session.
+        account_id: Uuid,
+        /// Optional associated device ID.
+        device_id: Option<Uuid>,
+        /// Session unique identifier.
+        session_id: Uuid,
+    },
+    /// Token exists but has expired.
+    Expired,
+    /// Token exists but has been explicitly revoked.
+    Revoked,
+    /// Associated device has been revoked.
+    DeviceRevoked,
 }
 
 /// Computes a deterministic 32-byte cryptographic digest of the mutation request payload.
@@ -766,6 +787,336 @@ impl ServerDb {
             has_more,
         })
     }
+
+    /// Creates a new authentication session for `account_id` and returns the session metadata and secret token.
+    ///
+    /// In accordance with SEC-003, only the BLAKE2s digest (`token_hash`) is persisted in the database;
+    /// the secret token is returned to the client once.
+    pub async fn create_session(
+        &self,
+        account_id: Uuid,
+        device_id: Option<Uuid>,
+        display_name: Option<String>,
+        expires_in_secs: Option<i64>,
+    ) -> Result<(AuthenticatedSession, AuthToken), DbError> {
+        self.ensure_account(account_id).await?;
+
+        // If device_id is provided, ensure device is registered and not revoked
+        if let Some(dev_id) = device_id {
+            if self.is_device_revoked(account_id, dev_id).await? {
+                return Err(DbError::SchemaVerificationFailed(
+                    "cannot create session for a revoked device".to_string(),
+                ));
+            }
+        }
+
+        let session_id = Uuid::new_v4();
+        let tok1 = Uuid::new_v4().simple();
+        let tok2 = Uuid::new_v4().simple();
+        let raw_token = format!("zk_sess_{tok1}{tok2}");
+        let token_hash: [u8; 32] = Blake2s256::digest(raw_token.as_bytes()).into();
+
+        let conn = self.conn.lock().await;
+
+        let acc_str = account_id.to_string();
+        let sess_str = session_id.to_string();
+        let dev_str = device_id.map(|d| d.to_string());
+
+        let expires_sql = match expires_in_secs {
+            Some(secs) => {
+                if secs >= 0 {
+                    format!("datetime('now', '+{secs} seconds')")
+                } else {
+                    format!("datetime('now', '{secs} seconds')")
+                }
+            }
+            None => "NULL".to_string(),
+        };
+
+        let insert_sql = format!(
+            "INSERT INTO sessions (
+                session_id, account_id, device_id, token_hash, display_name, created_at, expires_at, revoked_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, CURRENT_TIMESTAMP, {expires_sql}, NULL)"
+        );
+
+        conn.execute(
+            &insert_sql,
+            rusqlite::params![
+                sess_str,
+                acc_str,
+                dev_str,
+                token_hash.as_slice(),
+                display_name,
+            ],
+        )?;
+
+        let (created_at, expires_at): (String, Option<String>) = conn.query_row(
+            "SELECT created_at, expires_at FROM sessions WHERE session_id = ?1",
+            [&sess_str],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+
+        let session = AuthenticatedSession {
+            session_id,
+            account_id,
+            device_id,
+            display_name,
+            created_at,
+            expires_at,
+            is_revoked: false,
+        };
+
+        Ok((session, AuthToken::new(raw_token)))
+    }
+
+    /// Validates a raw bearer token against stored session digests.
+    pub async fn validate_session_token(
+        &self,
+        raw_token: &str,
+    ) -> Result<Option<SessionValidationResult>, DbError> {
+        let token_hash: [u8; 32] = Blake2s256::digest(raw_token.as_bytes()).into();
+        let conn = self.conn.lock().await;
+
+        let query = "SELECT session_id, account_id, device_id, revoked_at,
+                            (expires_at IS NOT NULL AND expires_at <= CURRENT_TIMESTAMP) AS is_expired
+                     FROM sessions WHERE token_hash = ?1";
+
+        let mut stmt = conn.prepare(query)?;
+        let mut rows = stmt.query([token_hash.as_slice()])?;
+
+        if let Some(row) = rows.next()? {
+            let session_id: String = row.get(0)?;
+            let account_id: String = row.get(1)?;
+            let device_id: Option<String> = row.get(2)?;
+            let revoked_at: Option<String> = row.get(3)?;
+            let is_expired: bool = row.get(4)?;
+
+            let session_id =
+                Uuid::parse_str(&session_id).map_err(|e| DbError::InvalidUuid(e.to_string()))?;
+            let account_id =
+                Uuid::parse_str(&account_id).map_err(|e| DbError::InvalidUuid(e.to_string()))?;
+            let device_id = match device_id {
+                Some(d) => {
+                    Some(Uuid::parse_str(&d).map_err(|e| DbError::InvalidUuid(e.to_string()))?)
+                }
+                None => None,
+            };
+
+            if revoked_at.is_some() {
+                return Ok(Some(SessionValidationResult::Revoked));
+            }
+
+            if is_expired {
+                return Ok(Some(SessionValidationResult::Expired));
+            }
+
+            // If device_id is present, check whether device is revoked
+            if let Some(dev_id) = device_id {
+                let dev_revoked: bool = conn.query_row(
+                    "SELECT (revoked_at IS NOT NULL) FROM devices WHERE account_id = ?1 AND device_id = ?2",
+                    rusqlite::params![account_id.to_string(), dev_id.to_string()],
+                    |r| r.get(0),
+                ).unwrap_or(false);
+
+                if dev_revoked {
+                    return Ok(Some(SessionValidationResult::DeviceRevoked));
+                }
+            }
+
+            return Ok(Some(SessionValidationResult::Valid {
+                account_id,
+                device_id,
+                session_id,
+            }));
+        }
+
+        Ok(None)
+    }
+
+    /// Revokes a specific session.
+    pub async fn revoke_session(
+        &self,
+        account_id: Uuid,
+        session_id: Uuid,
+    ) -> Result<bool, DbError> {
+        let conn = self.conn.lock().await;
+        let changed = conn.execute(
+            "UPDATE sessions SET revoked_at = CURRENT_TIMESTAMP
+             WHERE account_id = ?1 AND session_id = ?2 AND revoked_at IS NULL",
+            rusqlite::params![account_id.to_string(), session_id.to_string()],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Revokes all active sessions for an account.
+    pub async fn revoke_all_sessions_for_account(
+        &self,
+        account_id: Uuid,
+    ) -> Result<usize, DbError> {
+        let conn = self.conn.lock().await;
+        let count = conn.execute(
+            "UPDATE sessions SET revoked_at = CURRENT_TIMESTAMP
+             WHERE account_id = ?1 AND revoked_at IS NULL",
+            [account_id.to_string()],
+        )?;
+        Ok(count)
+    }
+
+    /// Revokes all active sessions associated with a specific device.
+    pub async fn revoke_device_sessions(
+        &self,
+        account_id: Uuid,
+        device_id: Uuid,
+    ) -> Result<usize, DbError> {
+        let conn = self.conn.lock().await;
+        let count = conn.execute(
+            "UPDATE sessions SET revoked_at = CURRENT_TIMESTAMP
+             WHERE account_id = ?1 AND device_id = ?2 AND revoked_at IS NULL",
+            rusqlite::params![account_id.to_string(), device_id.to_string()],
+        )?;
+        Ok(count)
+    }
+
+    /// Registers or updates a device for an account.
+    pub async fn register_device(
+        &self,
+        account_id: Uuid,
+        device_id: Uuid,
+        display_name: Option<&str>,
+    ) -> Result<DeviceRow, DbError> {
+        self.ensure_account(account_id).await?;
+        let conn = self.conn.lock().await;
+
+        let acc_str = account_id.to_string();
+        let dev_str = device_id.to_string();
+
+        conn.execute(
+            "INSERT INTO devices (account_id, device_id, display_name, created_at, last_seen, last_ack_server_seq)
+             VALUES (?1, ?2, ?3, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 0)
+             ON CONFLICT (account_id, device_id) DO UPDATE SET
+                 display_name = COALESCE(excluded.display_name, devices.display_name),
+                 last_seen = CURRENT_TIMESTAMP",
+            rusqlite::params![acc_str, dev_str, display_name],
+        )?;
+
+        let row = conn.query_row(
+            "SELECT account_id, device_id, display_name, created_at, last_seen, last_ack_server_seq, revoked_at
+             FROM devices WHERE account_id = ?1 AND device_id = ?2",
+            rusqlite::params![acc_str, dev_str],
+            |r| {
+                let acc: String = r.get(0)?;
+                let dev: String = r.get(1)?;
+                Ok(DeviceRow {
+                    account_id: Uuid::parse_str(&acc).unwrap_or_default(),
+                    device_id: Uuid::parse_str(&dev).unwrap_or_default(),
+                    display_name: r.get(2)?,
+                    created_at: r.get(3)?,
+                    last_seen: r.get(4)?,
+                    last_ack_server_seq: r.get(5)?,
+                    revoked_at: r.get(6)?,
+                })
+            },
+        )?;
+
+        Ok(row)
+    }
+
+    /// Revokes a device and all its active sessions.
+    pub async fn revoke_device(&self, account_id: Uuid, device_id: Uuid) -> Result<(), DbError> {
+        let conn = self.conn.lock().await;
+        let acc_str = account_id.to_string();
+        let dev_str = device_id.to_string();
+
+        conn.execute(
+            "UPDATE devices SET revoked_at = CURRENT_TIMESTAMP
+             WHERE account_id = ?1 AND device_id = ?2",
+            rusqlite::params![acc_str, dev_str],
+        )?;
+
+        conn.execute(
+            "UPDATE sessions SET revoked_at = CURRENT_TIMESTAMP
+             WHERE account_id = ?1 AND device_id = ?2 AND revoked_at IS NULL",
+            rusqlite::params![acc_str, dev_str],
+        )?;
+
+        Ok(())
+    }
+
+    /// Returns true if the device is revoked.
+    pub async fn is_device_revoked(
+        &self,
+        account_id: Uuid,
+        device_id: Uuid,
+    ) -> Result<bool, DbError> {
+        let conn = self.conn.lock().await;
+        let revoked: bool = conn.query_row(
+            "SELECT (revoked_at IS NOT NULL) FROM devices WHERE account_id = ?1 AND device_id = ?2",
+            rusqlite::params![account_id.to_string(), device_id.to_string()],
+            |r| r.get(0),
+        ).unwrap_or(false);
+
+        Ok(revoked)
+    }
+
+    /// Lists all devices for an account.
+    pub async fn list_devices(&self, account_id: Uuid) -> Result<Vec<DeviceRow>, DbError> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT account_id, device_id, display_name, created_at, last_seen, last_ack_server_seq, revoked_at
+             FROM devices WHERE account_id = ?1 ORDER BY created_at ASC",
+        )?;
+
+        let rows = stmt.query_map([account_id.to_string()], |r| {
+            let acc: String = r.get(0)?;
+            let dev: String = r.get(1)?;
+            Ok(DeviceRow {
+                account_id: Uuid::parse_str(&acc).unwrap_or_default(),
+                device_id: Uuid::parse_str(&dev).unwrap_or_default(),
+                display_name: r.get(2)?,
+                created_at: r.get(3)?,
+                last_seen: r.get(4)?,
+                last_ack_server_seq: r.get(5)?,
+                revoked_at: r.get(6)?,
+            })
+        })?;
+
+        let mut devices = Vec::new();
+        for d in rows {
+            devices.push(d?);
+        }
+        Ok(devices)
+    }
+
+    /// Lists all sessions for an account.
+    pub async fn list_sessions(&self, account_id: Uuid) -> Result<Vec<SessionRow>, DbError> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT session_id, account_id, device_id, token_hash, display_name, created_at, expires_at, revoked_at
+             FROM sessions WHERE account_id = ?1 ORDER BY created_at DESC",
+        )?;
+
+        let rows = stmt.query_map([account_id.to_string()], |r| {
+            let sess: String = r.get(0)?;
+            let acc: String = r.get(1)?;
+            let dev: Option<String> = r.get(2)?;
+            Ok(SessionRow {
+                session_id: Uuid::parse_str(&sess).unwrap_or_default(),
+                account_id: Uuid::parse_str(&acc).unwrap_or_default(),
+                device_id: dev.and_then(|d| Uuid::parse_str(&d).ok()),
+                token_hash: r.get(3)?,
+                display_name: r.get(4)?,
+                created_at: r.get(5)?,
+                expires_at: r.get(6)?,
+                revoked_at: r.get(7)?,
+            })
+        })?;
+
+        let mut sessions = Vec::new();
+        for s in rows {
+            sessions.push(s?);
+        }
+        Ok(sessions)
+    }
 }
 
 #[cfg(test)]
@@ -1383,6 +1734,103 @@ mod tests {
         assert!(
             pull_b.changes.is_empty(),
             "account B must not see account A's changes"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_session_lifecycle_and_validation() {
+        let db = ServerDb::new_in_memory().unwrap();
+        let acc_id = Uuid::new_v4();
+
+        // 1. Create active session
+        let (sess, token) = db
+            .create_session(acc_id, None, Some("CLI test".to_string()), Some(3600))
+            .await
+            .unwrap();
+
+        assert_eq!(sess.account_id, acc_id);
+        assert!(!sess.is_revoked);
+        assert!(sess.expires_at.is_some());
+
+        // 2. Validate token
+        let res = db
+            .validate_session_token(token.expose_secret())
+            .await
+            .unwrap();
+        match res {
+            Some(SessionValidationResult::Valid {
+                account_id,
+                device_id,
+                session_id,
+            }) => {
+                assert_eq!(account_id, acc_id);
+                assert_eq!(device_id, None);
+                assert_eq!(session_id, sess.session_id);
+            }
+            other => panic!("expected Valid, got {other:?}"),
+        }
+
+        // 3. Revoke session
+        let revoked = db.revoke_session(acc_id, sess.session_id).await.unwrap();
+        assert!(revoked);
+
+        // 4. Validate again -> Revoked
+        let res_revoked = db
+            .validate_session_token(token.expose_secret())
+            .await
+            .unwrap();
+        assert_eq!(res_revoked, Some(SessionValidationResult::Revoked));
+    }
+
+    #[tokio::test]
+    async fn test_device_registration_and_revocation_cascades_to_sessions() {
+        let db = ServerDb::new_in_memory().unwrap();
+        let acc_id = Uuid::new_v4();
+        let dev_id = Uuid::new_v4();
+
+        // 1. Register device
+        let dev_row = db
+            .register_device(acc_id, dev_id, Some("Laptop"))
+            .await
+            .unwrap();
+        assert_eq!(dev_row.device_id, dev_id);
+        assert_eq!(dev_row.display_name, Some("Laptop".to_string()));
+
+        // 2. Create session linked to device
+        let (sess, token) = db
+            .create_session(
+                acc_id,
+                Some(dev_id),
+                Some("Laptop session".to_string()),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(sess.device_id, Some(dev_id));
+
+        // 3. Verify session is valid
+        let res = db
+            .validate_session_token(token.expose_secret())
+            .await
+            .unwrap();
+        assert!(matches!(res, Some(SessionValidationResult::Valid { .. })));
+
+        // 4. Revoke device
+        db.revoke_device(acc_id, dev_id).await.unwrap();
+        assert!(db.is_device_revoked(acc_id, dev_id).await.unwrap());
+
+        // 5. Session validation reflects revocation (either Revoked or DeviceRevoked)
+        let res_dev_rev = db
+            .validate_session_token(token.expose_secret())
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                res_dev_rev,
+                Some(SessionValidationResult::Revoked)
+                    | Some(SessionValidationResult::DeviceRevoked)
+            ),
+            "revoking device must invalidate session"
         );
     }
 }

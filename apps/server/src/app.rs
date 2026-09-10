@@ -143,9 +143,7 @@ async fn security_headers_middleware(
 
 /// Constructs the top-level Axum [`Router`] with routes, state, and security middleware.
 pub fn create_app(state: AppState) -> Router {
-    Router::new()
-        .route("/health", get(health_handler))
-        .route("/v1/health", get(health_handler))
+    let protected_routes = Router::new()
         .route(
             "/v1/vault/bootstrap",
             get(get_vault_bootstrap_handler).post(create_vault_bootstrap_handler),
@@ -153,6 +151,15 @@ pub fn create_app(state: AppState) -> Router {
         .route("/v1/sync/push", post(push_mutation_handler))
         .route("/v1/sync/changes", get(pull_changes_handler))
         .route("/v1/sync/pull", get(pull_changes_handler))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::auth::auth_middleware,
+        ));
+
+    Router::new()
+        .route("/health", get(health_handler))
+        .route("/v1/health", get(health_handler))
+        .merge(protected_routes)
         .fallback(fallback_not_found)
         .layer(axum::middleware::from_fn(security_headers_middleware))
         .layer(axum::middleware::from_fn(redacted_trace_middleware))

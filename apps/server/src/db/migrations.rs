@@ -16,6 +16,9 @@ pub const MIGRATION_003_SQL: &str =
 pub const MIGRATION_004_SQL: &str =
     include_str!("../../../../migrations/004_mutation_idempotency.sql");
 
+/// Raw SQL contents of migration 007 (server sessions).
+pub const MIGRATION_007_SQL: &str = include_str!("../../../../migrations/007_server_sessions.sql");
+
 /// A versioned SQL schema migration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Migration {
@@ -43,6 +46,11 @@ pub const SERVER_MIGRATIONS: &[Migration] = &[
         version: 4,
         name: "004_mutation_idempotency",
         sql: MIGRATION_004_SQL,
+    },
+    Migration {
+        version: 7,
+        name: "007_server_sessions",
+        sql: MIGRATION_007_SQL,
     },
 ];
 
@@ -120,9 +128,9 @@ mod tests {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
 
-        // First migration run applies versions 2, 3, and 4
+        // First migration run applies versions 2, 3, 4, and 7
         let applied1 = run_server_migrations(&mut conn).unwrap();
-        assert_eq!(applied1, vec![2, 3, 4]);
+        assert_eq!(applied1, vec![2, 3, 4, 7]);
 
         // Schema verification passes
         verify_database_schema(&conn).unwrap();

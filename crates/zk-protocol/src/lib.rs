@@ -1,6 +1,7 @@
 //! Protocol types, constants, error codes, and serialization models
 //! for the zero-knowledge notes system.
 
+pub mod auth;
 pub mod constants;
 pub mod envelope;
 pub mod kind;
@@ -8,6 +9,7 @@ pub mod note;
 pub mod sync;
 pub mod vault;
 
+pub use auth::{AuthToken, AuthenticatedSession, SessionResponse, REDACTED_TOKEN};
 pub use constants::*;
 pub use envelope::{EncryptedEnvelope, EncryptedKeyContainer, EncryptedPayloadContainer};
 pub use kind::{ObjectKind, UnknownObjectKind};
@@ -78,6 +80,9 @@ mod tests {
     fn test_error_constants() {
         assert_eq!(ERROR_AUTH_REQUIRED, "AUTH_REQUIRED");
         assert_eq!(ERROR_AUTH_FORBIDDEN, "AUTH_FORBIDDEN");
+        assert_eq!(ERROR_AUTH_EXPIRED, "AUTH_EXPIRED");
+        assert_eq!(ERROR_AUTH_REVOKED, "AUTH_REVOKED");
+        assert_eq!(ERROR_DEVICE_REVOKED, "DEVICE_REVOKED");
         assert_eq!(ERROR_VAULT_LOCKED, "VAULT_LOCKED");
         assert_eq!(
             ERROR_CRYPTO_UNSUPPORTED_VERSION,

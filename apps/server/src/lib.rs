@@ -14,7 +14,7 @@ pub mod routes;
 pub mod server;
 
 pub use app::{create_app, AppState, ErrorResponse};
-pub use auth::{AuthError, AuthenticatedAccount};
+pub use auth::{auth_middleware, authenticate_bearer_token, AuthError, AuthenticatedAccount};
 pub use config::{LogFormat, ServerConfig};
 pub use error::{ConfigError, DbError, ServerError};
 
