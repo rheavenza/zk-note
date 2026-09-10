@@ -1787,7 +1787,7 @@ Implementation notes:
 ---
 
 ## ZK-067 — Web sync status
-Status: TODO  
+Status: DONE  
 Priority: P1  
 Dependencies: ZK-065, M5
 
@@ -1805,6 +1805,14 @@ error
 ```
 
 without leaking note content.
+
+Completion notes:
+- Created `SyncStore` and `SyncProvider` in `apps/web/src/context/SyncContext.tsx` handling all 6 required states: `offline`, `syncing`, `synced`, `pending changes`, `conflict`, and `error`.
+- Implemented `sanitizeSyncErrorMessage` to strictly redact and sanitize error messages, guaranteeing note titles, note content, and auth tokens are never leaked in UI error states or logs (SEC-001, SEC-003).
+- Built `SyncStatusIndicator` in `apps/web/src/components/SyncStatusIndicator.tsx` featuring status icons, exact labels, queue and conflict badge counts, and an interactive popover detailing sanitized sync metrics, a manual "Sync Now" trigger, and an offline mode toggle.
+- Integrated `SyncStatusIndicator` directly into `NotesWorkspace` header navbar.
+- Created `apps/web/test/sync-status.test.tsx` verifying all 6 sync states, state transitions, and zero-knowledge leak-free guarantees.
+- Ran `./scripts/ci.sh`: all 8 CI quality gates pass cleanly (47/47 web tests pass).
 
 ---
 

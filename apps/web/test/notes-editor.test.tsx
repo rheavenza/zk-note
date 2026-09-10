@@ -357,7 +357,7 @@ test("NotesWorkspace renders navbar, sidebar, and layout", () => {
   );
 
   assert.ok(html.includes("Zero-Knowledge Notes"));
-  assert.ok(html.includes("Offline Ready"));
+  assert.ok(html.includes("zk-sync-badge"));
   assert.ok(html.includes("Notes"));
   assert.ok(html.includes("+ New Note"));
 });

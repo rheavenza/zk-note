@@ -13,6 +13,7 @@ import { MarkdownEditor } from "./MarkdownEditor.js";
 import { LockVaultButton, VaultStatusBadge } from "./UnlockScreen.js";
 import { SearchBar } from "./SearchBar.js";
 import { SearchModal } from "./SearchModal.js";
+import { SyncStatusIndicator } from "./SyncStatusIndicator.js";
 
 export interface NotesWorkspaceProps {
   className?: string;
@@ -32,9 +33,7 @@ export const NotesWorkspace: React.FC<NotesWorkspaceProps> = ({ className }) => 
           <h1 style={{ margin: 0, fontSize: "16px", fontWeight: 700, color: "#111827" }}>
             Zero-Knowledge Notes
           </h1>
-          <span style={offlineBadgeStyle}>
-            ● Offline Ready (Encrypted Locally)
-          </span>
+          <SyncStatusIndicator />
         </div>
 
         {/* Local in-memory search bar */}
@@ -85,15 +84,6 @@ const navbarStyle: React.CSSProperties = {
   boxSizing: "border-box",
 };
 
-const offlineBadgeStyle: React.CSSProperties = {
-  fontSize: "11px",
-  fontWeight: 600,
-  color: "#059669",
-  backgroundColor: "#ecfdf5",
-  padding: "2px 8px",
-  borderRadius: "12px",
-  border: "1px solid #a7f3d0",
-};
 
 const mainSplitStyle: React.CSSProperties = {
   flex: 1,
