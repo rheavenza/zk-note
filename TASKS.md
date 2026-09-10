@@ -1839,7 +1839,7 @@ Completion notes:
 ---
 
 ## ZK-069 — Browser security headers/CSP
-Status: TODO  
+Status: DONE  
 Priority: P0  
 Dependencies: ZK-065
 
@@ -1850,6 +1850,14 @@ Acceptance criteria:
 - no inline unsafe script unless explicitly justified;
 - clickjacking/content-type hardening;
 - deployment documentation.
+
+Completion notes:
+- Implemented `security_headers_middleware` in `apps/server/src/app.rs` injecting restrictive Content Security Policy (`default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data: blob:; font-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; upgrade-insecure-requests;`), anti-clickjacking headers (`X-Frame-Options: DENY`, `frame-ancestors 'none'`), MIME-type protection (`X-Content-Type-Options: nosniff`), zero-leakage referrer policy (`Referrer-Policy: no-referrer`), cross-origin isolation (`Cross-Origin-Opener-Policy: same-origin`, `Cross-Origin-Embedder-Policy: require-corp`, `Cross-Origin-Resource-Policy: same-origin`), hardware lock-down (`Permissions-Policy`), and HSTS.
+- Created hardened `apps/web/index.html` with CSP meta tags, `nosniff`, `no-referrer`, zero third-party script requirements, and zero inline scripts.
+- Authored production-ready deployment configurations in `deploy/nginx/security-headers.conf`, `deploy/nginx/notes.conf`, and `deploy/caddy/Caddyfile`.
+- Authored comprehensive documentation in `docs/deployment/web-security.md` covering threat model, header rationale, WASM memory isolation, and multi-platform deployment instructions.
+- Added tests in `apps/server/src/app.rs` (`test_browser_security_headers_and_csp`) and `apps/web/test/security-headers.test.ts` verifying header presence, strict CSP directives, zero external script tags, and zero third-party runtime dependencies.
+- Passed all 8 CI quality gates via `./scripts/ci.sh` (64/64 web tests pass).
 
 ---
 

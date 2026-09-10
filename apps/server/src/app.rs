@@ -73,6 +73,74 @@ async fn request_id_middleware(
     resp
 }
 
+/// Middleware that injects comprehensive browser security headers and strict CSP (ZK-069).
+async fn security_headers_middleware(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let mut resp = next.run(req).await;
+    let headers = resp.headers_mut();
+
+    // 1. Restrictive Content Security Policy (CSP)
+    // - script-src 'self' 'wasm-unsafe-eval' strictly permits origin scripts + WASM compilation.
+    // - default-src 'none', object-src 'none', frame-ancestors 'none'.
+    // - Zero third-party scripts, zero runtime analytics.
+    headers.insert(
+        HeaderName::from_static("content-security-policy"),
+        HeaderValue::from_static(
+            "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data: blob:; font-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; upgrade-insecure-requests;"
+        ),
+    );
+
+    // 2. Anti-Clickjacking Hardening
+    headers.insert(
+        HeaderName::from_static("x-frame-options"),
+        HeaderValue::from_static("DENY"),
+    );
+
+    // 3. MIME-Type Sniffing Protection
+    headers.insert(
+        HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static("nosniff"),
+    );
+
+    // 4. Referrer Policy (Leak prevention)
+    headers.insert(
+        HeaderName::from_static("referrer-policy"),
+        HeaderValue::from_static("no-referrer"),
+    );
+
+    // 5. Cross-Origin Browsing Context Isolation (Spectre / WASM memory protection)
+    headers.insert(
+        HeaderName::from_static("cross-origin-opener-policy"),
+        HeaderValue::from_static("same-origin"),
+    );
+    headers.insert(
+        HeaderName::from_static("cross-origin-embedder-policy"),
+        HeaderValue::from_static("require-corp"),
+    );
+    headers.insert(
+        HeaderName::from_static("cross-origin-resource-policy"),
+        HeaderValue::from_static("same-origin"),
+    );
+
+    // 6. Permissions Policy (Hardware / Sensor API lock-down)
+    headers.insert(
+        HeaderName::from_static("permissions-policy"),
+        HeaderValue::from_static(
+            "accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()"
+        ),
+    );
+
+    // 7. Strict-Transport-Security (HSTS)
+    headers.insert(
+        HeaderName::from_static("strict-transport-security"),
+        HeaderValue::from_static("max-age=63072000; includeSubDomains; preload"),
+    );
+
+    resp
+}
+
 /// Constructs the top-level Axum [`Router`] with routes, state, and security middleware.
 pub fn create_app(state: AppState) -> Router {
     Router::new()
@@ -86,6 +154,7 @@ pub fn create_app(state: AppState) -> Router {
         .route("/v1/sync/changes", get(pull_changes_handler))
         .route("/v1/sync/pull", get(pull_changes_handler))
         .fallback(fallback_not_found)
+        .layer(axum::middleware::from_fn(security_headers_middleware))
         .layer(axum::middleware::from_fn(redacted_trace_middleware))
         .layer(axum::middleware::from_fn(request_id_middleware))
         .with_state(state)
@@ -173,5 +242,58 @@ mod tests {
             .unwrap();
         let err: ErrorResponse = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(err.code, zk_protocol::ERROR_OBJECT_NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_browser_security_headers_and_csp() {
+        let config = ServerConfig::default();
+        let state = AppState::new_in_memory(config).unwrap();
+        let app = create_app(state);
+
+        let req = Request::builder()
+            .uri("/health")
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let headers = resp.headers();
+
+        // 1. CSP
+        let csp = headers
+            .get("content-security-policy")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(csp.contains("default-src 'none'"));
+        assert!(csp.contains("script-src 'self' 'wasm-unsafe-eval'"));
+        assert!(csp.contains("frame-ancestors 'none'"));
+        assert!(!csp.contains("unsafe-inline") || csp.contains("style-src 'self' 'unsafe-inline'"));
+        assert!(!csp.contains("script-src 'self' 'unsafe-inline'"));
+
+        // 2. Clickjacking & MIME-type hardening
+        assert_eq!(headers.get("x-frame-options").unwrap(), "DENY");
+        assert_eq!(headers.get("x-content-type-options").unwrap(), "nosniff");
+        assert_eq!(headers.get("referrer-policy").unwrap(), "no-referrer");
+
+        // 3. Spectre / Cross-Origin Isolation
+        assert_eq!(
+            headers.get("cross-origin-opener-policy").unwrap(),
+            "same-origin"
+        );
+        assert_eq!(
+            headers.get("cross-origin-embedder-policy").unwrap(),
+            "require-corp"
+        );
+        assert_eq!(
+            headers.get("cross-origin-resource-policy").unwrap(),
+            "same-origin"
+        );
+
+        // 4. Permissions Policy & HSTS
+        assert!(headers.contains_key("permissions-policy"));
+        assert!(headers.contains_key("strict-transport-security"));
     }
 }

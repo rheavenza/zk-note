@@ -459,7 +459,9 @@ test("Wrong recovery key fails closed in both native and WASM", () => {
 
 test("Corrupted recovery phrase checksum fails closed in both native and WASM", () => {
     const initRes = zk.init_vault_with_params("pass", TEST_KDF_PARAMS_JSON);
-    const corruptedPhrase = initRes.recovery_phrase.slice(0, -2) + "00";
+    const lastChar = initRes.recovery_phrase.slice(-1);
+    const flip = lastChar === "0" ? "1" : "0";
+    const corruptedPhrase = initRes.recovery_phrase.slice(0, -1) + flip;
 
     const nativeFail = callNative([
         "unlock-recovery",
@@ -628,3 +630,53 @@ test("Malformed JSON payload fails closed in both native and WASM", () => {
         zk.wasm_decrypt_raw(vkB64, brokenJson);
     });
 });
+
+test("M6 Gate: CLI create -> sync -> web pull/decrypt -> web edit offline -> sync -> CLI pull/decrypt", () => {
+    const vkBytes = Buffer.alloc(32, 0x77);
+    const vkB64 = vkBytes.toString("base64");
+    const noteId = "note-m6-gate-flow";
+
+    // 1. CLI create: Native Rust creates and encrypts initial note
+    const cliCreate = callNative(["encrypt-note"], {
+        vault_key_b64: vkB64,
+        object_id: noteId,
+        title: "CLI Note Title",
+        body: "Created natively via CLI terminal client.",
+        tags: ["cli", "sync"],
+    });
+    assert.ok(cliCreate.ok, cliCreate.error);
+    const rev1EnvelopeJson = cliCreate.data.envelope_json;
+
+    // 2. Sync to Web: Web WASM pulls and decrypts note
+    const webPulledNote = zk.wasm_decrypt_envelope(vkB64, rev1EnvelopeJson);
+    assert.equal(webPulledNote.id, noteId);
+    assert.equal(webPulledNote.title, "CLI Note Title");
+    assert.equal(webPulledNote.body, "Created natively via CLI terminal client.");
+    assert.deepEqual(webPulledNote.tags, ["cli", "sync"]);
+
+    // 3. Web edit offline: User edits note in browser and encrypts via WASM
+    const editedTitle = "CLI Note Title (Edited in Web)";
+    const editedBody = "Updated offline in browser web client with zero-knowledge encryption.";
+    const editedTags = ["cli", "sync", "web-offline"];
+
+    const webEnc = zk.wasm_encrypt_envelope(
+        vkB64,
+        noteId,
+        editedTitle,
+        editedBody,
+        editedTags
+    );
+    assert.ok(webEnc.length > 0);
+
+    // 4. Sync to CLI: Native Rust pulls and decrypts updated revision
+    const cliPull = callNative(["decrypt-note"], {
+        vault_key_b64: vkB64,
+        envelope_json: webEnc,
+    });
+    assert.ok(cliPull.ok, cliPull.error);
+    assert.equal(cliPull.data.id, noteId);
+    assert.equal(cliPull.data.title, editedTitle);
+    assert.equal(cliPull.data.body, editedBody);
+    assert.deepEqual(cliPull.data.tags, ["cli", "sync", "web-offline"]);
+});
+

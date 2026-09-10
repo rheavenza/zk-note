@@ -1,0 +1,36 @@
+# ==============================================================================
+# Production Caddyfile for Zero-Knowledge Notes (ZK-069)
+# ==============================================================================
+
+notes.example.com {
+    # Automatic HTTPS via Let's Encrypt / ZeroSSL
+
+    # Security Headers & CSP
+    header {
+        Content-Security-Policy "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data: blob:; font-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; upgrade-insecure-requests;"
+        X-Frame-Options "DENY"
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "no-referrer"
+        Cross-Origin-Opener-Policy "same-origin"
+        Cross-Origin-Embedder-Policy "require-corp"
+        Cross-Origin-Resource-Policy "same-origin"
+        Permissions-Policy "accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()"
+        Strict-Transport-Security "max-age=63072000; includeSubDomains; preload"
+    }
+
+    # API Backend Reverse Proxy (Rust Axum server)
+    handle /v1/* {
+        reverse_proxy 127.0.0.1:8080
+    }
+
+    handle /health {
+        reverse_proxy 127.0.0.1:8080
+    }
+
+    # Static Web Client Files
+    handle {
+        root * /var/www/zk-notes/web
+        try_files {path} /index.html
+        file_server
+    }
+}

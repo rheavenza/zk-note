@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Zero-Knowledge Notes</title>
+
+  <!--
+    Content Security Policy (ZK-069):
+    - default-src 'none': Default deny for all capabilities.
+    - script-src 'self' 'wasm-unsafe-eval': Only application-origin scripts and WebAssembly execution.
+      Strictly NO third-party script CDNs, NO external analytics, NO unsafe inline scripts.
+    - style-src 'self' 'unsafe-inline': Application origin styles and React inline style attributes.
+    - connect-src 'self': Network requests restricted strictly to application origin (SEC-001, SEC-002).
+    - img-src 'self' data: blob:: Application origin assets, data URIs, and decrypted blob attachments.
+    - font-src 'self': Only local fonts.
+    - object-src 'none': Disallow Flash/Java plugins.
+    - base-uri 'self': Prevent base tag injection.
+    - form-action 'self': Restrict form submissions.
+    - frame-ancestors 'none': Anti-clickjacking defense.
+    - upgrade-insecure-requests: Enforce HTTPS.
+  -->
+  <meta
+    http-equiv="Content-Security-Policy"
+    content="default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data: blob:; font-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; upgrade-insecure-requests;"
+  />
+
+  <!-- Content-Type MIME-sniffing protection -->
+  <meta http-equiv="X-Content-Type-Options" content="nosniff" />
+
+  <!-- Zero-leakage Referrer Policy -->
+  <meta name="referrer" content="no-referrer" />
+
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      height: 100%;
+      width: 100%;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background-color: #f9fafb;
+      color: #111827;
+    }
+    #root {
+      height: 100%;
+      width: 100%;
+    }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="module" src="./src/index.js"></script>
+</body>
+</html>
