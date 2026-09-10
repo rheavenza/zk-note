@@ -8,6 +8,7 @@ pub mod kind;
 pub mod note;
 pub mod sync;
 pub mod vault;
+pub mod webauthn;
 
 pub use auth::{AuthToken, AuthenticatedSession, SessionResponse, REDACTED_TOKEN};
 pub use constants::*;
@@ -19,6 +20,7 @@ pub use sync::{
     PushResponse,
 };
 pub use vault::{KdfParams, VaultBootstrap, WrappedVaultKey};
+pub use webauthn::*;
 
 /// Returns the crate name as a sanity check.
 #[must_use]

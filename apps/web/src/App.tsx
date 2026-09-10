@@ -15,6 +15,7 @@ import React, { useMemo } from "react";
 import { VaultWorkerClient } from "./worker/client.js";
 import { IndexedDbStorage } from "./storage/indexeddb.js";
 import { VaultProvider } from "./context/VaultContext.js";
+import { AuthProvider } from "./context/AuthContext.js";
 import { SyncProvider } from "./context/SyncContext.js";
 import { ConflictProvider } from "./context/ConflictContext.js";
 import { SearchProvider } from "./context/SearchContext.js";
@@ -25,6 +26,7 @@ import { NotesWorkspace } from "./components/NotesWorkspace.js";
 export interface AppProps {
   client?: VaultWorkerClient;
   storage?: IndexedDbStorage;
+  serverUrl?: string;
 }
 
 function createDefaultWorkerClient(): VaultWorkerClient {
@@ -42,24 +44,26 @@ function createDefaultWorkerClient(): VaultWorkerClient {
   return new VaultWorkerClient(dummyWorker);
 }
 
-export const App: React.FC<AppProps> = ({ client, storage }) => {
+export const App: React.FC<AppProps> = ({ client, storage, serverUrl }) => {
   const activeClient = useMemo(() => client || createDefaultWorkerClient(), [client]);
   const activeStorage = useMemo(() => storage || new IndexedDbStorage(), [storage]);
 
   return (
-    <VaultProvider client={activeClient} storage={activeStorage}>
-      <SyncProvider>
-        <ConflictProvider>
-          <SearchProvider>
-            <NotesProvider>
-              <UnlockScreen>
-                <NotesWorkspace />
-              </UnlockScreen>
-            </NotesProvider>
-          </SearchProvider>
-        </ConflictProvider>
-      </SyncProvider>
-    </VaultProvider>
+    <AuthProvider serverUrl={serverUrl}>
+      <VaultProvider client={activeClient} storage={activeStorage}>
+        <SyncProvider>
+          <ConflictProvider>
+            <SearchProvider>
+              <NotesProvider>
+                <UnlockScreen>
+                  <NotesWorkspace />
+                </UnlockScreen>
+              </NotesProvider>
+            </SearchProvider>
+          </ConflictProvider>
+        </SyncProvider>
+      </VaultProvider>
+    </AuthProvider>
   );
 };
 

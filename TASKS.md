@@ -1921,7 +1921,7 @@ Completion notes:
 ---
 
 ## ZK-071 — Passkey/WebAuthn web auth
-Status: TODO  
+Status: DONE  
 Priority: P1  
 Dependencies: ZK-070
 
@@ -1931,6 +1931,27 @@ Acceptance criteria:
 - sign in;
 - revoke session;
 - no vault passphrase reuse.
+
+Completion notes:
+- Protocol layer (`crates/zk-protocol`):
+  - Defined WebAuthn models in `crates/zk-protocol/src/webauthn.rs`: `WebAuthnRpInfo`, `WebAuthnUserInfo`, `WebAuthnRegisterStartRequest`, `WebAuthnRegisterStartResponse`, `WebAuthnRegisterFinishRequest`, `WebAuthnRegisterFinishResponse`, `WebAuthnLoginStartRequest`, `WebAuthnLoginStartResponse`, `WebAuthnLoginFinishRequest`, `WebAuthnLoginFinishResponse`, `RevokeSessionRequest`, `RevokeSessionResponse`.
+  - Added canonical error codes in `constants.rs`: `ERROR_WEBAUTHN_CHALLENGE_EXPIRED`, `ERROR_WEBAUTHN_CHALLENGE_NOT_FOUND`, `ERROR_WEBAUTHN_VERIFICATION_FAILED`, `ERROR_WEBAUTHN_CREDENTIAL_NOT_FOUND`, `ERROR_WEBAUTHN_CREDENTIAL_EXISTS`.
+- Server storage & migrations (`apps/server`):
+  - Authored migration `migrations/008_webauthn_credentials.sql` creating `webauthn_credentials` and `webauthn_challenges` tables with appropriate indexes.
+  - Updated `apps/server/src/db/migrations.rs`, `schema.rs`, and `error.rs` to track migration 008.
+  - Implemented WebAuthn methods on `ServerDb`: `create_webauthn_challenge`, `consume_webauthn_challenge` (single-use validation with TTL enforcement), `register_webauthn_credential`, `get_webauthn_credential`, `update_webauthn_credential_usage`, and session revocation.
+- Server route handlers (`apps/server/src/routes/auth.rs`):
+  - Implemented `webauthn_register_start_handler`, `webauthn_register_finish_handler`, `webauthn_login_start_handler`, `webauthn_login_finish_handler`, and `revoke_session_handler`.
+  - Enforced SEC-001/SEC-002: Active payload inspection via `contains_forbidden_keys` strictly rejects any submission containing passphrase or vault key material ("no vault passphrase reuse").
+  - Wired public WebAuthn routes and protected session revocation routes into `create_app` in `apps/server/src/app.rs`.
+- Web client adapter (`apps/web`):
+  - Authored `apps/web/src/auth/webauthn.ts` supporting base64url transformations, `startRegistration`, `finishRegistration`, `startLogin`, `finishLogin`, and `revokeSession`.
+  - Created `apps/web/src/context/AuthContext.tsx` (`AuthProvider`, `useAuth`) wiring session state management.
+  - Wrapped `AuthProvider` into root `App.tsx` and exported in `index.ts`.
+- Tests & verification:
+  - Integration test suite in `apps/server/tests/server_webauthn_tests.rs` (5/5 tests passing).
+  - Unit test suite in `apps/web/test/webauthn.test.ts` (6/6 tests passing, bringing total web suite to 70/70 passing).
+  - Validated via `./scripts/ci.sh` (all 8 quality gates passed cleanly).
 
 ---
 

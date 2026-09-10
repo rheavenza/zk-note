@@ -1,7 +1,10 @@
 //! Server database handle and vault bootstrap persistence.
 
 use crate::db::migrations::create_in_memory_db;
-use crate::db::schema::{DeviceRow, EncryptedObjectRow, ObjectHistoryRow, SessionRow};
+use crate::db::schema::{
+    DeviceRow, EncryptedObjectRow, ObjectHistoryRow, SessionRow, WebAuthnChallengeRecord,
+    WebAuthnCredentialRecord,
+};
 use crate::error::DbError;
 use base64ct::{Base64, Encoding};
 use rusqlite::Connection;
@@ -1116,6 +1119,203 @@ impl ServerDb {
             sessions.push(s?);
         }
         Ok(sessions)
+    }
+
+    /// Creates and persists a WebAuthn challenge for registration or login.
+    pub async fn create_webauthn_challenge(
+        &self,
+        challenge_id: Uuid,
+        challenge: &[u8],
+        account_id: Option<Uuid>,
+        purpose: &str,
+        ttl_seconds: i64,
+    ) -> Result<(), DbError> {
+        let conn = self.conn.lock().await;
+        let expires_sql = if ttl_seconds >= 0 {
+            format!("datetime('now', '+{ttl_seconds} seconds')")
+        } else {
+            format!("datetime('now', '{ttl_seconds} seconds')")
+        };
+        let acc_str = account_id.map(|id| id.to_string());
+
+        conn.execute(
+            &format!(
+                "INSERT INTO webauthn_challenges (
+                    challenge_id, challenge, account_id, purpose, created_at, expires_at
+                ) VALUES (?1, ?2, ?3, ?4, CURRENT_TIMESTAMP, {expires_sql})"
+            ),
+            rusqlite::params![challenge_id.to_string(), challenge, acc_str, purpose,],
+        )?;
+
+        Ok(())
+    }
+
+    /// Consumes and deletes a WebAuthn challenge, verifying that it exists, matches the expected purpose, and has not expired.
+    pub async fn consume_webauthn_challenge(
+        &self,
+        challenge_id: Uuid,
+        expected_purpose: &str,
+    ) -> Result<WebAuthnChallengeRecord, DbError> {
+        let conn = self.conn.lock().await;
+        let id_str = challenge_id.to_string();
+
+        let query = "SELECT challenge, account_id, purpose, created_at, expires_at,
+                            (expires_at <= CURRENT_TIMESTAMP) AS is_expired
+                     FROM webauthn_challenges WHERE challenge_id = ?1";
+
+        let mut stmt = conn.prepare(query)?;
+        let mut rows = stmt.query([&id_str])?;
+
+        if let Some(row) = rows.next()? {
+            let challenge: Vec<u8> = row.get(0)?;
+            let account_id_str: Option<String> = row.get(1)?;
+            let purpose: String = row.get(2)?;
+            let created_at: String = row.get(3)?;
+            let expires_at: String = row.get(4)?;
+            let is_expired: bool = row.get(5)?;
+
+            if is_expired {
+                // Clean up expired challenge
+                conn.execute(
+                    "DELETE FROM webauthn_challenges WHERE challenge_id = ?1",
+                    [&id_str],
+                )?;
+                return Err(DbError::ChallengeExpired);
+            }
+
+            if purpose != expected_purpose {
+                return Err(DbError::ChallengeNotFound);
+            }
+
+            // Challenge is valid; delete it so it cannot be replayed (single-use)
+            conn.execute(
+                "DELETE FROM webauthn_challenges WHERE challenge_id = ?1",
+                [&id_str],
+            )?;
+
+            let account_id = match account_id_str {
+                Some(s) => {
+                    Some(Uuid::parse_str(&s).map_err(|e| DbError::InvalidUuid(e.to_string()))?)
+                }
+                None => None,
+            };
+
+            Ok(WebAuthnChallengeRecord {
+                challenge_id,
+                challenge,
+                account_id,
+                purpose,
+                created_at,
+                expires_at,
+            })
+        } else {
+            Err(DbError::ChallengeNotFound)
+        }
+    }
+
+    /// Registers a new WebAuthn credential for an account.
+    pub async fn register_webauthn_credential(
+        &self,
+        credential_id: &[u8],
+        account_id: Uuid,
+        public_key: &[u8],
+        device_id: Option<Uuid>,
+        display_name: Option<String>,
+    ) -> Result<(), DbError> {
+        self.ensure_account(account_id).await?;
+        let conn = self.conn.lock().await;
+
+        let acc_str = account_id.to_string();
+        let dev_str = device_id.map(|d| d.to_string());
+
+        let res = conn.execute(
+            "INSERT INTO webauthn_credentials (
+                credential_id, account_id, public_key, sign_count, device_id, display_name, created_at, last_used_at
+            ) VALUES (?1, ?2, ?3, 0, ?4, ?5, CURRENT_TIMESTAMP, NULL)",
+            rusqlite::params![
+                credential_id,
+                acc_str,
+                public_key,
+                dev_str,
+                display_name,
+            ],
+        );
+
+        match res {
+            Ok(_) => Ok(()),
+            Err(rusqlite::Error::SqliteFailure(err, _))
+                if err.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                Err(DbError::CredentialAlreadyExists)
+            }
+            Err(e) => Err(DbError::Sqlite(e)),
+        }
+    }
+
+    /// Looks up a WebAuthn credential by its credential ID.
+    pub async fn get_webauthn_credential(
+        &self,
+        credential_id: &[u8],
+    ) -> Result<Option<WebAuthnCredentialRecord>, DbError> {
+        let conn = self.conn.lock().await;
+        let query = "SELECT account_id, public_key, sign_count, device_id, display_name, created_at, last_used_at
+                     FROM webauthn_credentials WHERE credential_id = ?1";
+
+        let mut stmt = conn.prepare(query)?;
+        let mut rows = stmt.query([credential_id])?;
+
+        if let Some(row) = rows.next()? {
+            let account_id_str: String = row.get(0)?;
+            let public_key: Vec<u8> = row.get(1)?;
+            let sign_count: i64 = row.get(2)?;
+            let device_id_str: Option<String> = row.get(3)?;
+            let display_name: Option<String> = row.get(4)?;
+            let created_at: String = row.get(5)?;
+            let last_used_at: Option<String> = row.get(6)?;
+
+            let account_id = Uuid::parse_str(&account_id_str)
+                .map_err(|e| DbError::InvalidUuid(e.to_string()))?;
+            let device_id = match device_id_str {
+                Some(d) => {
+                    Some(Uuid::parse_str(&d).map_err(|e| DbError::InvalidUuid(e.to_string()))?)
+                }
+                None => None,
+            };
+
+            Ok(Some(WebAuthnCredentialRecord {
+                credential_id: credential_id.to_vec(),
+                account_id,
+                public_key,
+                sign_count: sign_count as u64,
+                device_id,
+                display_name,
+                created_at,
+                last_used_at,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Updates the usage timestamp and signature counter for a WebAuthn credential.
+    pub async fn update_webauthn_credential_usage(
+        &self,
+        credential_id: &[u8],
+        new_sign_count: u64,
+    ) -> Result<(), DbError> {
+        let conn = self.conn.lock().await;
+        let changed = conn.execute(
+            "UPDATE webauthn_credentials
+             SET sign_count = ?1, last_used_at = CURRENT_TIMESTAMP
+             WHERE credential_id = ?2",
+            rusqlite::params![new_sign_count as i64, credential_id],
+        )?;
+
+        if changed == 0 {
+            return Err(DbError::CredentialNotFound);
+        }
+
+        Ok(())
     }
 }
 

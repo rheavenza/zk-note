@@ -151,14 +151,41 @@ pub fn create_app(state: AppState) -> Router {
         .route("/v1/sync/push", post(push_mutation_handler))
         .route("/v1/sync/changes", get(pull_changes_handler))
         .route("/v1/sync/pull", get(pull_changes_handler))
+        .route(
+            "/v1/auth/session/revoke",
+            post(crate::routes::auth::revoke_session_handler),
+        )
+        .route(
+            "/v1/auth/logout",
+            post(crate::routes::auth::revoke_session_handler),
+        )
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             crate::auth::auth_middleware,
         ));
 
+    let public_auth_routes = Router::new()
+        .route(
+            "/v1/auth/webauthn/register/start",
+            post(crate::routes::auth::webauthn_register_start_handler),
+        )
+        .route(
+            "/v1/auth/webauthn/register/finish",
+            post(crate::routes::auth::webauthn_register_finish_handler),
+        )
+        .route(
+            "/v1/auth/webauthn/login/start",
+            post(crate::routes::auth::webauthn_login_start_handler),
+        )
+        .route(
+            "/v1/auth/webauthn/login/finish",
+            post(crate::routes::auth::webauthn_login_finish_handler),
+        );
+
     Router::new()
         .route("/health", get(health_handler))
         .route("/v1/health", get(health_handler))
+        .merge(public_auth_routes)
         .merge(protected_routes)
         .fallback(fallback_not_found)
         .layer(axum::middleware::from_fn(security_headers_middleware))

@@ -11,6 +11,8 @@ export * from "./context/VaultContext.js";
 export * from "./context/NotesContext.js";
 export * from "./context/SearchContext.js";
 export * from "./context/SyncContext.js";
+export * from "./context/AuthContext.js";
+export * from "./auth/webauthn.js";
 export * from "./components/UnlockScreen.js";
 export * from "./components/MarkdownEditor.js";
 export * from "./components/NotesList.js";

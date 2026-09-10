@@ -77,6 +77,14 @@ pub enum DbError {
     InvalidBase64(String),
     /// Invalid UUID string.
     InvalidUuid(String),
+    /// WebAuthn challenge not found or already consumed.
+    ChallengeNotFound,
+    /// WebAuthn challenge expired.
+    ChallengeExpired,
+    /// WebAuthn credential not found.
+    CredentialNotFound,
+    /// WebAuthn credential already registered.
+    CredentialAlreadyExists,
 }
 
 impl fmt::Display for DbError {
@@ -95,6 +103,10 @@ impl fmt::Display for DbError {
             Self::Serialization(e) => write!(f, "serialization failure: {e}"),
             Self::InvalidBase64(msg) => write!(f, "invalid base64 encoding: {msg}"),
             Self::InvalidUuid(msg) => write!(f, "invalid UUID format: {msg}"),
+            Self::ChallengeNotFound => write!(f, "webauthn challenge not found or already used"),
+            Self::ChallengeExpired => write!(f, "webauthn challenge has expired"),
+            Self::CredentialNotFound => write!(f, "webauthn credential not found"),
+            Self::CredentialAlreadyExists => write!(f, "webauthn credential already registered"),
         }
     }
 }
@@ -108,7 +120,11 @@ impl std::error::Error for DbError {
             | Self::SchemaVerificationFailed(_)
             | Self::VaultAlreadyExists(_)
             | Self::InvalidBase64(_)
-            | Self::InvalidUuid(_) => None,
+            | Self::InvalidUuid(_)
+            | Self::ChallengeNotFound
+            | Self::ChallengeExpired
+            | Self::CredentialNotFound
+            | Self::CredentialAlreadyExists => None,
         }
     }
 }

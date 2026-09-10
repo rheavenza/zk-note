@@ -23,6 +23,8 @@ pub const TABLE_PROCESSED_MUTATIONS: &str = "processed_mutations";
 pub const TABLE_DEVICES: &str = "devices";
 pub const TABLE_ACCOUNT_SEQUENCES: &str = "account_sequences";
 pub const TABLE_SESSIONS: &str = "sessions";
+pub const TABLE_WEBAUTHN_CREDENTIALS: &str = "webauthn_credentials";
+pub const TABLE_WEBAUTHN_CHALLENGES: &str = "webauthn_challenges";
 pub const TABLE_SCHEMA_MIGRATIONS: &str = "schema_migrations";
 
 /// Index name constants.
@@ -32,6 +34,8 @@ pub const INDEX_PROCESSED_MUTATIONS_ACCOUNT_OBJECT: &str = "idx_processed_mutati
 pub const INDEX_DEVICES_ACCOUNT_LAST_ACK: &str = "idx_devices_account_last_ack";
 pub const INDEX_SESSIONS_ACCOUNT_ID: &str = "idx_sessions_account_id";
 pub const INDEX_SESSIONS_DEVICE_ID: &str = "idx_sessions_device_id";
+pub const INDEX_WEBAUTHN_ACCOUNT_ID: &str = "idx_webauthn_account_id";
+pub const INDEX_WEBAUTHN_CHALLENGES_EXPIRES: &str = "idx_webauthn_challenges_expires";
 
 /// All required table names defined in the schema.
 pub const ALL_TABLES: &[&str] = &[
@@ -44,6 +48,8 @@ pub const ALL_TABLES: &[&str] = &[
     TABLE_DEVICES,
     TABLE_ACCOUNT_SEQUENCES,
     TABLE_SESSIONS,
+    TABLE_WEBAUTHN_CREDENTIALS,
+    TABLE_WEBAUTHN_CHALLENGES,
 ];
 
 /// All required indexes defined in the schema.
@@ -54,6 +60,8 @@ pub const ALL_INDEXES: &[&str] = &[
     INDEX_DEVICES_ACCOUNT_LAST_ACK,
     INDEX_SESSIONS_ACCOUNT_ID,
     INDEX_SESSIONS_DEVICE_ID,
+    INDEX_WEBAUTHN_ACCOUNT_ID,
+    INDEX_WEBAUTHN_CHALLENGES_EXPIRES,
 ];
 
 /// Account record in database.
@@ -227,6 +235,44 @@ pub struct SessionRow {
     pub expires_at: Option<String>,
     /// Revocation timestamp, if revoked.
     pub revoked_at: Option<String>,
+}
+
+/// WebAuthn / Passkey credential record in database.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebAuthnCredentialRecord {
+    /// Opaque credential ID issued by the authenticator.
+    pub credential_id: Vec<u8>,
+    /// Owning account ID.
+    pub account_id: Uuid,
+    /// Public key bytes.
+    pub public_key: Vec<u8>,
+    /// Monotonically increasing signature counter.
+    pub sign_count: u64,
+    /// Optional associated device identifier.
+    pub device_id: Option<Uuid>,
+    /// Optional human-readable name (e.g. "MacBook Touch ID").
+    pub display_name: Option<String>,
+    /// Credential registration timestamp.
+    pub created_at: String,
+    /// Timestamp of most recent authentication.
+    pub last_used_at: Option<String>,
+}
+
+/// WebAuthn registration or login challenge record in database.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebAuthnChallengeRecord {
+    /// Challenge unique identifier.
+    pub challenge_id: Uuid,
+    /// Cryptographic challenge bytes.
+    pub challenge: Vec<u8>,
+    /// Associated account ID (if known).
+    pub account_id: Option<Uuid>,
+    /// Purpose: "register" or "login".
+    pub purpose: String,
+    /// Creation timestamp.
+    pub created_at: String,
+    /// Expiration timestamp.
+    pub expires_at: String,
 }
 
 /// Verifies that all expected tables and indexes exist in the connected database.

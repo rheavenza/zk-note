@@ -68,3 +68,13 @@ pub const ERROR_NETWORK_UNAVAILABLE: &str = "NETWORK_UNAVAILABLE";
 pub const ERROR_LOCAL_STORAGE_FAILURE: &str = "LOCAL_STORAGE_FAILURE";
 /// Internal server error.
 pub const ERROR_SERVER_FAILURE: &str = "SERVER_FAILURE";
+/// WebAuthn challenge has expired.
+pub const ERROR_WEBAUTHN_CHALLENGE_EXPIRED: &str = "WEBAUTHN_CHALLENGE_EXPIRED";
+/// WebAuthn challenge was not found or has already been used.
+pub const ERROR_WEBAUTHN_CHALLENGE_NOT_FOUND: &str = "WEBAUTHN_CHALLENGE_NOT_FOUND";
+/// WebAuthn signature or attestation verification failed.
+pub const ERROR_WEBAUTHN_VERIFICATION_FAILED: &str = "WEBAUTHN_VERIFICATION_FAILED";
+/// WebAuthn credential was not found for the requested identity.
+pub const ERROR_WEBAUTHN_CREDENTIAL_NOT_FOUND: &str = "WEBAUTHN_CREDENTIAL_NOT_FOUND";
+/// WebAuthn credential ID already registered.
+pub const ERROR_WEBAUTHN_CREDENTIAL_EXISTS: &str = "WEBAUTHN_CREDENTIAL_EXISTS";
