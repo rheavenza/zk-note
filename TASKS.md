@@ -1707,15 +1707,25 @@ Completion notes:
 ---
 
 ## ZK-064 — Unlock screen
-Status: TODO  
+Status: DONE  
 Priority: P0  
 Dependencies: ZK-062, ZK-063
 
 Acceptance criteria:
 
-- passphrase remains client-side;
-- clear locked/unlocked states;
-- failure does not reveal sensitive detail.
+- [x] passphrase remains client-side;
+- [x] clear locked/unlocked states;
+- [x] failure does not reveal sensitive detail.
+
+Implementation notes:
+- Created `VaultContext` and `VaultStore` in `apps/web/src/context/VaultContext.tsx` implementing the complete vault state machine (`UNINITIALIZED`, `LOCKED`, `UNLOCKING`, `UNLOCKED`) using React `useSyncExternalStore` and dynamic property getters.
+- Built `UnlockScreen`, `LockVaultButton`, and `VaultStatusBadge` in `apps/web/src/components/UnlockScreen.tsx`:
+  - Password inputs strictly use `type="password"`, `spellCheck={false}`, and proper `autoComplete` attributes, preventing cleartext exposure (SEC-001).
+  - Component state for passphrases and recovery phrase inputs is wiped immediately upon submission in a `finally` block to minimize in-memory retention.
+  - Initial vault creation workflow renders formatted 9-group recovery key with copy-to-clipboard functionality and mandatory acknowledgment checkbox before entering vault.
+  - Safe error sanitization strictly maps worker and crypto exceptions to non-revealing generic messages without leaking cipher parameters, AEAD tags, or stack traces (SEC-003, SEC-010).
+- Added comprehensive unit and integration test suite in `apps/web/test/unlock-screen.test.tsx` (7 tests covering SSR rendering, masked attributes, state machine transitions, lock broadcasts, and real Worker thread integration).
+- All 8 CI quality gates in `./scripts/ci.sh` pass cleanly (26/26 web tests pass).
 
 ---
 
