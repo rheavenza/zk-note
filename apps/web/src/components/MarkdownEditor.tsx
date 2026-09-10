@@ -11,6 +11,7 @@
 
 import React, { useState, useRef, useCallback } from "react";
 import { useNotes } from "../context/NotesContext.js";
+import { useConflict } from "../context/ConflictContext.js";
 import { renderMarkdown } from "../utils/markdown.js";
 
 export type EditorViewMode = "edit" | "preview" | "split";
@@ -31,6 +32,7 @@ export const MarkdownEditor: React.FC<MarkdownEditorProps> = ({
     deleteNote,
     saveStatus,
   } = useNotes();
+  const { activeConflicts, openModal } = useConflict();
 
   const [viewMode, setViewMode] = useState<EditorViewMode>("split");
   const [tagInput, setTagInput] = useState("");
@@ -147,6 +149,7 @@ export const MarkdownEditor: React.FC<MarkdownEditorProps> = ({
     );
   }
 
+  const activeConflictForNote = activeConflicts.find((c) => c.object_id === noteId);
   const renderedHtml = renderMarkdown(selectedNote.body);
 
   return (
@@ -155,6 +158,31 @@ export const MarkdownEditor: React.FC<MarkdownEditorProps> = ({
       style={editorContainerStyle}
       data-testid="markdown-editor"
     >
+      {/* Active Conflict Warning Banner */}
+      {activeConflictForNote && (
+        <div
+          style={conflictBannerStyle}
+          className="zk-note-conflict-banner"
+          data-testid="note-conflict-banner"
+        >
+          <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+            <span style={{ fontSize: "16px" }}>⚠️</span>
+            <span>
+              <strong>Sync Conflict:</strong> This note has conflicting local and remote edits.
+            </span>
+          </div>
+          <button
+            type="button"
+            onClick={() => openModal(activeConflictForNote.conflict_id)}
+            style={resolveBannerButtonStyle}
+            className="zk-resolve-conflict-banner-button"
+            data-testid="resolve-conflict-banner-button"
+          >
+            Resolve Conflict
+          </button>
+        </div>
+      )}
+
       {/* Top Header: Title and Save status */}
       <div style={topBarStyle}>
         <input
@@ -612,3 +640,26 @@ const dangerModalButtonStyle: React.CSSProperties = {
   fontSize: "13px",
   fontWeight: 600,
 };
+
+const conflictBannerStyle: React.CSSProperties = {
+  backgroundColor: "#fff7ed",
+  borderBottom: "1px solid #fed7aa",
+  padding: "8px 16px",
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "space-between",
+  fontSize: "13px",
+  color: "#9a3412",
+};
+
+const resolveBannerButtonStyle: React.CSSProperties = {
+  padding: "4px 10px",
+  backgroundColor: "#c2410c",
+  color: "#ffffff",
+  border: "none",
+  borderRadius: "4px",
+  fontSize: "12px",
+  fontWeight: 600,
+  cursor: "pointer",
+};
+

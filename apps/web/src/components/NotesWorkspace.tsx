@@ -14,6 +14,7 @@ import { LockVaultButton, VaultStatusBadge } from "./UnlockScreen.js";
 import { SearchBar } from "./SearchBar.js";
 import { SearchModal } from "./SearchModal.js";
 import { SyncStatusIndicator } from "./SyncStatusIndicator.js";
+import { ConflictResolverModal } from "./ConflictResolverModal.js";
 
 export interface NotesWorkspaceProps {
   className?: string;
@@ -58,6 +59,9 @@ export const NotesWorkspace: React.FC<NotesWorkspaceProps> = ({ className }) => 
 
       {/* Quick Search Modal / Command Palette */}
       <SearchModal />
+
+      {/* Sync Conflict Resolver Modal */}
+      <ConflictResolverModal />
     </div>
   );
 };

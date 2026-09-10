@@ -15,6 +15,7 @@
 
 import React, { useState } from "react";
 import { useSync, SyncStatus } from "../context/SyncContext.js";
+import { useConflict } from "../context/ConflictContext.js";
 
 export interface SyncStatusIndicatorProps {
   className?: string;
@@ -34,6 +35,7 @@ export const SyncStatusIndicator: React.FC<SyncStatusIndicatorProps> = ({
   conflictCount: propConflictCount,
 }) => {
   const sync = useSync();
+  const { activeConflicts, openModal } = useConflict();
 
   const status = propStatus || sync.status;
   const pendingCount = propPendingCount !== undefined ? propPendingCount : sync.pendingCount;
@@ -232,6 +234,24 @@ export const SyncStatusIndicator: React.FC<SyncStatusIndicatorProps> = ({
 
             {/* Actions */}
             <div style={{ display: "flex", flexDirection: "column", gap: "8px", marginTop: 12 }}>
+              {conflictCount > 0 && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setIsPopoverOpen(false);
+                    const firstConflict = activeConflicts[0];
+                    if (firstConflict) {
+                      openModal(firstConflict.conflict_id);
+                    }
+                  }}
+                  style={resolveConflictPopoverButtonStyle}
+                  className="zk-resolve-conflicts-button"
+                  data-testid="resolve-conflicts-popover-button"
+                >
+                  Resolve Conflicts {`(${conflictCount})`}
+                </button>
+              )}
+
               <button
                 type="button"
                 onClick={() => syncNow().catch(() => {})}
@@ -363,3 +383,16 @@ const secondaryActionButtonStyle: React.CSSProperties = {
   fontSize: "12px",
   cursor: "pointer",
 };
+
+const resolveConflictPopoverButtonStyle: React.CSSProperties = {
+  width: "100%",
+  padding: "7px",
+  backgroundColor: "#fff7ed",
+  color: "#c2410c",
+  border: "1px solid #fed7aa",
+  borderRadius: "6px",
+  fontSize: "12px",
+  fontWeight: 600,
+  cursor: "pointer",
+};
+

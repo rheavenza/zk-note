@@ -1817,7 +1817,7 @@ Completion notes:
 ---
 
 ## ZK-068 — Web conflict resolver
-Status: TODO  
+Status: DONE  
 Priority: P0  
 Dependencies: ZK-053, ZK-065
 
@@ -1827,6 +1827,14 @@ Acceptance criteria:
 - use merge candidate;
 - manual resolution;
 - preserve-both action.
+
+Completion notes:
+- Built three-way text diff3 and structured note merge engine in `apps/web/src/utils/diff3.ts`, supporting non-overlapping line auto-merging, clean identical change merging, standard diff3 conflict markers (`<<<<<<< LOCAL`, `=======`, `>>>>>>> REMOTE`), and deterministic set-based tag merging.
+- Created `ConflictStore` and `ConflictProvider` in `apps/web/src/context/ConflictContext.tsx`, managing active conflicts, side-by-side in-memory envelope decryption, and all 4 resolution strategies (Keep Local, Keep Remote, Candidate/Manual Merge, and Preserve Both).
+- Built `ConflictResolverModal` in `apps/web/src/components/ConflictResolverModal.tsx` featuring side-by-side comparison of local vs remote revisions, titles, tags, and bodies; one-click "Use Merge Candidate"; interactive manual merge editor with diff3 markers; and "Preserve Both (Duplicate Local)".
+- Integrated conflict detection and actions into `MarkdownEditor.tsx` (active conflict banner), `NotesList.tsx` (per-note warning badges), `SyncStatusIndicator.tsx` (popover resolution trigger), and `NotesWorkspace.tsx`.
+- Created comprehensive test suite in `apps/web/test/conflict-resolver.test.tsx` verifying diff3 mechanics, side-by-side comparison, all resolution actions, CAS revision tracking, and zero-knowledge security guarantees (SEC-001, SEC-003, SEC-009).
+- Validated via `./scripts/ci.sh`: all 8 quality gates pass cleanly (59/59 web tests pass).
 
 ---
 

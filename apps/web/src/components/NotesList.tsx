@@ -10,6 +10,7 @@
 
 import React, { useState, useMemo } from "react";
 import { useNotes } from "../context/NotesContext.js";
+import { useConflict } from "../context/ConflictContext.js";
 import { PlaintextNoteDto } from "../worker/protocol.js";
 
 export interface NotesListProps {
@@ -22,6 +23,7 @@ export const NotesList: React.FC<NotesListProps> = ({
   onSelectNote,
 }) => {
   const { notes, selectedNoteId, selectNote, createNote, isLoading } = useNotes();
+  const { activeConflicts } = useConflict();
   const [filterQuery, setFilterQuery] = useState("");
 
   const filteredNotes = useMemo(() => {
@@ -122,6 +124,7 @@ export const NotesList: React.FC<NotesListProps> = ({
           const displayTitle = note.title.trim() || "Untitled Note";
           const snippet = note.body.trim().split("\n")[0] || "No content";
           const formattedDate = formatDate(note.updatedAt);
+          const hasConflict = activeConflicts.some((c) => c.object_id === note.id);
 
           return (
             <div
@@ -138,20 +141,32 @@ export const NotesList: React.FC<NotesListProps> = ({
               }}
             >
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
-                <h4
-                  style={{
-                    margin: "0 0 4px 0",
-                    fontSize: "15px",
-                    fontWeight: isSelected ? 700 : 600,
-                    color: isSelected ? "#1d4ed8" : "#111827",
-                    fontStyle: note.title.trim() ? "normal" : "italic",
-                    whiteSpace: "nowrap",
-                    overflow: "hidden",
-                    textOverflow: "ellipsis",
-                  }}
-                >
-                  {displayTitle}
-                </h4>
+                <div style={{ display: "flex", alignItems: "center", gap: "6px", overflow: "hidden" }}>
+                  <h4
+                    style={{
+                      margin: "0 0 4px 0",
+                      fontSize: "15px",
+                      fontWeight: isSelected ? 700 : 600,
+                      color: isSelected ? "#1d4ed8" : "#111827",
+                      fontStyle: note.title.trim() ? "normal" : "italic",
+                      whiteSpace: "nowrap",
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                    }}
+                  >
+                    {displayTitle}
+                  </h4>
+                  {hasConflict && (
+                    <span
+                      style={conflictBadgeStyle}
+                      className="zk-note-conflict-badge"
+                      title="Active sync conflict"
+                      data-testid="note-conflict-badge"
+                    >
+                      ⚠️ Conflict
+                    </span>
+                  )}
+                </div>
                 <span style={dateStyle}>{formattedDate}</span>
               </div>
 
@@ -320,3 +335,15 @@ const tagPillStyle: React.CSSProperties = {
   backgroundColor: "#f3f4f6",
   color: "#4b5563",
 };
+
+const conflictBadgeStyle: React.CSSProperties = {
+  fontSize: "10px",
+  fontWeight: 700,
+  color: "#c2410c",
+  backgroundColor: "#ffedd5",
+  padding: "1px 5px",
+  borderRadius: "4px",
+  whiteSpace: "nowrap",
+  flexShrink: 0,
+};
+

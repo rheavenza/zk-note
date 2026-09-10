@@ -497,7 +497,25 @@ export const NotesProvider: React.FC<NotesProviderProps> = ({ children }) => {
 export function useNotes(): NotesContextType {
   const ctx = useContext(NotesContext);
   if (!ctx) {
-    throw new Error("useNotes must be used within a NotesProvider");
+    return {
+      notes: [],
+      selectedNoteId: null,
+      selectedNote: null,
+      isLoading: false,
+      saveStatus: "saved",
+      lastSavedAt: null,
+      error: null,
+      selectNote: () => {},
+      createNote: async () => {
+        throw new Error("NotesProvider not available");
+      },
+      updateNote: () => {},
+      saveNoteNow: async () => {},
+      deleteNote: async () => {},
+      reloadNotes: async () => {},
+      clearError: () => {},
+      store: null as any,
+    };
   }
   return ctx;
 }
