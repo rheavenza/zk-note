@@ -233,8 +233,12 @@ export class IndexedDbStorage {
 
       req.onsuccess = () => {
         const mutations: PendingMutation[] = req.result || [];
-        // FIFO order: sort by created_at ascending
-        mutations.sort((a, b) => a.created_at.localeCompare(b.created_at));
+        // FIFO order: sort by created_at ascending, breaking ties with expected_revision
+        mutations.sort((a, b) => {
+          const cmp = a.created_at.localeCompare(b.created_at);
+          if (cmp !== 0) return cmp;
+          return a.expected_revision - b.expected_revision;
+        });
         resolve(mutations);
       };
       req.onerror = () => reject(req.error);
@@ -251,7 +255,11 @@ export class IndexedDbStorage {
 
       req.onsuccess = () => {
         const mutations: PendingMutation[] = req.result || [];
-        mutations.sort((a, b) => a.created_at.localeCompare(b.created_at));
+        mutations.sort((a, b) => {
+          const cmp = a.created_at.localeCompare(b.created_at);
+          if (cmp !== 0) return cmp;
+          return a.expected_revision - b.expected_revision;
+        });
         resolve(mutations);
       };
       req.onerror = () => reject(req.error);

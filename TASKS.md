@@ -1730,16 +1730,32 @@ Implementation notes:
 ---
 
 ## ZK-065 — Notes list/editor
-Status: TODO  
+Status: DONE  
 Priority: P1  
 Dependencies: ZK-064
 
 Acceptance criteria:
 
-- create/edit/delete;
-- Markdown source editor;
-- autosave to encrypted local state;
-- offline operation.
+- [x] create/edit/delete;
+- [x] Markdown source editor;
+- [x] autosave to encrypted local state;
+- [x] offline operation.
+
+Implementation notes:
+- Implemented `NotesContext` and `NotesStore` in `apps/web/src/context/NotesContext.tsx`:
+  - Full note CRUD operations (create, edit, delete, batch load).
+  - Debounced autosave (600ms) with immediate manual flush on navigation, blur, or shortcut (Ctrl+S).
+  - Encrypts note envelopes in Web Worker (`client.encryptNote`) and persists encrypted state to IndexedDB `objects` store with incremented revision (SEC-001, SEC-006).
+  - Enqueues `PendingMutation` (`Upsert` or `Delete`) in IndexedDB `mutations` store for offline-first sync (SEC-007).
+  - Tombstone deletion semantics via `storage.markDeleted` and `client.removeFromIndex` (SEC-008).
+  - Complete memory sanitization on vault lock: in-memory notes and selection are wiped immediately upon `handleVaultLocked` (SEC-009).
+- Created safe, zero-dependency Markdown parser and HTML renderer in `apps/web/src/utils/markdown.ts` with XSS sanitization (`escapeHtml`, `sanitizeUrl`).
+- Implemented React UI components:
+  - `MarkdownEditor` in `apps/web/src/components/MarkdownEditor.tsx` featuring Markdown source editing, syntax toolbar shortcuts, tags management, view modes (Source, Split, Preview), real-time save status badge, and deletion confirmation modal.
+  - `NotesList` in `apps/web/src/components/NotesList.tsx` with sidebar list, relative timestamp formatting, tags pills, new note button, and real-time query filtering.
+  - `NotesWorkspace` in `apps/web/src/components/NotesWorkspace.tsx` combining two-pane split layout, top navbar, offline indicator, and vault lock controls.
+- Added comprehensive unit and integration test suite in `apps/web/test/notes-editor.test.tsx` (8 tests covering markdown parsing, XSS prevention, store lifecycle, zero-knowledge storage audit, UI rendering, and real Web Worker thread integration).
+- All 8 CI quality gates in `./scripts/ci.sh` pass cleanly (34/34 web tests pass).
 
 ---
 
