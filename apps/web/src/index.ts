@@ -9,9 +9,13 @@ export * from "./storage/models.js";
 export * from "./storage/indexeddb.js";
 export * from "./context/VaultContext.js";
 export * from "./context/NotesContext.js";
+export * from "./context/SearchContext.js";
 export * from "./components/UnlockScreen.js";
 export * from "./components/MarkdownEditor.js";
 export * from "./components/NotesList.js";
+export * from "./components/SearchBar.js";
+export * from "./components/SearchModal.js";
 export * from "./components/NotesWorkspace.js";
 export * from "./utils/markdown.js";
+
 

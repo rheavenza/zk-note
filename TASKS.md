@@ -1760,15 +1760,29 @@ Implementation notes:
 ---
 
 ## ZK-066 — Web search
-Status: TODO  
+Status: DONE  
 Priority: P1  
 Dependencies: ZK-065
 
 Acceptance criteria:
 
-- in-memory local search;
-- no server query;
-- lock clears searchable plaintext state.
+- [x] in-memory local search;
+- [x] no server query;
+- [x] lock clears searchable plaintext state.
+
+Implementation notes:
+- Created `SearchContext` in `apps/web/src/context/SearchContext.tsx`:
+  - Direct integration with Web Worker search API (`client.search(query)`).
+  - Debounced search query dispatch (150ms) with immediate manual search trigger.
+  - Zero server query guarantee: search terms and results run 100% locally in the browser/worker process without network transmission (SEC-001).
+  - Global shortcut listener (Cmd+K / Ctrl+K) for opening the quick-search palette.
+  - Complete memory sanitization on vault lock: in-memory search query, cached results, snippets, and open modals are wiped immediately when vault locks (SEC-009).
+- Implemented UI search components:
+  - `SearchBar` in `apps/web/src/components/SearchBar.tsx` featuring search icon, responsive input, live loading spinner, clear button, and platform-specific shortcut badge (⌘K / Ctrl+K).
+  - `SearchModal` in `apps/web/src/components/SearchModal.tsx` command palette modal with backdrop, auto-focus input, snippet display, relevance score badges, and keyboard navigation (ArrowUp, ArrowDown, Enter to navigate to note, Esc to close).
+  - Integrated `SearchBar` and `SearchModal` directly into the `NotesWorkspace` navigation header.
+- Added comprehensive test suite in `apps/web/test/web-search.test.tsx` (6 tests covering in-memory local query execution, score ranking, zero-network validation, lock-clearing of plaintext search state, UI rendering, and real Web Worker thread integration).
+- All 8 CI quality gates in `./scripts/ci.sh` pass cleanly (40/40 web tests pass).
 
 ---
 

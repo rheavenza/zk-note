@@ -11,6 +11,8 @@ import React from "react";
 import { NotesList } from "./NotesList.js";
 import { MarkdownEditor } from "./MarkdownEditor.js";
 import { LockVaultButton, VaultStatusBadge } from "./UnlockScreen.js";
+import { SearchBar } from "./SearchBar.js";
+import { SearchModal } from "./SearchModal.js";
 
 export interface NotesWorkspaceProps {
   className?: string;
@@ -35,6 +37,9 @@ export const NotesWorkspace: React.FC<NotesWorkspaceProps> = ({ className }) => 
           </span>
         </div>
 
+        {/* Local in-memory search bar */}
+        <SearchBar />
+
         <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
           <VaultStatusBadge />
           <LockVaultButton />
@@ -51,6 +56,9 @@ export const NotesWorkspace: React.FC<NotesWorkspaceProps> = ({ className }) => 
           <MarkdownEditor />
         </main>
       </div>
+
+      {/* Quick Search Modal / Command Palette */}
+      <SearchModal />
     </div>
   );
 };
