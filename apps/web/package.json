@@ -13,7 +13,8 @@
     "zk-wasm": "file:../../crates/zk-wasm/pkg"
   },
   "devDependencies": {
-    "typescript": "^5.7.0",
-    "@types/node": "^22.0.0"
+    "@types/node": "^22.0.0",
+    "fake-indexeddb": "^6.2.5",
+    "typescript": "^5.7.0"
   }
 }

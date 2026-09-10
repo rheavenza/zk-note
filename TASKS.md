@@ -1678,7 +1678,7 @@ Completion notes:
 ---
 
 ## ZK-063 — IndexedDB encrypted adapter
-Status: TODO  
+Status: DONE  
 Priority: P0  
 Dependencies: ZK-021, ZK-060
 
@@ -1688,6 +1688,21 @@ Acceptance criteria:
 - note ciphertext persists;
 - pending queue/cursor persists;
 - browser storage inspection reveals no plaintext note content.
+
+Completion notes:
+- Implemented `IndexedDbStorage` in `apps/web/src/storage/indexeddb.ts` and models in `apps/web/src/storage/models.ts` with exact semantic parity to the native SQLite adapter:
+  - `ObjectStore`: `putObject`, `getObject`, `listObjects` (active only, filtered by protocol kind, include deleted tombstones), `markDeleted` (recording tombstone envelope and revision), and `purgeObject`.
+  - `MutationStore`: Strict FIFO queue ordering (`listPendingMutations` and `listMutationsForObject` sorted by `created_at` ascending), `updateMutationStatus` (`Pending`, `InFlight`, `Failed`), retry count tracking, `pendingMutationCount`, and `removeMutation`.
+  - `BaseVersionStore`: Base envelope retention for three-way conflict merging (`putBaseVersion`, `getBaseVersion`, `listBaseVersions` ascending), `pruneBaseVersions`, and `clearBaseVersions`.
+  - `SyncStateStore`: Monotonic `sync_cursor` tracking and device metadata persistence.
+  - `ConflictStore`: `putConflict`, `getConflict`, `getActiveConflictForObject`, `listConflicts` (filtered by resolved state), `resolveConflict` (with candidate envelope), and `deleteConflict`.
+- Note ciphertext persistence:
+  - Tested persistence across database closing and reopening (simulating browser tab close/reopen), confirming all stored objects and base versions retain full `EncryptedEnvelope` payloads.
+- Pending queue and cursor persistence:
+  - Verified queued mutations and sync cursors survive restarts without data loss or reordering.
+- Zero-Knowledge Security Audit (SEC-009):
+  - Implemented automated recursive audit verifying that raw database inspection across all 5 stores (`objects`, `mutations`, `base_versions`, `sync_state`, `conflicts`) reveals zero plaintext note titles, bodies, tags, or passphrases. Envelopes contain only base64 ciphertexts and nonces.
+- Added comprehensive unit and integration test suite in `apps/web/test/indexeddb.test.ts` (7 tests, all passing). All 8 CI quality gates in `./scripts/ci.sh` pass cleanly.
 
 ---
 
