@@ -17,6 +17,7 @@ import {
   WorkerErrorCode,
   isWorkerBroadcastEvent,
   PlaintextNoteDto,
+  AttachmentManifestDto,
   SearchResultDto,
   VaultInitResultDto,
   VaultRewrapResultDto,
@@ -183,11 +184,17 @@ export class VaultWorkerClient {
 
   public async rewrapPassphrase(
     newPassphrase: string,
-    kdfParamsJson?: string
+    kdfParamsJson?: string,
+    oldPassphrase?: string,
+    currentWrappedVaultKeyJson?: string,
+    currentKdfParamsJson?: string
   ): Promise<VaultRewrapResultDto> {
     return this.sendRequest("REWRAP_PASSPHRASE", {
       newPassphrase,
       kdfParamsJson,
+      oldPassphrase,
+      currentWrappedVaultKeyJson,
+      currentKdfParamsJson,
     });
   }
 
@@ -195,9 +202,65 @@ export class VaultWorkerClient {
     noteId: string,
     title: string,
     body: string,
-    tags: string[]
+    tags: string[],
+    attachments?: string[]
   ): Promise<{ envelopeJson: string }> {
-    return this.sendRequest("ENCRYPT_NOTE", { noteId, title, body, tags });
+    return this.sendRequest("ENCRYPT_NOTE", { noteId, title, body, tags, attachments });
+  }
+
+  public async generateAttachmentKey(): Promise<string> {
+    const res = await this.sendRequest("GENERATE_ATTACHMENT_KEY", undefined);
+    return res.attachmentKeyBase64;
+  }
+
+  public async computeContentHash(bytes: Uint8Array): Promise<string> {
+    const res = await this.sendRequest("COMPUTE_CONTENT_HASH", { bytes });
+    return res.hash;
+  }
+
+  public async encryptAttachmentChunk(
+    chunkBytes: Uint8Array,
+    attachmentId: string,
+    chunkIndex: number,
+    totalChunks: number,
+    attachmentKeyBase64: string
+  ): Promise<Uint8Array> {
+    const res = await this.sendRequest("ENCRYPT_ATTACHMENT_CHUNK", {
+      chunkBytes,
+      attachmentId,
+      chunkIndex,
+      totalChunks,
+      attachmentKeyBase64,
+    });
+    return res.chunkBinary;
+  }
+
+  public async decryptAttachmentChunk(
+    chunkBinary: Uint8Array,
+    attachmentKeyBase64: string
+  ): Promise<Uint8Array> {
+    const res = await this.sendRequest("DECRYPT_ATTACHMENT_CHUNK", {
+      chunkBinary,
+      attachmentKeyBase64,
+    });
+    return res.plaintextBytes;
+  }
+
+  public async encryptAttachmentManifest(
+    manifest: AttachmentManifestDto,
+    attachmentKeyBase64: string
+  ): Promise<string> {
+    const res = await this.sendRequest("ENCRYPT_ATTACHMENT_MANIFEST", {
+      manifest,
+      attachmentKeyBase64,
+    });
+    return res.envelopeJson;
+  }
+
+  public async decryptAttachmentManifest(
+    envelopeJson: string
+  ): Promise<{ manifest: AttachmentManifestDto; attachmentKeyBase64: string }> {
+    return this.sendRequest("DECRYPT_ATTACHMENT_MANIFEST", { envelopeJson });
   }
 
   public async decryptNote(envelopeJson: string): Promise<PlaintextNoteDto> {

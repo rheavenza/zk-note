@@ -356,6 +356,12 @@ export function threeWayMergeNotes(
   // 3. Tags merge
   const mergedTags = mergeTags(baseTags, localNote.tags, remoteNote.tags);
 
+  // 4. Attachments merge (3-way set merge)
+  const baseAttachments = baseNote?.attachments || [];
+  const localAttachments = localNote.attachments || [];
+  const remoteAttachments = remoteNote.attachments || [];
+  const mergedAttachments = mergeTags(baseAttachments, localAttachments, remoteAttachments);
+
   const isClean = !hasTitleConflict && diffResult.isClean;
 
   const candidate: PlaintextNoteDto = {
@@ -363,6 +369,7 @@ export function threeWayMergeNotes(
     title: mergedTitle,
     body: diffResult.mergedText,
     tags: mergedTags,
+    attachments: mergedAttachments,
     createdAt: localNote.createdAt || remoteNote.createdAt || new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   };

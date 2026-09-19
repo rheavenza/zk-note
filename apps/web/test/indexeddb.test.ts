@@ -423,6 +423,7 @@ test("Zero-Knowledge Security Audit: Storage inspection reveals NO plaintext not
     });
 
     await storage.putBaseVersion("note-sec-1", 1, noteEnvelope);
+    await storage.putBlob("blob-sec-1", new Uint8Array([1, 2, 3, 4]));
 
     await storage.putConflict({
       conflict_id: "conf-sec-1",
@@ -445,11 +446,12 @@ test("Zero-Knowledge Security Audit: Storage inspection reveals NO plaintext not
       device_id: "device-uuid-audit",
     });
 
-    // Audit: Read raw database records from all 5 stores and scan for plaintext strings
+    // Audit: Read raw database records from all 6 stores and scan for plaintext strings
     const db = await storage.getDb();
     const storeNames = Array.from(db.objectStoreNames);
     assert.deepEqual(storeNames.sort(), [
       "base_versions",
+      "blobs",
       "conflicts",
       "mutations",
       "objects",

@@ -17,13 +17,14 @@ use zk_core::note::{NoteBuilder, PlaintextNote};
 use zk_core::search::InMemorySearchIndex;
 use zk_core::vault::VaultSession;
 use zk_crypto::kdf::{derive_kek, KdfParams};
-use zk_crypto::keys::{KeyEncryptionKey, RecoveryKey, VaultKey};
+use zk_crypto::keys::{AttachmentKey, KeyEncryptionKey, RecoveryKey, VaultKey};
 use zk_crypto::object::{decrypt_envelope, encrypt_envelope};
 use zk_crypto::recovery::{format_recovery_key, parse_recovery_key};
 use zk_crypto::vault::{
     unwrap_vault_key, unwrap_vault_key_recovery, wrap_vault_key, wrap_vault_key_recovery,
     WrappedVaultKey,
 };
+use zk_protocol::attachment::{AttachmentManifest, EncryptedChunk};
 use zk_protocol::envelope::EncryptedEnvelope;
 
 /// Typed errors produced across the WASM boundary.
@@ -73,6 +74,7 @@ pub struct WasmPlaintextNote {
     title: String,
     body: String,
     tags: Vec<String>,
+    attachments: Vec<String>,
     created_at: String,
     updated_at: String,
 }
@@ -103,6 +105,12 @@ impl WasmPlaintextNote {
         self.tags.clone()
     }
 
+    /// Note attachment IDs as an array of strings (ZK-084).
+    #[wasm_bindgen(getter)]
+    pub fn attachments(&self) -> Vec<String> {
+        self.attachments.clone()
+    }
+
     /// ISO-8601 creation timestamp.
     #[wasm_bindgen(getter)]
     pub fn created_at(&self) -> String {
@@ -118,6 +126,103 @@ impl WasmPlaintextNote {
     /// Serializes note to JSON string.
     pub fn to_json(&self) -> Result<String, JsValue> {
         serde_json::to_string(self).map_err(|e| to_js_error(e.to_string()))
+    }
+}
+
+/// Attachment metadata manifest exported across the WASM boundary to JavaScript (ZK-084).
+#[wasm_bindgen]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WasmAttachmentManifest {
+    attachment_id: String,
+    name: String,
+    mime: String,
+    size: f64,
+    chunk_count: u32,
+    chunk_size: u32,
+    content_hash: Option<String>,
+}
+
+#[wasm_bindgen]
+impl WasmAttachmentManifest {
+    #[wasm_bindgen(constructor)]
+    pub fn new(
+        attachment_id: String,
+        name: String,
+        mime: String,
+        size: f64,
+        chunk_count: u32,
+        chunk_size: u32,
+        content_hash: Option<String>,
+    ) -> Self {
+        Self {
+            attachment_id,
+            name,
+            mime,
+            size,
+            chunk_count,
+            chunk_size,
+            content_hash,
+        }
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn attachment_id(&self) -> String {
+        self.attachment_id.clone()
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn name(&self) -> String {
+        self.name.clone()
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn mime(&self) -> String {
+        self.mime.clone()
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn size(&self) -> f64 {
+        self.size
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn chunk_count(&self) -> u32 {
+        self.chunk_count
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn chunk_size(&self) -> u32 {
+        self.chunk_size
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn content_hash(&self) -> Option<String> {
+        self.content_hash.clone()
+    }
+
+    pub fn to_json(&self) -> Result<String, JsValue> {
+        serde_json::to_string(self).map_err(|e| to_js_error(e.to_string()))
+    }
+}
+
+/// Decrypted attachment manifest and key container (ZK-084).
+#[wasm_bindgen]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WasmDecryptedManifest {
+    manifest: WasmAttachmentManifest,
+    attachment_key_base64: String,
+}
+
+#[wasm_bindgen]
+impl WasmDecryptedManifest {
+    #[wasm_bindgen(getter)]
+    pub fn manifest(&self) -> WasmAttachmentManifest {
+        self.manifest.clone()
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn attachment_key_base64(&self) -> String {
+        self.attachment_key_base64.clone()
     }
 }
 
@@ -200,6 +305,7 @@ impl WasmVaultSession {
         title: &str,
         body: &str,
         tags: Vec<String>,
+        attachments: Vec<String>,
     ) -> Result<String, WasmError> {
         let key = self
             .inner
@@ -210,6 +316,7 @@ impl WasmVaultSession {
             .title(title)
             .body(body)
             .tags(tags)
+            .attachments(attachments)
             .build()
             .map_err(|e| WasmError::InvalidPayload(e.to_string()))?;
 
@@ -240,6 +347,7 @@ impl WasmVaultSession {
             title: note.title,
             body: note.body,
             tags: note.tags,
+            attachments: note.attachments,
             created_at: note.created_at,
             updated_at: note.updated_at,
         })
@@ -328,6 +436,31 @@ impl WasmVaultSession {
         self.search_index.clear();
     }
 
+    /// Sets or updates the idle auto-lock timeout in seconds (None or 0 disables) (ZK-076).
+    pub fn set_idle_timeout(&mut self, timeout_secs: Option<u64>) {
+        self.inner.set_idle_timeout(timeout_secs);
+    }
+
+    /// Returns the configured idle timeout in seconds, or None if disabled (ZK-076).
+    pub fn idle_timeout(&self) -> Option<u64> {
+        self.inner.idle_timeout()
+    }
+
+    /// Touches the session, updating the last active timestamp (ZK-076).
+    pub fn touch(&mut self) {
+        self.inner.touch();
+    }
+
+    /// Checks if the idle timeout has elapsed. If so, locks and zeroes session material
+    /// and returns true; otherwise returns false (ZK-076).
+    pub fn check_idle_timeout(&mut self) -> bool {
+        let expired = self.inner.check_idle_timeout();
+        if expired {
+            self.search_index.clear();
+        }
+        expired
+    }
+
     /// Encrypts a note into an [`EncryptedEnvelope`] JSON string using the active session key.
     ///
     /// Fails closed if the session is locked.
@@ -338,7 +471,20 @@ impl WasmVaultSession {
         body: &str,
         tags: Vec<String>,
     ) -> Result<String, JsValue> {
-        self.encrypt_note_impl(note_id, title, body, tags)
+        self.encrypt_note_impl(note_id, title, body, tags, Vec::new())
+            .map_err(to_js_error)
+    }
+
+    /// Encrypts a note with attachment IDs into an [`EncryptedEnvelope`] JSON string (ZK-084).
+    pub fn encrypt_note_with_attachments(
+        &self,
+        note_id: &str,
+        title: &str,
+        body: &str,
+        tags: Vec<String>,
+        attachments: Vec<String>,
+    ) -> Result<String, JsValue> {
+        self.encrypt_note_impl(note_id, title, body, tags, attachments)
             .map_err(to_js_error)
     }
 
@@ -396,6 +542,125 @@ impl WasmVaultSession {
             serde_json::from_str(kdf_params_json).map_err(|e| to_js_error(e.to_string()))?;
         self.rewrap_passphrase_impl(new_passphrase, &params)
             .map_err(to_js_error)
+    }
+
+    /// Encrypts an attachment manifest into an EncryptedEnvelope JSON string under the active Vault Key (ZK-084).
+    pub fn encrypt_attachment_manifest(
+        &self,
+        manifest_json: &str,
+        attachment_key_base64: &str,
+    ) -> Result<String, JsValue> {
+        let key = self
+            .inner
+            .active_key()
+            .map_err(|e| to_js_error(WasmError::Crypto(e.to_string())))?;
+
+        let manifest: AttachmentManifest = serde_json::from_str(manifest_json)
+            .map_err(|e| to_js_error(WasmError::InvalidPayload(e.to_string())))?;
+
+        let key_bytes = Base64::decode_vec(attachment_key_base64)
+            .map_err(|e| to_js_error(WasmError::Crypto(e.to_string())))?;
+        let attachment_key = AttachmentKey::from_slice(&key_bytes)
+            .map_err(|e| to_js_error(WasmError::Crypto(e.to_string())))?;
+
+        let envelope =
+            zk_core::attachment::encrypt_attachment_manifest(&manifest, &attachment_key, key)
+                .map_err(|e| to_js_error(WasmError::Crypto(e.to_string())))?;
+
+        serde_json::to_string(&envelope)
+            .map_err(|e| to_js_error(WasmError::InvalidPayload(e.to_string())))
+    }
+
+    /// Decrypts an EncryptedEnvelope JSON string containing an attachment manifest using the active Vault Key (ZK-084).
+    pub fn decrypt_attachment_manifest(
+        &self,
+        envelope_json: &str,
+    ) -> Result<WasmDecryptedManifest, JsValue> {
+        let key = self
+            .inner
+            .active_key()
+            .map_err(|e| to_js_error(WasmError::Crypto(e.to_string())))?;
+
+        let envelope: EncryptedEnvelope = serde_json::from_str(envelope_json)
+            .map_err(|e| to_js_error(WasmError::InvalidEnvelope(e.to_string())))?;
+
+        let (manifest, attachment_key) =
+            zk_core::attachment::decrypt_attachment_manifest(&envelope, key).map_err(|e| {
+                to_js_error(WasmError::Crypto(format!(
+                    "manifest decryption failed: {e}"
+                )))
+            })?;
+
+        let wasm_manifest = WasmAttachmentManifest {
+            attachment_id: manifest.attachment_id,
+            name: manifest.name,
+            mime: manifest.mime,
+            size: manifest.size as f64,
+            chunk_count: manifest.chunk_count,
+            chunk_size: manifest.chunk_size,
+            content_hash: manifest.content_hash,
+        };
+
+        let attachment_key_base64 = Base64::encode_string(attachment_key.as_bytes());
+
+        Ok(WasmDecryptedManifest {
+            manifest: wasm_manifest,
+            attachment_key_base64,
+        })
+    }
+
+    /// Encrypts an attachment chunk using XChaCha20-Poly1305 and returns compact binary wire format (ZKCK) (ZK-084).
+    pub fn encrypt_attachment_chunk(
+        &self,
+        chunk_bytes: &[u8],
+        attachment_id: &str,
+        chunk_index: u32,
+        total_chunks: u32,
+        attachment_key_base64: &str,
+    ) -> Result<Vec<u8>, JsValue> {
+        if !self.is_unlocked() {
+            return Err(to_js_error(WasmError::VaultLocked));
+        }
+        let key_bytes = Base64::decode_vec(attachment_key_base64)
+            .map_err(|e| to_js_error(WasmError::Crypto(e.to_string())))?;
+        let attachment_key = AttachmentKey::from_slice(&key_bytes)
+            .map_err(|e| to_js_error(WasmError::Crypto(e.to_string())))?;
+
+        let encrypted = zk_crypto::attachment::encrypt_chunk(
+            chunk_bytes,
+            &attachment_key,
+            attachment_id,
+            chunk_index,
+            total_chunks,
+        )
+        .map_err(|e| to_js_error(WasmError::Crypto(e.to_string())))?;
+
+        encrypted
+            .to_bytes()
+            .map_err(|e| to_js_error(WasmError::Crypto(e.to_string())))
+    }
+
+    /// Decrypts a binary attachment chunk (ZKCK) and verifies chunk index and AAD (ZK-084).
+    pub fn decrypt_attachment_chunk(
+        &self,
+        chunk_binary: &[u8],
+        attachment_key_base64: &str,
+    ) -> Result<Vec<u8>, JsValue> {
+        if !self.is_unlocked() {
+            return Err(to_js_error(WasmError::VaultLocked));
+        }
+        let key_bytes = Base64::decode_vec(attachment_key_base64)
+            .map_err(|e| to_js_error(WasmError::Crypto(e.to_string())))?;
+        let attachment_key = AttachmentKey::from_slice(&key_bytes)
+            .map_err(|e| to_js_error(WasmError::Crypto(e.to_string())))?;
+
+        let chunk = EncryptedChunk::from_bytes(chunk_binary)
+            .map_err(|e| to_js_error(WasmError::InvalidPayload(e.to_string())))?;
+
+        let plaintext = zk_crypto::attachment::decrypt_chunk(&chunk, &attachment_key)
+            .map_err(|e| to_js_error(WasmError::Crypto(format!("chunk decryption failed: {e}"))))?;
+
+        Ok(plaintext)
     }
 }
 
@@ -670,6 +935,7 @@ pub fn wasm_decrypt_envelope(
         title: note.title,
         body: note.body,
         tags: note.tags,
+        attachments: note.attachments,
         created_at: note.created_at,
         updated_at: note.updated_at,
     })
@@ -737,6 +1003,25 @@ pub fn wasm_decrypt_raw(vault_key_base64: &str, envelope_json: &str) -> Result<V
     Ok(plaintext)
 }
 
+/// Generates a fresh random 256-bit AttachmentKey and returns standard base64 (ZK-084).
+#[wasm_bindgen]
+pub fn wasm_generate_attachment_key() -> Result<String, JsValue> {
+    let key = AttachmentKey::generate();
+    Ok(Base64::encode_string(key.as_bytes()))
+}
+
+/// Computes BLAKE2b-512 content integrity hash (ZK-084).
+#[wasm_bindgen]
+pub fn wasm_compute_content_hash(bytes: &[u8]) -> String {
+    zk_core::attachment::compute_content_hash(bytes)
+}
+
+/// Computes expected chunk count for attachment size and chunk size (ZK-084).
+#[wasm_bindgen]
+pub fn wasm_calculate_chunk_count(size: f64, chunk_size: u32) -> u32 {
+    zk_core::attachment::calculate_chunk_count(size as u64, chunk_size as usize)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -762,6 +1047,7 @@ mod tests {
                 "WASM Confidential Note",
                 "WASM body content",
                 vec!["wasm".to_string(), "crypto".to_string()],
+                vec!["att-id-1".to_string()],
             )
             .expect("encrypt note");
 
@@ -774,6 +1060,7 @@ mod tests {
         assert_eq!(decrypted.title(), "WASM Confidential Note");
         assert_eq!(decrypted.body(), "WASM body content");
         assert_eq!(decrypted.tags(), vec!["crypto", "wasm"]); // Canonicalized order
+        assert_eq!(decrypted.attachments(), vec!["att-id-1"]);
 
         // Index and search in WASM memory
         session
@@ -840,7 +1127,7 @@ mod tests {
 
         let obj_id = uuid::Uuid::new_v4().to_string();
         let env_json = session
-            .encrypt_note_impl(&obj_id, "Title", "Body", vec![])
+            .encrypt_note_impl(&obj_id, "Title", "Body", vec![], vec![])
             .expect("encrypt");
 
         // Rewrap
@@ -897,5 +1184,80 @@ mod tests {
         let wrapped_json = wasm_wrap_key(&kek_b64, &vault_key_b64).expect("wrap");
         let unwrapped_b64 = wasm_unwrap_key(&kek_b64, &wrapped_json).expect("unwrap");
         assert_eq!(unwrapped_b64, vault_key_b64);
+    }
+
+    #[test]
+    fn test_wasm_attachment_manifest_and_chunks() {
+        let params = KdfParams::new_test();
+        let mut init_res = init_vault_impl("vault-passphrase", &params).expect("init vault");
+        let session = init_res.take_session().expect("take session");
+
+        // 1. Generate attachment key
+        let att_key_b64 = wasm_generate_attachment_key().expect("generate key");
+        assert!(!att_key_b64.is_empty());
+
+        let att_id = uuid::Uuid::new_v4().to_string();
+        let sample_data = b"Hello from confidential Web attachment chunk!";
+        let content_hash = wasm_compute_content_hash(sample_data);
+        assert!(!content_hash.is_empty());
+
+        // 2. Encrypt chunk
+        let chunk_binary = session
+            .encrypt_attachment_chunk(sample_data, &att_id, 0, 1, &att_key_b64)
+            .expect("encrypt chunk");
+        assert!(chunk_binary.starts_with(b"ZKCK"));
+
+        // 3. Decrypt chunk
+        let decrypted_bytes = session
+            .decrypt_attachment_chunk(&chunk_binary, &att_key_b64)
+            .expect("decrypt chunk");
+        assert_eq!(decrypted_bytes, sample_data);
+
+        // Tampered chunk fails closed
+        let mut tampered_chunk = chunk_binary.clone();
+        tampered_chunk[50] ^= 0x42;
+        assert!(session
+            .decrypt_attachment_chunk(&tampered_chunk, &att_key_b64)
+            .is_err());
+
+        // Wrong key fails closed
+        let wrong_key_b64 = wasm_generate_attachment_key().expect("wrong key");
+        assert!(session
+            .decrypt_attachment_chunk(&chunk_binary, &wrong_key_b64)
+            .is_err());
+
+        // 4. Attachment manifest encryption and decryption
+        let manifest = AttachmentManifest {
+            attachment_id: att_id.clone(),
+            name: "test_doc.pdf".to_string(),
+            mime: "application/pdf".to_string(),
+            size: sample_data.len() as u64,
+            chunk_count: 1,
+            chunk_size: 4096,
+            content_hash: Some(content_hash.clone()),
+        };
+        let manifest_json = serde_json::to_string(&manifest).expect("serialize manifest");
+
+        let manifest_envelope_json = session
+            .encrypt_attachment_manifest(&manifest_json, &att_key_b64)
+            .expect("encrypt manifest");
+        assert!(manifest_envelope_json.contains(&att_id));
+
+        let dec_manifest_result = session
+            .decrypt_attachment_manifest(&manifest_envelope_json)
+            .expect("decrypt manifest");
+        assert_eq!(dec_manifest_result.manifest().attachment_id(), att_id);
+        assert_eq!(dec_manifest_result.manifest().name(), "test_doc.pdf");
+        assert_eq!(dec_manifest_result.manifest().mime(), "application/pdf");
+        assert_eq!(
+            dec_manifest_result.manifest().size(),
+            sample_data.len() as f64
+        );
+        assert_eq!(dec_manifest_result.manifest().chunk_count(), 1);
+        assert_eq!(
+            dec_manifest_result.manifest().content_hash(),
+            Some(content_hash)
+        );
+        assert_eq!(dec_manifest_result.attachment_key_base64(), att_key_b64);
     }
 }

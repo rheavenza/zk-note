@@ -1,10 +1,16 @@
+pub mod attachment;
 pub mod error;
 pub mod note;
 pub mod search;
 pub mod time;
 pub mod vault;
 
-pub use error::{CoreError, NoteValidationError};
+pub use attachment::{
+    calculate_chunk_count, compute_content_hash, decrypt_attachment_stream_with_source,
+    decrypt_attachment_to_file, encrypt_attachment_file, encrypt_attachment_stream,
+    encrypt_attachment_stream_with_sink, DEFAULT_CHUNK_SIZE, MAX_ATTACHMENT_SIZE,
+};
+pub use error::{AttachmentError, CoreError, NoteValidationError};
 pub use note::{
     Note, NoteBuilder, NoteHistoryItem, PlaintextNote, MAX_ATTACHMENTS_COUNT,
     MAX_ATTACHMENT_ID_LEN, MAX_BODY_LEN, MAX_TAGS_COUNT, MAX_TAG_LEN, MAX_TITLE_LEN,

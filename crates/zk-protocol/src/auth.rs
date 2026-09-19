@@ -169,6 +169,52 @@ pub struct SessionStatusResponse {
     pub status: String,
 }
 
+/// Detailed representation of a registered device (ZK-075).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceInfo {
+    /// Device identifier.
+    pub device_id: Uuid,
+    /// Owning account identifier.
+    pub account_id: Uuid,
+    /// Human-readable device name or label.
+    pub display_name: Option<String>,
+    /// RFC 3339 timestamp when the device was first registered.
+    pub created_at: String,
+    /// RFC 3339 timestamp when the device was last seen.
+    pub last_seen: Option<String>,
+    /// Last acknowledged server sync sequence.
+    pub last_ack_server_seq: i64,
+    /// RFC 3339 timestamp when the device was revoked, if revoked.
+    pub revoked_at: Option<String>,
+    /// Flag indicating whether the device is currently revoked.
+    pub is_revoked: bool,
+}
+
+/// Response returned when listing registered devices (GET /v1/devices) (ZK-075).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceListResponse {
+    /// List of registered devices for the account.
+    pub devices: Vec<DeviceInfo>,
+}
+
+/// Request to revoke a device (POST /v1/devices/revoke) (ZK-075).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RevokeDeviceRequest {
+    /// Unique identifier of the device to revoke.
+    pub device_id: Uuid,
+}
+
+/// Response returned when a device is revoked (ZK-075).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RevokeDeviceResponse {
+    /// Unique identifier of the revoked device.
+    pub device_id: Uuid,
+    /// Whether the revocation succeeded.
+    pub revoked: bool,
+    /// Status description.
+    pub message: String,
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -265,5 +311,44 @@ mod tests {
         let status_json = serde_json::to_string(&status).unwrap();
         let parsed_status: SessionStatusResponse = serde_json::from_str(&status_json).unwrap();
         assert_eq!(parsed_status, status);
+    }
+
+    #[test]
+    fn test_device_management_models_serialization() {
+        let acc_id = Uuid::new_v4();
+        let dev_id = Uuid::new_v4();
+
+        let info = DeviceInfo {
+            device_id: dev_id,
+            account_id: acc_id,
+            display_name: Some("Work Laptop".to_string()),
+            created_at: "2026-09-19T00:00:00Z".to_string(),
+            last_seen: Some("2026-09-19T12:00:00Z".to_string()),
+            last_ack_server_seq: 42,
+            revoked_at: None,
+            is_revoked: false,
+        };
+
+        let list_resp = DeviceListResponse {
+            devices: vec![info.clone()],
+        };
+        let list_json = serde_json::to_string(&list_resp).unwrap();
+        let parsed_list: DeviceListResponse = serde_json::from_str(&list_json).unwrap();
+        assert_eq!(parsed_list.devices.len(), 1);
+        assert_eq!(parsed_list.devices[0], info);
+
+        let revoke_req = RevokeDeviceRequest { device_id: dev_id };
+        let req_json = serde_json::to_string(&revoke_req).unwrap();
+        let parsed_req: RevokeDeviceRequest = serde_json::from_str(&req_json).unwrap();
+        assert_eq!(parsed_req.device_id, dev_id);
+
+        let revoke_resp = RevokeDeviceResponse {
+            device_id: dev_id,
+            revoked: true,
+            message: "Device revoked successfully".to_string(),
+        };
+        let resp_json = serde_json::to_string(&revoke_resp).unwrap();
+        let parsed_resp: RevokeDeviceResponse = serde_json::from_str(&resp_json).unwrap();
+        assert_eq!(parsed_resp, revoke_resp);
     }
 }

@@ -248,3 +248,95 @@ fn test_fuzz_mutations_no_panic() {
         );
     }
 }
+
+#[test]
+fn test_attachment_chunk_negative_cases() {
+    use zk_crypto::attachment::{decrypt_chunk, encrypt_chunk};
+    use zk_crypto::keys::AttachmentKey;
+
+    let key = AttachmentKey::generate();
+    let wrong_key = AttachmentKey::generate();
+    let chunk = encrypt_chunk(b"Sensitive Attachment Data", &key, "att-uuid-1", 0, 1)
+        .expect("encrypt chunk");
+
+    // 1. Wrong key fails closed
+    assert_eq!(
+        decrypt_chunk(&chunk, &wrong_key),
+        Err(CryptoError::DecryptionFailed)
+    );
+
+    // 2. Tampered nonce fails closed
+    {
+        let mut tampered = chunk.clone();
+        let mut nonce_bytes = Base64::decode_vec(&tampered.nonce).unwrap();
+        nonce_bytes[0] ^= 0xaa;
+        tampered.nonce = Base64::encode_string(&nonce_bytes);
+        assert_eq!(
+            decrypt_chunk(&tampered, &key),
+            Err(CryptoError::DecryptionFailed)
+        );
+    }
+
+    // 3. Truncated nonce fails closed
+    {
+        let mut tampered = chunk.clone();
+        tampered.nonce = Base64::encode_string(&[0x42u8; 12]);
+        assert!(matches!(
+            decrypt_chunk(&tampered, &key),
+            Err(CryptoError::InvalidKeyLength {
+                expected: 24,
+                actual: 12
+            })
+        ));
+    }
+
+    // 4. Malformed base64 nonce rejected
+    {
+        let mut tampered = chunk.clone();
+        tampered.nonce = "not-valid-base64!!!".to_string();
+        assert!(matches!(
+            decrypt_chunk(&tampered, &key),
+            Err(CryptoError::InvalidEncoding(_))
+        ));
+    }
+
+    // 5. Tampered chunk_index fails closed
+    {
+        let mut tampered = chunk.clone();
+        tampered.chunk_index = 5;
+        assert_eq!(
+            decrypt_chunk(&tampered, &key),
+            Err(CryptoError::DecryptionFailed)
+        );
+    }
+
+    // 6. Tampered attachment_id fails closed
+    {
+        let mut tampered = chunk.clone();
+        tampered.attachment_id = "att-uuid-2".to_string();
+        assert_eq!(
+            decrypt_chunk(&tampered, &key),
+            Err(CryptoError::DecryptionFailed)
+        );
+    }
+
+    // 7. Tampered total_chunks fails closed
+    {
+        let mut tampered = chunk.clone();
+        tampered.total_chunks = 10;
+        assert_eq!(
+            decrypt_chunk(&tampered, &key),
+            Err(CryptoError::DecryptionFailed)
+        );
+    }
+
+    // 8. Unsupported version fails closed
+    {
+        let mut tampered = chunk;
+        tampered.version = 2;
+        assert_eq!(
+            decrypt_chunk(&tampered, &key),
+            Err(CryptoError::UnsupportedVersion(2))
+        );
+    }
+}

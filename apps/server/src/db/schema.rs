@@ -25,6 +25,7 @@ pub const TABLE_ACCOUNT_SEQUENCES: &str = "account_sequences";
 pub const TABLE_SESSIONS: &str = "sessions";
 pub const TABLE_WEBAUTHN_CREDENTIALS: &str = "webauthn_credentials";
 pub const TABLE_WEBAUTHN_CHALLENGES: &str = "webauthn_challenges";
+pub const TABLE_BLOBS: &str = "blobs";
 pub const TABLE_SCHEMA_MIGRATIONS: &str = "schema_migrations";
 
 /// Index name constants.
@@ -36,6 +37,7 @@ pub const INDEX_SESSIONS_ACCOUNT_ID: &str = "idx_sessions_account_id";
 pub const INDEX_SESSIONS_DEVICE_ID: &str = "idx_sessions_device_id";
 pub const INDEX_WEBAUTHN_ACCOUNT_ID: &str = "idx_webauthn_account_id";
 pub const INDEX_WEBAUTHN_CHALLENGES_EXPIRES: &str = "idx_webauthn_challenges_expires";
+pub const INDEX_BLOBS_ACCOUNT_ID: &str = "idx_blobs_account_id";
 
 /// All required table names defined in the schema.
 pub const ALL_TABLES: &[&str] = &[
@@ -50,6 +52,7 @@ pub const ALL_TABLES: &[&str] = &[
     TABLE_SESSIONS,
     TABLE_WEBAUTHN_CREDENTIALS,
     TABLE_WEBAUTHN_CHALLENGES,
+    TABLE_BLOBS,
 ];
 
 /// All required indexes defined in the schema.
@@ -62,6 +65,7 @@ pub const ALL_INDEXES: &[&str] = &[
     INDEX_SESSIONS_DEVICE_ID,
     INDEX_WEBAUTHN_ACCOUNT_ID,
     INDEX_WEBAUTHN_CHALLENGES_EXPIRES,
+    INDEX_BLOBS_ACCOUNT_ID,
 ];
 
 /// Account record in database.
@@ -273,6 +277,27 @@ pub struct WebAuthnChallengeRecord {
     pub created_at: String,
     /// Expiration timestamp.
     pub expires_at: String,
+}
+
+/// Ciphertext blob record in database (ZK-082).
+///
+/// In accordance with SEC-001, SEC-002, and SEC-003:
+/// - Contains ONLY opaque ciphertext data and size metadata.
+/// - NEVER contains note plaintext, attachment filenames, or MIME types.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlobRow {
+    /// Owning account ID.
+    pub account_id: Uuid,
+    /// Opaque blob identifier.
+    pub blob_id: String,
+    /// Size in bytes.
+    pub size: i64,
+    /// Opaque ciphertext bytes.
+    pub data: Vec<u8>,
+    /// Creation timestamp.
+    pub created_at: String,
+    /// Last update timestamp.
+    pub updated_at: String,
 }
 
 /// Verifies that all expected tables and indexes exist in the connected database.

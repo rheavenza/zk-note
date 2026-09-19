@@ -200,7 +200,7 @@ pub async fn pull_changes_handler(
             let key = parts.next().unwrap_or("");
             let val = parts.next().unwrap_or("");
             match key {
-                "after" => match val.parse::<u64>() {
+                "after" | "since" | "cursor" => match val.parse::<u64>() {
                     Ok(v) => after = v,
                     Err(e) => {
                         return (

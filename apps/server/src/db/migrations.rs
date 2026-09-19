@@ -23,6 +23,9 @@ pub const MIGRATION_007_SQL: &str = include_str!("../../../../migrations/007_ser
 pub const MIGRATION_008_SQL: &str =
     include_str!("../../../../migrations/008_webauthn_credentials.sql");
 
+/// Raw SQL contents of migration 009 (ciphertext blobs ZK-082).
+pub const MIGRATION_009_SQL: &str = include_str!("../../../../migrations/009_ciphertext_blobs.sql");
+
 /// A versioned SQL schema migration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Migration {
@@ -60,6 +63,11 @@ pub const SERVER_MIGRATIONS: &[Migration] = &[
         version: 8,
         name: "008_webauthn_credentials",
         sql: MIGRATION_008_SQL,
+    },
+    Migration {
+        version: 9,
+        name: "009_ciphertext_blobs",
+        sql: MIGRATION_009_SQL,
     },
 ];
 
@@ -137,9 +145,9 @@ mod tests {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
 
-        // First migration run applies versions 2, 3, 4, 7, and 8
+        // First migration run applies versions 2, 3, 4, 7, 8, and 9
         let applied1 = run_server_migrations(&mut conn).unwrap();
-        assert_eq!(applied1, vec![2, 3, 4, 7, 8]);
+        assert_eq!(applied1, vec![2, 3, 4, 7, 8, 9]);
 
         // Schema verification passes
         verify_database_schema(&conn).unwrap();

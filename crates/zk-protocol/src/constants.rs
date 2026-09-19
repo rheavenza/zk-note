@@ -7,6 +7,15 @@ pub const PROTOCOL_VERSION_V1: u32 = 1;
 /// Active encrypted envelope format version.
 pub const ENVELOPE_VERSION_V1: u32 = 1;
 
+/// Active encrypted attachment chunk format version.
+pub const ATTACHMENT_CHUNK_VERSION_V1: u32 = 1;
+
+/// Target chunk size for large attachments: 4 MiB (4,194,304 bytes).
+pub const DEFAULT_ATTACHMENT_CHUNK_SIZE: usize = 4 * 1024 * 1024;
+
+/// Maximum allowed single attachment size: 100 MiB (104,857,600 bytes).
+pub const MAX_ATTACHMENT_SIZE: u64 = 100 * 1024 * 1024;
+
 /// Initial expected revision value for creating a new object.
 pub const INITIAL_EXPECTED_REVISION: u64 = 0;
 
@@ -78,3 +87,9 @@ pub const ERROR_WEBAUTHN_VERIFICATION_FAILED: &str = "WEBAUTHN_VERIFICATION_FAIL
 pub const ERROR_WEBAUTHN_CREDENTIAL_NOT_FOUND: &str = "WEBAUTHN_CREDENTIAL_NOT_FOUND";
 /// WebAuthn credential ID already registered.
 pub const ERROR_WEBAUTHN_CREDENTIAL_EXISTS: &str = "WEBAUTHN_CREDENTIAL_EXISTS";
+/// Account aggregate storage quota exceeded (ZK-082).
+pub const ERROR_QUOTA_EXCEEDED: &str = "QUOTA_EXCEEDED";
+/// Payload exceeds maximum single object/blob limit (ZK-082).
+pub const ERROR_PAYLOAD_TOO_LARGE: &str = "PAYLOAD_TOO_LARGE";
+/// Requested ciphertext blob was not found (ZK-082).
+pub const ERROR_BLOB_NOT_FOUND: &str = "BLOB_NOT_FOUND";

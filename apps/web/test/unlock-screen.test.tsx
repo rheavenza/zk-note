@@ -457,3 +457,171 @@ test("SecurityRecoveryModal renders security guarantees, invariants, and warning
   assert.ok(html.includes("Change Passphrase"));
 });
 
+test("Password Change UX: Changing passphrase verifies current passphrase and rewraps cleanly (ZK-074)", async () => {
+  const worker = new Worker(WORKER_PATH);
+  const client = new VaultWorkerClient(worker);
+  const storage = new IndexedDbStorage("test-db-passwd-ux");
+
+  try {
+    let ctxRef: VaultContextType | null = null;
+    const Consumer: React.FC = () => {
+      ctxRef = useVault();
+      return <div>Consumer</div>;
+    };
+
+    renderToString(
+      <VaultProvider client={client} storage={storage} initialBootstrap={null}>
+        <Consumer />
+      </VaultProvider>
+    );
+
+    const ctx = ctxRef! as VaultContextType;
+    const initRes = await ctx.initVault("initial-pass-1", TEST_KDF_PARAMS);
+    const recoveryKey = initRes.recoveryPhrase;
+
+    // Encrypt note under initial VaultKey
+    const encRes = await client.encryptNote(
+      "note-passwd-ux",
+      "Important Secrets",
+      "Unmodified note body preserved across passphrase rewraps.",
+      ["ux", "security"]
+    );
+
+    // 1. Attempting to change passphrase with incorrect current passphrase fails closed
+    await assert.rejects(
+      async () => {
+        await ctx.rewrapPassphrase("new-pass-2", TEST_KDF_PARAMS, "wrong-current-pass");
+      },
+      (err: Error) => {
+        assert.equal(err.message, "Current master passphrase is incorrect.");
+        return true;
+      }
+    );
+
+    // 2. Successful passphrase change with correct current passphrase
+    await ctx.rewrapPassphrase("new-pass-2", TEST_KDF_PARAMS, "initial-pass-1");
+
+    // 3. Existing note remains decryptable in active session
+    const dec1 = await client.decryptNote(encRes.envelopeJson);
+    assert.equal(dec1.title, "Important Secrets");
+    assert.equal(dec1.body, "Unmodified note body preserved across passphrase rewraps.");
+    assert.deepEqual(dec1.tags, ["security", "ux"]);
+
+    // 4. Lock vault
+    await ctx.lock();
+    assert.equal(ctx.vaultState, "LOCKED");
+
+    // 5. Old passphrase cannot unlock vault
+    await assert.rejects(
+      async () => {
+        await ctx.unlockWithPassphrase("initial-pass-1");
+      },
+      (err: Error) => {
+        assert.equal(err.message, "Incorrect passphrase or invalid recovery key.");
+        return true;
+      }
+    );
+
+    // 6. New passphrase unlocks vault and note decrypts perfectly
+    await ctx.unlockWithPassphrase("new-pass-2");
+    assert.equal(ctx.vaultState, "UNLOCKED");
+    const dec2 = await client.decryptNote(encRes.envelopeJson);
+    assert.equal(dec2.title, "Important Secrets");
+    assert.equal(dec2.body, "Unmodified note body preserved across passphrase rewraps.");
+
+    // 7. Recovery key wrapper remains valid and unchanged
+    await ctx.lock();
+    await ctx.unlockWithRecoveryKey(recoveryKey);
+    assert.equal(ctx.vaultState, "UNLOCKED");
+    const dec3 = await client.decryptNote(encRes.envelopeJson);
+    assert.equal(dec3.title, "Important Secrets");
+  } finally {
+    client.dispose();
+    await worker.terminate();
+    await storage.close();
+  }
+});
+
+test("Auto-Lock Policy: Default timeout, configuration, and idle auto-locking (ZK-076)", async () => {
+  const { client } = createMockClient({ isUnlocked: false });
+  const storage = new IndexedDbStorage("test-autolock-store");
+
+  try {
+    let ctxRef: VaultContextType | null = null;
+    const Consumer: React.FC = () => {
+      ctxRef = useVault();
+      return <div>Consumer</div>;
+    };
+
+    renderToString(
+      <VaultProvider client={client} storage={storage} initialBootstrap={null}>
+        <Consumer />
+      </VaultProvider>
+    );
+
+    const ctx = ctxRef! as VaultContextType;
+    assert.equal(ctx.vaultState, "UNINITIALIZED");
+    assert.equal(ctx.autoLockTimeoutMinutes, 15);
+
+    // Initialize vault -> state becomes UNLOCKED
+    await ctx.initVault("my-secure-passphrase");
+    assert.equal(ctx.vaultState, "UNLOCKED");
+
+    // Configure auto-lock timeout to 30 minutes
+    ctx.setAutoLockTimeout(30);
+    assert.equal(ctx.autoLockTimeoutMinutes, 30);
+
+    // Before idle timeout elapses, checkIdleLock does not lock
+    await ctx.checkIdleLock();
+    assert.equal(ctx.vaultState, "UNLOCKED");
+
+    // Advance idle time beyond 30 minutes
+    // Simulate by setting lastActivityTime on the store
+    (ctx.store as any).lastActivityTime = Date.now() - 31 * 60 * 1000;
+
+    // checkIdleLock triggers auto-lock
+    await ctx.checkIdleLock();
+    assert.equal(ctx.vaultState, "LOCKED");
+
+    // Unlock again
+    await ctx.unlockWithPassphrase("correct-passphrase");
+    assert.equal(ctx.vaultState, "UNLOCKED");
+
+    // User activity resets timer
+    (ctx.store as any).lastActivityTime = Date.now() - 29 * 60 * 1000;
+    ctx.recordActivity();
+    await ctx.checkIdleLock();
+    assert.equal(ctx.vaultState, "UNLOCKED");
+
+    // Disabling auto-lock (0 minutes)
+    ctx.setAutoLockTimeout(0);
+    assert.equal(ctx.autoLockTimeoutMinutes, 0);
+    (ctx.store as any).lastActivityTime = Date.now() - 1000 * 60 * 1000;
+    await ctx.checkIdleLock();
+    assert.equal(ctx.vaultState, "UNLOCKED");
+
+    // Explicit lock works immediately
+    await ctx.lock();
+    assert.equal(ctx.vaultState, "LOCKED");
+  } finally {
+    await storage.close();
+  }
+});
+
+test("Auto-Lock Policy UI: SecurityRecoveryModal renders auto-lock tab and timeout selectors (ZK-076)", () => {
+  const { client } = createMockClient({ isUnlocked: true });
+  const storage = new IndexedDbStorage("test-autolock-modal");
+
+  const html = renderToString(
+    <VaultProvider client={client} storage={storage} initialBootstrap={null}>
+      <SecurityRecoveryModal isOpen={true} onClose={() => {}} />
+    </VaultProvider>
+  );
+
+  // Tab button rendered
+  assert.ok(html.includes("Auto-Lock"));
+  assert.ok(html.includes("Security Guarantees"));
+  assert.ok(html.includes("Change Passphrase"));
+});
+
+

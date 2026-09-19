@@ -9,7 +9,7 @@ use crate::routes::vault::{create_vault_bootstrap_handler, get_vault_bootstrap_h
 use axum::http::header::HeaderName;
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::IntoResponse;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
@@ -23,6 +23,18 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Creates application state based on the provided configuration.
+    /// If `config.db_path` is specified, opens the persistent file database;
+    /// otherwise initializes an in-memory database.
+    pub fn new(config: ServerConfig) -> Result<Self, crate::error::DbError> {
+        let db = if let Some(ref path) = config.db_path {
+            ServerDb::open_file(path)?
+        } else {
+            ServerDb::new_in_memory()?
+        };
+        Ok(Self { config, db })
+    }
+
     /// Creates a new application state with an in-memory SQLite database initialized with all migrations.
     pub fn new_in_memory(config: ServerConfig) -> Result<Self, crate::error::DbError> {
         Ok(Self {
@@ -166,6 +178,24 @@ pub fn create_app(state: AppState) -> Router {
         .route(
             "/v1/auth/whoami",
             get(crate::routes::auth::session_status_handler),
+        )
+        .route(
+            "/v1/devices",
+            get(crate::routes::auth::list_devices_handler),
+        )
+        .route(
+            "/v1/devices/{device_id}",
+            delete(crate::routes::auth::revoke_device_handler),
+        )
+        .route(
+            "/v1/devices/revoke",
+            post(crate::routes::auth::revoke_device_post_handler),
+        )
+        .route(
+            "/v1/blobs/{blob_id}",
+            get(crate::routes::blob::get_blob_handler)
+                .put(crate::routes::blob::put_blob_handler)
+                .delete(crate::routes::blob::delete_blob_handler),
         )
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),

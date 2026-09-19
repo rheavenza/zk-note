@@ -85,6 +85,20 @@ pub enum DbError {
     CredentialNotFound,
     /// WebAuthn credential already registered.
     CredentialAlreadyExists,
+    /// Ciphertext blob size exceeds maximum single blob limit (ZK-082).
+    BlobSizeExceeded {
+        /// Maximum allowed bytes.
+        max: usize,
+        /// Actual submitted bytes.
+        actual: usize,
+    },
+    /// Account aggregate blob storage quota exceeded (ZK-082).
+    AccountQuotaExceeded {
+        /// Total account quota in bytes.
+        quota: u64,
+        /// Requested total storage in bytes.
+        requested: u64,
+    },
 }
 
 impl fmt::Display for DbError {
@@ -107,6 +121,15 @@ impl fmt::Display for DbError {
             Self::ChallengeExpired => write!(f, "webauthn challenge has expired"),
             Self::CredentialNotFound => write!(f, "webauthn credential not found"),
             Self::CredentialAlreadyExists => write!(f, "webauthn credential already registered"),
+            Self::BlobSizeExceeded { max, actual } => {
+                write!(f, "blob size {actual} bytes exceeds limit of {max} bytes")
+            }
+            Self::AccountQuotaExceeded { quota, requested } => {
+                write!(
+                    f,
+                    "storage requested {requested} bytes exceeds quota of {quota} bytes"
+                )
+            }
         }
     }
 }
@@ -124,7 +147,9 @@ impl std::error::Error for DbError {
             | Self::ChallengeNotFound
             | Self::ChallengeExpired
             | Self::CredentialNotFound
-            | Self::CredentialAlreadyExists => None,
+            | Self::CredentialAlreadyExists
+            | Self::BlobSizeExceeded { .. }
+            | Self::AccountQuotaExceeded { .. } => None,
         }
     }
 }

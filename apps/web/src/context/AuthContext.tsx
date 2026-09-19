@@ -10,9 +10,13 @@
 import React, { createContext, useContext, useState, useCallback } from "react";
 import {
   WebAuthnSession,
+  DeviceInfo,
+  RevokeDeviceResponse,
   registerPasskey,
   signInWithPasskey,
   revokeSession,
+  listDevices,
+  revokeDevice,
 } from "../auth/webauthn.js";
 
 export interface AuthContextType {
@@ -28,6 +32,8 @@ export interface AuthContextType {
   }) => Promise<WebAuthnSession>;
   signIn: (options?: { accountId?: string; deviceId?: string }) => Promise<WebAuthnSession>;
   logout: () => Promise<void>;
+  listDevices: () => Promise<DeviceInfo[]>;
+  revokeDevice: (deviceId: string) => Promise<RevokeDeviceResponse>;
   clearError: () => void;
 }
 
@@ -139,6 +145,42 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({
     }
   }, [serverUrl, session]);
 
+  const listDevicesCallback = useCallback(async (): Promise<DeviceInfo[]> => {
+    if (!session?.token) {
+      throw new Error("Cannot list devices: not authenticated");
+    }
+    setError(null);
+    try {
+      return await listDevices(serverUrl, session.token);
+    } catch (err: any) {
+      const msg = err?.message || "Failed to list devices";
+      setError(msg);
+      throw err;
+    }
+  }, [serverUrl, session?.token]);
+
+  const revokeDeviceCallback = useCallback(
+    async (deviceId: string): Promise<RevokeDeviceResponse> => {
+      if (!session?.token) {
+        throw new Error("Cannot revoke device: not authenticated");
+      }
+      setError(null);
+      try {
+        const res = await revokeDevice(serverUrl, session.token, deviceId);
+        if (session.deviceId === deviceId) {
+          setSession(null);
+          persistSession(null);
+        }
+        return res;
+      } catch (err: any) {
+        const msg = err?.message || "Failed to revoke device";
+        setError(msg);
+        throw err;
+      }
+    },
+    [serverUrl, session?.token, session?.deviceId]
+  );
+
   const value: AuthContextType = {
     session,
     isAuthenticated: Boolean(session?.token),
@@ -147,6 +189,8 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({
     register,
     signIn,
     logout,
+    listDevices: listDevicesCallback,
+    revokeDevice: revokeDeviceCallback,
     clearError,
   };
 
@@ -156,7 +200,26 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({
 export function useAuth(): AuthContextType {
   const context = useContext(AuthContext);
   if (!context) {
-    throw new Error("useAuth must be used within an AuthProvider");
+    return {
+      session: null,
+      isAuthenticated: false,
+      isLoading: false,
+      error: null,
+      register: async () => {
+        throw new Error("useAuth must be used within an AuthProvider");
+      },
+      signIn: async () => {
+        throw new Error("useAuth must be used within an AuthProvider");
+      },
+      logout: async () => {},
+      listDevices: async () => [],
+      revokeDevice: async () => ({
+        status: "revoked",
+        deviceId: "",
+        revokedSessionsCount: 0,
+      }),
+      clearError: () => {},
+    };
   }
   return context;
 }

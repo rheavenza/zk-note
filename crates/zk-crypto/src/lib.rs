@@ -1,6 +1,7 @@
 //! Cryptographic primitives, key derivation (Argon2id), key wrapping,
 //! and envelope encryption (XChaCha20-Poly1305) for zero-knowledge notes.
 
+pub mod attachment;
 pub mod error;
 pub mod kdf;
 pub mod keys;
@@ -8,9 +9,14 @@ pub mod object;
 pub mod recovery;
 pub mod vault;
 
+pub use attachment::{
+    build_chunk_aad, decrypt_chunk, decrypt_chunk_binary, encrypt_chunk, encrypt_chunk_binary,
+    encrypt_chunk_with_rng, unwrap_attachment_key, wrap_attachment_key,
+    wrap_attachment_key_with_rng,
+};
 pub use error::CryptoError;
 pub use kdf::{derive_kek, KdfParams, ARGON2ID_ALGORITHM, SALT_LEN};
-pub use keys::{KeyEncryptionKey, ObjectKey, RecoveryKey, VaultKey, KEY_LEN};
+pub use keys::{AttachmentKey, KeyEncryptionKey, ObjectKey, RecoveryKey, VaultKey, KEY_LEN};
 pub use object::{
     build_aad, decrypt_envelope, decrypt_object_payload, encrypt_envelope, encrypt_object_payload,
     unwrap_object_key, wrap_object_key,

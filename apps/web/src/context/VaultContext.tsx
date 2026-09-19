@@ -30,24 +30,35 @@ export interface VaultSnapshot {
   vaultState: VaultState;
   bootstrap: VaultBootstrapData | null;
   error: string | null;
+  autoLockTimeoutMinutes: number;
 }
 
 export interface VaultContextType {
   vaultState: VaultState;
   bootstrap: VaultBootstrapData | null;
   error: string | null;
+  autoLockTimeoutMinutes: number;
   clearError: () => void;
   initVault: (passphrase: string, kdfParamsJson?: string) => Promise<{ recoveryPhrase: string }>;
   unlockWithPassphrase: (passphrase: string) => Promise<void>;
   unlockWithRecoveryKey: (recoveryPhrase: string) => Promise<void>;
-  rewrapPassphrase: (newPassphrase: string, kdfParamsJson?: string) => Promise<void>;
+  rewrapPassphrase: (
+    newPassphrase: string,
+    kdfParamsJson?: string,
+    oldPassphrase?: string
+  ) => Promise<void>;
   lock: () => Promise<void>;
+  setAutoLockTimeout: (minutes: number) => void;
+  recordActivity: () => void;
+  checkIdleLock: () => Promise<void>;
   client: VaultWorkerClient;
   storage: IndexedDbStorage;
   store: VaultStore;
 }
 
 const BOOTSTRAP_STORAGE_KEY = "zk_vault_bootstrap";
+export const DEFAULT_AUTO_LOCK_MINUTES = 15;
+export const AUTO_LOCK_STORAGE_KEY = "zk_autolock_minutes";
 
 function getStoredBootstrap(): VaultBootstrapData | null {
   try {
@@ -71,6 +82,33 @@ function persistBootstrap(data: VaultBootstrapData): void {
   }
 }
 
+function getStoredAutoLockTimeout(): number {
+  try {
+    if (typeof window !== "undefined" && window.localStorage) {
+      const raw = window.localStorage.getItem(AUTO_LOCK_STORAGE_KEY);
+      if (raw !== null) {
+        const parsed = parseInt(raw, 10);
+        if (!isNaN(parsed) && parsed >= 0) {
+          return parsed;
+        }
+      }
+    }
+  } catch {
+    // Ignore storage errors
+  }
+  return DEFAULT_AUTO_LOCK_MINUTES;
+}
+
+function persistAutoLockTimeout(minutes: number): void {
+  try {
+    if (typeof window !== "undefined" && window.localStorage) {
+      window.localStorage.setItem(AUTO_LOCK_STORAGE_KEY, minutes.toString());
+    }
+  } catch {
+    // Ignore storage errors
+  }
+}
+
 /**
  * Headless Vault State Store.
  * Encapsulates the state machine and worker communication outside React,
@@ -80,6 +118,9 @@ export class VaultStore {
   private state: VaultState;
   private bootstrap: VaultBootstrapData | null;
   private error: string | null = null;
+  private autoLockTimeoutMinutes: number;
+  private lastActivityTime: number = Date.now();
+  private idleCheckInterval: any = null;
   private listeners = new Set<() => void>();
   private unsubscribeLock: () => void;
   private isDisposed = false;
@@ -87,8 +128,14 @@ export class VaultStore {
   constructor(
     public readonly client: VaultWorkerClient,
     public readonly storage: IndexedDbStorage,
-    initialBootstrap: VaultBootstrapData | null = null
+    initialBootstrap: VaultBootstrapData | null = null,
+    initialAutoLockMinutes?: number
   ) {
+    this.autoLockTimeoutMinutes =
+      initialAutoLockMinutes !== undefined
+        ? initialAutoLockMinutes
+        : getStoredAutoLockTimeout();
+
     if (initialBootstrap !== undefined && initialBootstrap !== null) {
       this.bootstrap = initialBootstrap;
       this.state = "LOCKED";
@@ -112,6 +159,19 @@ export class VaultStore {
       this.notify();
     });
 
+    // Start background idle lock checker interval (every 2s)
+    if (typeof setInterval !== "undefined") {
+      this.idleCheckInterval = setInterval(() => {
+        this.checkIdleLock();
+      }, 2000);
+      if (
+        this.idleCheckInterval &&
+        typeof (this.idleCheckInterval as any).unref === "function"
+      ) {
+        (this.idleCheckInterval as any).unref();
+      }
+    }
+
     // Check actual worker session status if available
     this.checkWorkerStatus();
   }
@@ -121,6 +181,7 @@ export class VaultStore {
       const status = await this.client.getStatus();
       if (!this.isDisposed && status.isUnlocked) {
         this.state = "UNLOCKED";
+        this.recordActivity();
         this.notify();
       }
     } catch {
@@ -133,11 +194,38 @@ export class VaultStore {
       vaultState: this.state,
       bootstrap: this.bootstrap,
       error: this.error,
+      autoLockTimeoutMinutes: this.autoLockTimeoutMinutes,
     };
   }
 
   public getSnapshot = (): VaultSnapshot => {
     return this.getState();
+  };
+
+  public setAutoLockTimeout(minutes: number): void {
+    this.autoLockTimeoutMinutes = Math.max(0, minutes);
+    persistAutoLockTimeout(this.autoLockTimeoutMinutes);
+    this.recordActivity();
+    this.notify();
+  }
+
+  public getAutoLockTimeout(): number {
+    return this.autoLockTimeoutMinutes;
+  }
+
+  public recordActivity(): void {
+    this.lastActivityTime = Date.now();
+  }
+
+  public checkIdleLock = async (): Promise<void> => {
+    if (this.isDisposed) return;
+    if (this.state === "UNLOCKED" && this.autoLockTimeoutMinutes > 0) {
+      const elapsedMs = Date.now() - this.lastActivityTime;
+      const timeoutMs = this.autoLockTimeoutMinutes * 60 * 1000;
+      if (elapsedMs >= timeoutMs) {
+        await this.lock();
+      }
+    }
   };
 
   public subscribe = (listener: () => void): (() => void) => {
@@ -162,6 +250,12 @@ export class VaultStore {
     if (err instanceof WorkerError) {
       switch (err.code) {
         case WorkerErrorCode.DECRYPTION_FAILED:
+          if (
+            (err as any)?.message &&
+            String((err as any).message).includes("Current master passphrase is incorrect")
+          ) {
+            return "Current master passphrase is incorrect.";
+          }
           return "Incorrect passphrase or invalid recovery key.";
         case WorkerErrorCode.INVALID_RECOVERY_KEY:
           return "Invalid recovery phrase format or checksum.";
@@ -194,6 +288,7 @@ export class VaultStore {
 
       this.bootstrap = newBootstrap;
       this.state = "UNLOCKED";
+      this.recordActivity();
       this.notify();
 
       return { recoveryPhrase: res.recoveryPhrase };
@@ -224,6 +319,7 @@ export class VaultStore {
         this.bootstrap.kdfParamsJson
       );
       this.state = "UNLOCKED";
+      this.recordActivity();
       this.notify();
     } catch (err) {
       const msg = this.sanitizeError(err);
@@ -251,6 +347,7 @@ export class VaultStore {
         this.bootstrap.wrappedRecoveryKey
       );
       this.state = "UNLOCKED";
+      this.recordActivity();
       this.notify();
     } catch (err) {
       const msg = this.sanitizeError(err);
@@ -263,7 +360,8 @@ export class VaultStore {
 
   public async rewrapPassphrase(
     newPassphrase: string,
-    kdfParamsJson?: string
+    kdfParamsJson?: string,
+    oldPassphrase?: string
   ): Promise<void> {
     if (!this.bootstrap) {
       this.error = "Vault is not initialized.";
@@ -273,7 +371,13 @@ export class VaultStore {
 
     this.error = null;
     try {
-      const res = await this.client.rewrapPassphrase(newPassphrase, kdfParamsJson);
+      const res = await this.client.rewrapPassphrase(
+        newPassphrase,
+        kdfParamsJson,
+        oldPassphrase,
+        this.bootstrap.wrappedVaultKey,
+        this.bootstrap.kdfParamsJson
+      );
       const newBootstrap: VaultBootstrapData = {
         wrappedVaultKey: res.newWrappedVaultKey,
         kdfParamsJson: res.newKdfParamsJson,
@@ -303,6 +407,10 @@ export class VaultStore {
 
   public dispose(): void {
     this.isDisposed = true;
+    if (this.idleCheckInterval) {
+      clearInterval(this.idleCheckInterval);
+      this.idleCheckInterval = null;
+    }
     this.unsubscribeLock();
     this.listeners.clear();
   }
@@ -314,6 +422,7 @@ export interface VaultProviderProps {
   client: VaultWorkerClient;
   storage: IndexedDbStorage;
   initialBootstrap?: VaultBootstrapData | null;
+  initialAutoLockMinutes?: number;
   children: React.ReactNode;
 }
 
@@ -321,16 +430,50 @@ export const VaultProvider: React.FC<VaultProviderProps> = ({
   client,
   storage,
   initialBootstrap = null,
+  initialAutoLockMinutes,
   children,
 }) => {
   const store = useMemo(
-    () => new VaultStore(client, storage, initialBootstrap),
-    [client, storage, initialBootstrap]
+    () => new VaultStore(client, storage, initialBootstrap, initialAutoLockMinutes),
+    [client, storage, initialBootstrap, initialAutoLockMinutes]
   );
 
   useEffect(() => {
     return () => {
       store.dispose();
+    };
+  }, [store]);
+
+  // Window/document user activity listeners to touch idle timeout
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    let lastThrottledTime = 0;
+    const handleActivity = () => {
+      const now = Date.now();
+      if (now - lastThrottledTime > 1000) {
+        lastThrottledTime = now;
+        store.recordActivity();
+      }
+    };
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        store.checkIdleLock();
+      }
+    };
+
+    const events = ["mousedown", "keydown", "touchstart", "scroll", "mousemove"];
+    for (const event of events) {
+      window.addEventListener(event, handleActivity, { passive: true });
+    }
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+
+    return () => {
+      for (const event of events) {
+        window.removeEventListener(event, handleActivity);
+      }
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
   }, [store]);
 
@@ -348,12 +491,19 @@ export const VaultProvider: React.FC<VaultProviderProps> = ({
       get error() {
         return store.getState().error;
       },
+      get autoLockTimeoutMinutes() {
+        return store.getState().autoLockTimeoutMinutes;
+      },
       clearError: () => store.clearError(),
       initVault: (p: string, k?: string) => store.initVault(p, k),
       unlockWithPassphrase: (p: string) => store.unlockWithPassphrase(p),
       unlockWithRecoveryKey: (r: string) => store.unlockWithRecoveryKey(r),
-      rewrapPassphrase: (p: string, k?: string) => store.rewrapPassphrase(p, k),
+      rewrapPassphrase: (p: string, k?: string, old?: string) =>
+        store.rewrapPassphrase(p, k, old),
       lock: () => store.lock(),
+      setAutoLockTimeout: (minutes: number) => store.setAutoLockTimeout(minutes),
+      recordActivity: () => store.recordActivity(),
+      checkIdleLock: () => store.checkIdleLock(),
       client: store.client,
       storage: store.storage,
       store,

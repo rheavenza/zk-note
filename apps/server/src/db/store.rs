@@ -105,6 +105,15 @@ impl ServerDb {
         })
     }
 
+    /// Opens an SQLite database file at `path` and executes all migrations.
+    pub fn open_file<P: AsRef<std::path::Path>>(path: P) -> Result<Self, DbError> {
+        let mut conn = Connection::open(path)?;
+        crate::db::migrations::run_server_migrations(&mut conn)?;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
+    }
+
     /// Wraps an existing rusqlite connection in a [`ServerDb`].
     pub fn from_connection(conn: Connection) -> Self {
         Self {
@@ -905,25 +914,27 @@ impl ServerDb {
                 None => None,
             };
 
+            // If device_id is present, check whether device is revoked first
+            if let Some(dev_id) = device_id {
+                let dev_revoked: bool = conn
+                    .query_row(
+                        "SELECT (revoked_at IS NOT NULL) FROM devices WHERE account_id = ?1 AND device_id = ?2",
+                        rusqlite::params![account_id.to_string(), dev_id.to_string()],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(false);
+
+                if dev_revoked {
+                    return Ok(Some(SessionValidationResult::DeviceRevoked));
+                }
+            }
+
             if revoked_at.is_some() {
                 return Ok(Some(SessionValidationResult::Revoked));
             }
 
             if is_expired {
                 return Ok(Some(SessionValidationResult::Expired));
-            }
-
-            // If device_id is present, check whether device is revoked
-            if let Some(dev_id) = device_id {
-                let dev_revoked: bool = conn.query_row(
-                    "SELECT (revoked_at IS NOT NULL) FROM devices WHERE account_id = ?1 AND device_id = ?2",
-                    rusqlite::params![account_id.to_string(), dev_id.to_string()],
-                    |r| r.get(0),
-                ).unwrap_or(false);
-
-                if dev_revoked {
-                    return Ok(Some(SessionValidationResult::DeviceRevoked));
-                }
             }
 
             return Ok(Some(SessionValidationResult::Valid {
@@ -1316,6 +1327,133 @@ impl ServerDb {
         }
 
         Ok(())
+    }
+
+    /// Stores an opaque ciphertext blob for the given account (ZK-082).
+    ///
+    /// In accordance with SEC-001, SEC-002, and SEC-003:
+    /// - The server NEVER receives or persists note plaintext, attachment filenames, or MIME types.
+    /// - Blobs are strictly isolated by `account_id` and identified by opaque `blob_id`.
+    /// - Enforces single blob size limit (`max_blob_size`) and account aggregate storage quota (`account_blob_quota`).
+    pub async fn put_blob(
+        &self,
+        account_id: Uuid,
+        blob_id: &str,
+        data: &[u8],
+        account_blob_quota: u64,
+        max_blob_size: usize,
+    ) -> Result<u64, DbError> {
+        if data.len() > max_blob_size {
+            return Err(DbError::BlobSizeExceeded {
+                max: max_blob_size,
+                actual: data.len(),
+            });
+        }
+
+        self.ensure_account(account_id).await?;
+
+        let conn = self.conn.lock().await;
+
+        // Check if blob already exists to compute net storage delta
+        let existing_size: i64 = conn
+            .query_row(
+                "SELECT size FROM blobs WHERE account_id = ?1 AND blob_id = ?2",
+                rusqlite::params![account_id.to_string(), blob_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+
+        // Check current aggregate usage
+        let current_usage: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(size), 0) FROM blobs WHERE account_id = ?1",
+            rusqlite::params![account_id.to_string()],
+            |row| row.get(0),
+        )?;
+
+        let current_usage_u64 = if current_usage < 0 {
+            0
+        } else {
+            current_usage as u64
+        };
+        let existing_size_u64 = if existing_size < 0 {
+            0
+        } else {
+            existing_size as u64
+        };
+        let new_size_u64 = data.len() as u64;
+
+        let projected_usage = current_usage_u64.saturating_sub(existing_size_u64) + new_size_u64;
+        if projected_usage > account_blob_quota {
+            return Err(DbError::AccountQuotaExceeded {
+                quota: account_blob_quota,
+                requested: projected_usage,
+            });
+        }
+
+        conn.execute(
+            "INSERT INTO blobs (account_id, blob_id, size, data, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+             ON CONFLICT (account_id, blob_id) DO UPDATE SET
+                 size = excluded.size,
+                 data = excluded.data,
+                 updated_at = CURRENT_TIMESTAMP",
+            rusqlite::params![account_id.to_string(), blob_id, new_size_u64 as i64, data],
+        )?;
+
+        Ok(new_size_u64)
+    }
+
+    /// Retrieves an opaque ciphertext blob by ID, strictly scoped to the authenticated account (ZK-082).
+    ///
+    /// Returns `None` if the blob does not exist or belongs to another account.
+    pub async fn get_blob(
+        &self,
+        account_id: Uuid,
+        blob_id: &str,
+    ) -> Result<Option<Vec<u8>>, DbError> {
+        let conn = self.conn.lock().await;
+
+        let mut stmt =
+            conn.prepare("SELECT data FROM blobs WHERE account_id = ?1 AND blob_id = ?2")?;
+
+        let mut rows = stmt.query(rusqlite::params![account_id.to_string(), blob_id])?;
+        if let Some(row) = rows.next()? {
+            let data: Vec<u8> = row.get(0)?;
+            Ok(Some(data))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Deletes a ciphertext blob by ID, strictly scoped to the authenticated account (ZK-082).
+    ///
+    /// Returns `true` if a blob was deleted, or `false` if it did not exist.
+    pub async fn delete_blob(&self, account_id: Uuid, blob_id: &str) -> Result<bool, DbError> {
+        let conn = self.conn.lock().await;
+
+        let rows_affected = conn.execute(
+            "DELETE FROM blobs WHERE account_id = ?1 AND blob_id = ?2",
+            rusqlite::params![account_id.to_string(), blob_id],
+        )?;
+
+        Ok(rows_affected > 0)
+    }
+
+    /// Returns the total storage bytes consumed by an account's ciphertext blobs (ZK-082).
+    pub async fn get_account_blob_usage(&self, account_id: Uuid) -> Result<u64, DbError> {
+        let conn = self.conn.lock().await;
+
+        let current_usage: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(size), 0) FROM blobs WHERE account_id = ?1",
+            rusqlite::params![account_id.to_string()],
+            |row| row.get(0),
+        )?;
+
+        Ok(if current_usage < 0 {
+            0
+        } else {
+            current_usage as u64
+        })
     }
 }
 

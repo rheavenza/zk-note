@@ -334,3 +334,93 @@ export async function signInWithPasskey(
   // Fallback for non-browser/test environments
   throw new Error("WebAuthn navigator.credentials is not available in the current environment.");
 }
+
+/**
+ * Information about a registered device (ZK-075).
+ */
+export interface DeviceInfo {
+  deviceId: string;
+  displayName?: string | null;
+  createdAt: string;
+  lastSeen?: string | null;
+  lastAckServerSeq: number;
+  isRevoked: boolean;
+  revokedAt?: string | null;
+}
+
+export interface DeviceListResponse {
+  devices: DeviceInfo[];
+}
+
+export interface RevokeDeviceResponse {
+  status: string;
+  deviceId: string;
+  revokedSessionsCount: number;
+}
+
+/**
+ * Fetches authorized devices from GET /v1/devices (ZK-075).
+ */
+export async function listDevices(
+  serverUrl: string,
+  token: string
+): Promise<DeviceInfo[]> {
+  const cleanUrl = serverUrl.replace(/\/+$/, "");
+  const res = await fetch(`${cleanUrl}/v1/devices`, {
+    method: "GET",
+    headers: {
+      Authorization: `Bearer ${token}`,
+    },
+  });
+
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.message || `Failed to list devices (HTTP ${res.status})`);
+  }
+
+  const data = await res.json();
+  const rawList = Array.isArray(data.devices) ? data.devices : [];
+  return rawList.map((d: any) => ({
+    deviceId: d.device_id || d.deviceId,
+    displayName: d.display_name !== undefined ? d.display_name : d.displayName,
+    createdAt: d.created_at || d.createdAt,
+    lastSeen: d.last_seen !== undefined ? d.last_seen : d.lastSeen,
+    lastAckServerSeq:
+      d.last_ack_server_seq !== undefined ? d.last_ack_server_seq : (d.lastAckServerSeq ?? 0),
+    isRevoked: Boolean(d.is_revoked ?? d.isRevoked),
+    revokedAt: d.revoked_at !== undefined ? d.revoked_at : d.revokedAt,
+  }));
+}
+
+/**
+ * Revokes an authorized device via DELETE /v1/devices/{deviceId} (ZK-075).
+ */
+export async function revokeDevice(
+  serverUrl: string,
+  token: string,
+  deviceId: string
+): Promise<RevokeDeviceResponse> {
+  const cleanUrl = serverUrl.replace(/\/+$/, "");
+  const res = await fetch(`${cleanUrl}/v1/devices/${deviceId}`, {
+    method: "DELETE",
+    headers: {
+      Authorization: `Bearer ${token}`,
+    },
+  });
+
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.message || `Failed to revoke device (HTTP ${res.status})`);
+  }
+
+  const data = await res.json();
+  return {
+    status: data.status || "revoked",
+    deviceId: data.device_id || data.deviceId || deviceId,
+    revokedSessionsCount:
+      data.revoked_sessions_count !== undefined
+        ? data.revoked_sessions_count
+        : (data.revokedSessionsCount ?? 0),
+  };
+}
+

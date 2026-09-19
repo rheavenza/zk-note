@@ -27,8 +27,19 @@ export interface PlaintextNoteDto {
   title: string;
   body: string;
   tags: string[];
+  attachments: string[];
   createdAt: string;
   updatedAt: string;
+}
+
+export interface AttachmentManifestDto {
+  attachment_id: string;
+  name: string;
+  mime: string;
+  size: number;
+  chunk_count: number;
+  chunk_size: number;
+  content_hash?: string | null;
 }
 
 export interface SearchResultDto {
@@ -87,6 +98,9 @@ export interface UnlockWithRecoveryKeyPayload {
 export interface RewrapPassphrasePayload {
   newPassphrase: string;
   kdfParamsJson?: string;
+  oldPassphrase?: string;
+  currentWrappedVaultKeyJson?: string;
+  currentKdfParamsJson?: string;
 }
 
 export interface EncryptNotePayload {
@@ -94,6 +108,7 @@ export interface EncryptNotePayload {
   title: string;
   body: string;
   tags: string[];
+  attachments?: string[];
 }
 
 export interface DecryptNotePayload {
@@ -120,6 +135,32 @@ export interface SearchPayload {
   query: string;
 }
 
+export interface EncryptAttachmentChunkPayload {
+  chunkBytes: Uint8Array;
+  attachmentId: string;
+  chunkIndex: number;
+  totalChunks: number;
+  attachmentKeyBase64: string;
+}
+
+export interface DecryptAttachmentChunkPayload {
+  chunkBinary: Uint8Array;
+  attachmentKeyBase64: string;
+}
+
+export interface EncryptAttachmentManifestPayload {
+  manifest: AttachmentManifestDto;
+  attachmentKeyBase64: string;
+}
+
+export interface DecryptAttachmentManifestPayload {
+  envelopeJson: string;
+}
+
+export interface ComputeContentHashPayload {
+  bytes: Uint8Array;
+}
+
 export interface RequestPayloadMap {
   INIT_VAULT: InitVaultPayload;
   UNLOCK_VAULT: UnlockVaultPayload;
@@ -133,6 +174,12 @@ export interface RequestPayloadMap {
   INDEX_NOTE: IndexNotePayload;
   REMOVE_FROM_INDEX: RemoveFromIndexPayload;
   SEARCH: SearchPayload;
+  ENCRYPT_ATTACHMENT_CHUNK: EncryptAttachmentChunkPayload;
+  DECRYPT_ATTACHMENT_CHUNK: DecryptAttachmentChunkPayload;
+  ENCRYPT_ATTACHMENT_MANIFEST: EncryptAttachmentManifestPayload;
+  DECRYPT_ATTACHMENT_MANIFEST: DecryptAttachmentManifestPayload;
+  GENERATE_ATTACHMENT_KEY: void;
+  COMPUTE_CONTENT_HASH: ComputeContentHashPayload;
 }
 
 export interface ResponseDataMap {
@@ -148,6 +195,15 @@ export interface ResponseDataMap {
   INDEX_NOTE: { success: true };
   REMOVE_FROM_INDEX: { success: true };
   SEARCH: SearchResultDto[];
+  ENCRYPT_ATTACHMENT_CHUNK: { chunkBinary: Uint8Array };
+  DECRYPT_ATTACHMENT_CHUNK: { plaintextBytes: Uint8Array };
+  ENCRYPT_ATTACHMENT_MANIFEST: { envelopeJson: string };
+  DECRYPT_ATTACHMENT_MANIFEST: {
+    manifest: AttachmentManifestDto;
+    attachmentKeyBase64: string;
+  };
+  GENERATE_ATTACHMENT_KEY: { attachmentKeyBase64: string };
+  COMPUTE_CONTENT_HASH: { hash: string };
 }
 
 export type WorkerRequestType = keyof RequestPayloadMap;

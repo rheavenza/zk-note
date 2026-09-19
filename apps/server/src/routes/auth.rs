@@ -17,7 +17,8 @@ use axum::Json;
 use base64ct::{Base64, Base64UrlUnpadded, Encoding};
 use uuid::Uuid;
 use zk_protocol::auth::{
-    DeviceAuthRequest, DeviceAuthResponse, SessionResponse, SessionStatusResponse,
+    DeviceAuthRequest, DeviceAuthResponse, DeviceInfo, DeviceListResponse, RevokeDeviceRequest,
+    RevokeDeviceResponse, SessionResponse, SessionStatusResponse,
 };
 use zk_protocol::constants::{
     ERROR_AUTH_REQUIRED, ERROR_CRYPTO_AUTH_FAILED, ERROR_DEVICE_REVOKED,
@@ -713,4 +714,106 @@ pub async fn session_status_handler(auth: AuthenticatedAccount) -> Response {
         }),
     )
         .into_response()
+}
+
+/// Handler for `GET /v1/devices` (ZK-075).
+///
+/// Returns all registered devices for the authenticated account.
+pub async fn list_devices_handler(
+    auth: AuthenticatedAccount,
+    State(state): State<AppState>,
+) -> Response {
+    match state.db.list_devices(auth.account_id).await {
+        Ok(rows) => {
+            let devices: Vec<DeviceInfo> = rows
+                .into_iter()
+                .map(|r| DeviceInfo {
+                    device_id: r.device_id,
+                    account_id: r.account_id,
+                    display_name: r.display_name,
+                    created_at: r.created_at,
+                    last_seen: r.last_seen,
+                    last_ack_server_seq: r.last_ack_server_seq,
+                    is_revoked: r.revoked_at.is_some(),
+                    revoked_at: r.revoked_at,
+                })
+                .collect();
+            (StatusCode::OK, Json(DeviceListResponse { devices })).into_response()
+        }
+        Err(e) => {
+            tracing::error!("failed to list devices: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    code: "DATABASE_ERROR".to_string(),
+                    message: "Failed to list devices".to_string(),
+                }),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Handler for `DELETE /v1/devices/:device_id` (ZK-075).
+///
+/// Revokes the specified device and invalidates all associated sessions.
+pub async fn revoke_device_handler(
+    axum::extract::Path(device_id): axum::extract::Path<Uuid>,
+    auth: AuthenticatedAccount,
+    State(state): State<AppState>,
+) -> Response {
+    match state.db.revoke_device(auth.account_id, device_id).await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(RevokeDeviceResponse {
+                device_id,
+                revoked: true,
+                message: "Device and associated sessions revoked successfully".to_string(),
+            }),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!("failed to revoke device {device_id}: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    code: "DATABASE_ERROR".to_string(),
+                    message: "Failed to revoke device".to_string(),
+                }),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Handler for `POST /v1/devices/revoke` (ZK-075).
+///
+/// Convenience endpoint accepting JSON payload to revoke a device.
+pub async fn revoke_device_post_handler(
+    auth: AuthenticatedAccount,
+    State(state): State<AppState>,
+    Json(req): Json<RevokeDeviceRequest>,
+) -> Response {
+    match state.db.revoke_device(auth.account_id, req.device_id).await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(RevokeDeviceResponse {
+                device_id: req.device_id,
+                revoked: true,
+                message: "Device and associated sessions revoked successfully".to_string(),
+            }),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!("failed to revoke device {}: {e}", req.device_id);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    code: "DATABASE_ERROR".to_string(),
+                    message: "Failed to revoke device".to_string(),
+                }),
+            )
+                .into_response()
+        }
+    }
 }

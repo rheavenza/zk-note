@@ -9,10 +9,11 @@
  * - Offline-first operation.
  */
 
-import React, { useState, useRef, useCallback } from "react";
+import React, { useState, useRef, useCallback, useEffect } from "react";
 import { useNotes } from "../context/NotesContext.js";
 import { useConflict } from "../context/ConflictContext.js";
 import { renderMarkdown } from "../utils/markdown.js";
+import { AttachmentManifestDto } from "../worker/protocol.js";
 
 export type EditorViewMode = "edit" | "preview" | "split";
 
@@ -31,15 +32,88 @@ export const MarkdownEditor: React.FC<MarkdownEditorProps> = ({
     saveNoteNow,
     deleteNote,
     saveStatus,
+    attachFile,
+    detachAttachment,
+    downloadAttachment,
+    getAttachmentManifests,
+    attachmentProgress,
   } = useNotes();
   const { activeConflicts, openModal } = useConflict();
 
   const [viewMode, setViewMode] = useState<EditorViewMode>("split");
   const [tagInput, setTagInput] = useState("");
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [manifests, setManifests] = useState<AttachmentManifestDto[]>([]);
+  const [isAttaching, setIsAttaching] = useState(false);
+  const [attachmentError, setAttachmentError] = useState<string | null>(null);
+
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const noteId = selectedNote?.id;
+
+  useEffect(() => {
+    if (noteId) {
+      getAttachmentManifests(noteId)
+        .then(setManifests)
+        .catch(() => setManifests([]));
+    } else {
+      setManifests([]);
+    }
+  }, [noteId, selectedNote?.attachments]);
+
+  const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file || !noteId) return;
+    setAttachmentError(null);
+    setIsAttaching(true);
+    try {
+      await attachFile(noteId, file);
+      const updated = await getAttachmentManifests(noteId);
+      setManifests(updated);
+    } catch (err: any) {
+      setAttachmentError(err?.message || "Failed to attach file");
+    } finally {
+      setIsAttaching(false);
+      if (fileInputRef.current) {
+        fileInputRef.current.value = "";
+      }
+    }
+  };
+
+  const handleDownload = async (attId: string, name: string) => {
+    try {
+      const downloaded = await downloadAttachment(attId);
+      if (typeof window !== "undefined" && typeof document !== "undefined") {
+        const url = URL.createObjectURL(downloaded.blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = name || "attachment";
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+      }
+    } catch (err: any) {
+      alert(`Download failed: ${err?.message || err}`);
+    }
+  };
+
+  const handleDetach = async (attId: string) => {
+    if (!noteId) return;
+    try {
+      await detachAttachment(noteId, attId);
+      setManifests((prev) => prev.filter((m) => m.attachment_id !== attId));
+    } catch (err: any) {
+      alert(`Detach failed: ${err?.message || err}`);
+    }
+  };
+
+  const formatFileSize = (bytes: number): string => {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  };
 
   const handleTitleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (!noteId) return;
@@ -241,6 +315,122 @@ export const MarkdownEditor: React.FC<MarkdownEditorProps> = ({
           style={tagInputStyle}
           className="zk-tag-input"
         />
+      </div>
+
+      {/* Attachments Section (ZK-084) */}
+      <div
+        style={attachmentsContainerStyle}
+        className="zk-attachments-section"
+        data-testid="attachments-section"
+      >
+        <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap", width: "100%" }}>
+          <button
+            type="button"
+            onClick={() => fileInputRef.current?.click()}
+            disabled={isAttaching}
+            style={attachButtonStyle}
+            className="zk-attach-file-btn"
+            data-testid="attach-file-button"
+            title="Attach file to this note"
+          >
+            📎 {isAttaching ? "Attaching..." : "Attach File"}
+          </button>
+          <input
+            type="file"
+            ref={fileInputRef}
+            onChange={handleFileSelect}
+            style={{ display: "none" }}
+            data-testid="attachment-file-input"
+          />
+
+          {manifests.length > 0 && (
+            <span style={{ fontSize: "12px", color: "#6b7280", fontWeight: 500 }}>
+              Attachments ({manifests.length}):
+            </span>
+          )}
+
+          {manifests.map((att) => (
+            <div
+              key={att.attachment_id}
+              style={attachmentItemStyle}
+              className="zk-attachment-item"
+              data-testid={`attachment-item-${att.attachment_id}`}
+            >
+              <span title={att.mime} style={{ fontSize: "13px" }}>📄</span>
+              <span
+                style={{
+                  fontWeight: 500,
+                  maxWidth: "160px",
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                  whiteSpace: "nowrap",
+                }}
+                title={att.name}
+              >
+                {att.name}
+              </span>
+              <span style={{ fontSize: "11px", color: "#6b7280" }}>
+                ({formatFileSize(att.size)})
+              </span>
+              <button
+                type="button"
+                onClick={() => handleDownload(att.attachment_id, att.name)}
+                style={downloadButtonStyle}
+                className="zk-attachment-download-btn"
+                data-testid={`download-attachment-${att.attachment_id}`}
+                title={`Download ${att.name}`}
+              >
+                ⬇️
+              </button>
+              <button
+                type="button"
+                onClick={() => handleDetach(att.attachment_id)}
+                style={removeAttachmentButtonStyle}
+                className="zk-attachment-detach-btn"
+                data-testid={`detach-attachment-${att.attachment_id}`}
+                title={`Detach ${att.name}`}
+              >
+                ×
+              </button>
+            </div>
+          ))}
+        </div>
+
+        {/* Attachment Upload / Download Progress Indicator */}
+        {attachmentProgress && (
+          <div
+            style={progressContainerStyle}
+            className="zk-attachment-progress"
+            data-testid="attachment-progress"
+          >
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                fontSize: "12px",
+                color: "#374151",
+                marginBottom: "4px",
+              }}
+            >
+              <span>{attachmentProgress.message || `${attachmentProgress.phase}...`}</span>
+              <span>{attachmentProgress.percent}%</span>
+            </div>
+            <div style={progressBarTrackStyle}>
+              <div
+                style={{
+                  ...progressBarFillStyle,
+                  width: `${attachmentProgress.percent}%`,
+                }}
+              />
+            </div>
+          </div>
+        )}
+
+        {attachmentError && (
+          <div style={{ color: "#dc2626", fontSize: "12px", marginTop: "4px" }} data-testid="attachment-error">
+            ⚠️ {attachmentError}
+          </div>
+        )}
       </div>
 
       {/* Formatting Toolbar */}
@@ -661,5 +851,77 @@ const resolveBannerButtonStyle: React.CSSProperties = {
   fontSize: "12px",
   fontWeight: 600,
   cursor: "pointer",
+};
+
+const attachmentsContainerStyle: React.CSSProperties = {
+  padding: "8px 16px",
+  borderBottom: "1px solid #e5e7eb",
+  backgroundColor: "#f9fafb",
+  display: "flex",
+  flexDirection: "column",
+  gap: "6px",
+};
+
+const attachButtonStyle: React.CSSProperties = {
+  padding: "4px 10px",
+  backgroundColor: "#ffffff",
+  border: "1px solid #d1d5db",
+  borderRadius: "6px",
+  fontSize: "12px",
+  fontWeight: 500,
+  cursor: "pointer",
+  color: "#374151",
+  display: "inline-flex",
+  alignItems: "center",
+  gap: "4px",
+};
+
+const attachmentItemStyle: React.CSSProperties = {
+  display: "inline-flex",
+  alignItems: "center",
+  gap: "6px",
+  padding: "3px 8px",
+  backgroundColor: "#ffffff",
+  border: "1px solid #e5e7eb",
+  borderRadius: "6px",
+  fontSize: "12px",
+  color: "#1f2937",
+};
+
+const downloadButtonStyle: React.CSSProperties = {
+  background: "none",
+  border: "none",
+  cursor: "pointer",
+  padding: "2px",
+  fontSize: "12px",
+};
+
+const removeAttachmentButtonStyle: React.CSSProperties = {
+  background: "none",
+  border: "none",
+  color: "#9ca3af",
+  cursor: "pointer",
+  fontSize: "14px",
+  lineHeight: 1,
+  padding: "0 2px",
+};
+
+const progressContainerStyle: React.CSSProperties = {
+  width: "100%",
+  marginTop: "4px",
+};
+
+const progressBarTrackStyle: React.CSSProperties = {
+  width: "100%",
+  height: "6px",
+  backgroundColor: "#e5e7eb",
+  borderRadius: "3px",
+  overflow: "hidden",
+};
+
+const progressBarFillStyle: React.CSSProperties = {
+  height: "100%",
+  backgroundColor: "#2563eb",
+  transition: "width 0.2s ease-in-out",
 };
 

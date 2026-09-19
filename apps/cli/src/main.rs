@@ -9,9 +9,10 @@ mod session;
 
 use clap::{Parser, Subcommand};
 use commands::{
-    cmd_conflicts, cmd_delete, cmd_edit, cmd_history, cmd_init, cmd_list, cmd_lock, cmd_login,
-    cmd_logout, cmd_new, cmd_recover, cmd_resolve, cmd_search, cmd_show, cmd_status, cmd_unlock,
-    cmd_whoami,
+    cmd_attach, cmd_attachments, cmd_autolock, cmd_conflicts, cmd_delete, cmd_detach,
+    cmd_device_list, cmd_device_revoke, cmd_edit, cmd_history, cmd_init, cmd_list, cmd_lock,
+    cmd_login, cmd_logout, cmd_new, cmd_passwd, cmd_recover, cmd_resolve, cmd_search, cmd_show,
+    cmd_status, cmd_unlock, cmd_whoami,
 };
 use error::CliError;
 use std::path::PathBuf;
@@ -59,6 +60,10 @@ pub enum Commands {
         /// Set a new master passphrase when unlocking
         #[arg(long)]
         new_passphrase: Option<String>,
+
+        /// Auto-lock idle timeout in minutes (0 to disable, defaults to 15 or $ZK_AUTO_LOCK_MINUTES)
+        #[arg(long, alias = "idle-timeout")]
+        timeout: Option<u64>,
     },
     /// Recover vault access using 288-bit recovery key and reset passphrase (ZK-073)
     Recover {
@@ -78,8 +83,34 @@ pub enum Commands {
         #[arg(long, hide = true)]
         test_kdf: bool,
     },
-    /// Lock the vault and clear active session
+    /// Change the vault master passphrase (ZK-074)
+    #[command(alias = "change-password", alias = "password")]
+    Passwd {
+        /// Current master passphrase (prompted if omitted)
+        #[arg(long)]
+        old_passphrase: Option<String>,
+
+        /// New master passphrase
+        #[arg(long)]
+        new_passphrase: Option<String>,
+
+        /// Use fast test KDF parameters (for testing only)
+        #[arg(long, hide = true)]
+        test_kdf: bool,
+    },
+    /// Lock the vault and clear active session key material
     Lock,
+    /// View or configure the vault auto-lock idle timeout policy (ZK-076)
+    #[command(alias = "auto-lock")]
+    Autolock {
+        /// Set the idle auto-lock timeout in minutes (0 to disable)
+        #[arg(short = 't', long)]
+        timeout: Option<u64>,
+
+        /// Output auto-lock status in raw JSON format
+        #[arg(long)]
+        json: bool,
+    },
     /// Display vault and sync server status
     Status,
     /// Log in to a sync server and authorize this device (ZK-072)
@@ -111,6 +142,11 @@ pub enum Commands {
         /// Output whoami details in raw JSON format
         #[arg(long)]
         json: bool,
+    },
+    /// Manage authorized devices and sessions (ZK-075)
+    Device {
+        #[command(subcommand)]
+        subcommand: DeviceCommands,
     },
     /// Create a new encrypted note
     #[command(alias = "create")]
@@ -257,6 +293,59 @@ pub enum Commands {
         #[arg(short = 'g', long = "tag", value_delimiter = ',')]
         tag: Option<Vec<String>>,
     },
+    /// Attach a file to an existing note (ZK-083)
+    Attach {
+        /// Note identifier (or unique prefix)
+        note_id: String,
+
+        /// Path to the file to attach
+        file: PathBuf,
+
+        /// Custom attachment display name (defaults to file name)
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Custom attachment MIME type
+        #[arg(long)]
+        mime: Option<String>,
+    },
+    /// Detach and remove an attachment from a note (ZK-083)
+    Detach {
+        /// Note identifier (or unique prefix)
+        note_id: String,
+
+        /// Attachment identifier
+        attachment_id: String,
+    },
+    /// List attachments belonging to a note (ZK-083)
+    Attachments {
+        /// Note identifier (or unique prefix)
+        note_id: String,
+
+        /// Output attachments in raw JSON format
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// Device management subcommands (ZK-075).
+#[derive(Subcommand, Debug)]
+pub enum DeviceCommands {
+    /// List authorized devices and sessions
+    List {
+        /// Output device list in raw JSON format
+        #[arg(long)]
+        json: bool,
+    },
+    /// Revoke an authorized device and its active sessions
+    Revoke {
+        /// Device UUID to revoke
+        device_id: String,
+
+        /// Output revocation response in raw JSON format
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 async fn run() -> Result<(), CliError> {
@@ -272,7 +361,8 @@ async fn run() -> Result<(), CliError> {
             passphrase,
             recovery_key,
             new_passphrase,
-        } => cmd_unlock(data_dir, passphrase, recovery_key, new_passphrase),
+            timeout,
+        } => cmd_unlock(data_dir, passphrase, recovery_key, new_passphrase, timeout),
         Commands::Recover {
             recovery_key,
             new_passphrase,
@@ -285,7 +375,13 @@ async fn run() -> Result<(), CliError> {
             export_receipt.as_deref(),
             test_kdf,
         ),
+        Commands::Passwd {
+            old_passphrase,
+            new_passphrase,
+            test_kdf,
+        } => cmd_passwd(data_dir, old_passphrase, new_passphrase, test_kdf),
         Commands::Lock => cmd_lock(data_dir),
+        Commands::Autolock { timeout, json } => cmd_autolock(data_dir, timeout, json),
         Commands::Status => cmd_status(data_dir),
         Commands::Login {
             server,
@@ -296,6 +392,12 @@ async fn run() -> Result<(), CliError> {
         } => cmd_login(data_dir, server, account_id, device_name, device_id, token).await,
         Commands::Logout => cmd_logout(data_dir).await,
         Commands::Whoami { json } => cmd_whoami(data_dir, json).await,
+        Commands::Device { subcommand } => match subcommand {
+            DeviceCommands::List { json } => cmd_device_list(data_dir, json).await,
+            DeviceCommands::Revoke { device_id, json } => {
+                cmd_device_revoke(data_dir, &device_id, json).await
+            }
+        },
         Commands::New { title, body, tag } => {
             cmd_new(data_dir, title, body, tag)?;
             Ok(())
@@ -340,6 +442,26 @@ async fn run() -> Result<(), CliError> {
         }
         Commands::Conflicts { all, json } => {
             cmd_conflicts(data_dir, all, json)?;
+            Ok(())
+        }
+        Commands::Attach {
+            note_id,
+            file,
+            name,
+            mime,
+        } => {
+            cmd_attach(data_dir, &note_id, &file, name, mime)?;
+            Ok(())
+        }
+        Commands::Detach {
+            note_id,
+            attachment_id,
+        } => {
+            cmd_detach(data_dir, &note_id, &attachment_id)?;
+            Ok(())
+        }
+        Commands::Attachments { note_id, json } => {
+            cmd_attachments(data_dir, &note_id, json)?;
             Ok(())
         }
         Commands::Resolve {
@@ -436,6 +558,7 @@ mod tests {
             Some("wrong-password".to_string()),
             None,
             None,
+            None,
         )
         .unwrap_err();
         match wrong_err {
@@ -447,7 +570,7 @@ mod tests {
         )));
 
         // 6. Unlock with correct password succeeds
-        cmd_unlock(Some(dir_path), Some(pass), None, None).expect("unlock vault");
+        cmd_unlock(Some(dir_path), Some(pass), None, None, None).expect("unlock vault");
         assert!(session::has_active_session(&config::session_file(dir_path)));
 
         // 7. Verify session key can be loaded and matches valid 32-byte key
@@ -492,6 +615,7 @@ mod tests {
             None,
             Some("1234-5678-90AB-CDEF-1234-5678-90AB-CDEF-1234".to_string()),
             None,
+            None,
         )
         .unwrap_err();
 
@@ -501,7 +625,7 @@ mod tests {
         }
 
         // Correct recovery key succeeds
-        cmd_unlock(Some(dir_path), None, Some(recovery_str), None)
+        cmd_unlock(Some(dir_path), None, Some(recovery_str), None, None)
             .expect("unlock with recovery key");
         assert!(session::has_active_session(&config::session_file(dir_path)));
 
@@ -652,7 +776,7 @@ mod tests {
         }
 
         // 10. Unlock again -> show and list succeed
-        cmd_unlock(Some(dir_path), Some(pass), None, None).expect("unlock");
+        cmd_unlock(Some(dir_path), Some(pass), None, None, None).expect("unlock");
 
         let unlocked_show = cmd_show(Some(dir_path), &note1_id, false).expect("show unlocked");
         assert_eq!(unlocked_show.title, "Architecture Plan");
@@ -1041,7 +1165,7 @@ mod tests {
         assert!(matches!(locked_hist, CliError::VaultLocked));
 
         // 12. Unlock and test purge
-        cmd_unlock(Some(dir_path), Some(pass), None, None).expect("unlock");
+        cmd_unlock(Some(dir_path), Some(pass), None, None, None).expect("unlock");
         cmd_delete(Some(dir_path), &note_id, true).expect("purge");
         assert!(storage.get_object(&note_id).expect("get").is_none());
         assert!(storage
@@ -1426,7 +1550,7 @@ mod tests {
         assert!(matches!(locked_rev, CliError::VaultLocked));
 
         // Unlock and verify access restored
-        cmd_unlock(Some(dir_path), Some(pass), None, None).expect("unlock");
+        cmd_unlock(Some(dir_path), Some(pass), None, None, None).expect("unlock");
         let unlocked_rev =
             cmd_history(Some(dir_path), &note_id, Some(2), false).expect("unlocked r2");
         assert_eq!(unlocked_rev[0].revision, 2);
@@ -1491,7 +1615,7 @@ mod tests {
         cmd_status(Some(dir_path)).expect("5. reopen status");
 
         // 6. unlock
-        cmd_unlock(Some(dir_path), Some(pass), None, None).expect("6. unlock");
+        cmd_unlock(Some(dir_path), Some(pass), None, None, None).expect("6. unlock");
 
         // 7. search
         let search_results = cmd_search(Some(dir_path), canary_term, false).expect("7. search");
@@ -2424,6 +2548,76 @@ mod tests {
         let _ = fs::remove_dir_all(&test_dir);
     }
 
+    #[tokio::test]
+    async fn test_cli_device_list_and_revoke() {
+        let (server_url, _state, _shutdown) = start_test_server().await;
+        let test_dir1 = temp_test_dir("cli_device_mgr_1");
+        let dir1 = test_dir1.as_path();
+        let test_dir2 = temp_test_dir("cli_device_mgr_2");
+        let dir2 = test_dir2.as_path();
+
+        let account_id = Uuid::new_v4();
+        let dev1_id = Uuid::new_v4();
+        let dev2_id = Uuid::new_v4();
+
+        // 1. Client 1 logs in
+        cmd_login(
+            Some(dir1),
+            Some(server_url.clone()),
+            Some(account_id.to_string()),
+            Some("Laptop Workstation".to_string()),
+            Some(dev1_id.to_string()),
+            None,
+        )
+        .await
+        .expect("client 1 login succeeds");
+
+        // 2. Client 2 logs in with same account
+        cmd_login(
+            Some(dir2),
+            Some(server_url.clone()),
+            Some(account_id.to_string()),
+            Some("Mobile Device".to_string()),
+            Some(dev2_id.to_string()),
+            None,
+        )
+        .await
+        .expect("client 2 login succeeds");
+
+        // 3. Client 1 lists devices
+        cmd_device_list(Some(dir1), false)
+            .await
+            .expect("device list succeeds");
+
+        // 4. Client 1 revokes device 2
+        cmd_device_revoke(Some(dir1), &dev2_id.to_string(), false)
+            .await
+            .expect("revoke device 2 succeeds");
+
+        // 5. Client 2 attempts whoami -> detects revoked device/session
+        cmd_whoami(Some(dir2), false)
+            .await
+            .expect("whoami on revoked client handles gracefully");
+
+        // 6. Client 1 is still active and can list devices (device 2 is revoked)
+        cmd_device_list(Some(dir1), true)
+            .await
+            .expect("device list JSON succeeds");
+
+        // 7. Client 1 revokes its own device -> clears local session
+        let auth_path1 = config::auth_session_file(dir1);
+        assert!(auth::has_auth_session(&auth_path1));
+
+        cmd_device_revoke(Some(dir1), &dev1_id.to_string(), false)
+            .await
+            .expect("self-revocation succeeds");
+
+        assert!(!auth::has_auth_session(&auth_path1));
+
+        let _ = fs::remove_dir_all(&test_dir1);
+        let _ = fs::remove_dir_all(&test_dir2);
+    }
+
     #[test]
     fn test_cli_recover_restores_vault_and_resets_passphrase() {
         let test_dir = temp_test_dir("cli_recover_passphrase");
@@ -2443,7 +2637,7 @@ mod tests {
         let _ = zk_storage::SqliteStorage::open(config::db_file(dir_path)).expect("open db");
 
         // Unlock to create a note
-        cmd_unlock(Some(dir_path), Some(initial_pass.clone()), None, None).expect("unlock");
+        cmd_unlock(Some(dir_path), Some(initial_pass.clone()), None, None, None).expect("unlock");
         let note_id = cmd_new(
             Some(dir_path),
             Some("Secret Project".to_string()),
@@ -2480,20 +2674,21 @@ mod tests {
         cmd_lock(Some(dir_path)).expect("lock");
 
         // 5. Old passphrase must FAIL closed
-        let old_err = cmd_unlock(Some(dir_path), Some(initial_pass), None, None).unwrap_err();
+        let old_err = cmd_unlock(Some(dir_path), Some(initial_pass), None, None, None).unwrap_err();
         match old_err {
             CliError::AuthenticationFailed => (),
             other => panic!("expected AuthenticationFailed on old passphrase, got {other:?}"),
         }
 
         // 6. New passphrase unlocks successfully
-        cmd_unlock(Some(dir_path), Some(new_pass), None, None).expect("unlock with new passphrase");
+        cmd_unlock(Some(dir_path), Some(new_pass), None, None, None)
+            .expect("unlock with new passphrase");
         let note_again = cmd_show(Some(dir_path), &note_id, false).expect("show note again");
         assert_eq!(note_again.title, "Secret Project");
 
         // 7. Recovery key STILL unlocks successfully
         cmd_lock(Some(dir_path)).expect("lock");
-        cmd_unlock(Some(dir_path), None, Some(recovery_str), None)
+        cmd_unlock(Some(dir_path), None, Some(recovery_str), None, None)
             .expect("unlock with recovery key after rotation");
 
         let _ = fs::remove_dir_all(&test_dir);
@@ -2550,6 +2745,250 @@ mod tests {
         // Never log or write secrets into receipt (SEC-003)
         assert!(!receipt_content.contains(&pass));
         assert!(!receipt_content.contains("vault_key"));
+
+        let _ = fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn test_cli_passwd_command_lifecycle() {
+        let test_dir = temp_test_dir("cli_passwd_lifecycle");
+        let dir_path = test_dir.as_path();
+        let initial_pass = "initial-passphrase-123".to_string();
+        let new_pass = "updated-master-passphrase-456".to_string();
+
+        // 1. Initialize vault and create note
+        let (bootstrap, recovery_str, _vault_key) = zk_core::vault::VaultManager::init_vault(
+            initial_pass.as_bytes(),
+            &zk_crypto::kdf::KdfParams::new_test(),
+        )
+        .expect("init vault");
+
+        let bootstrap_json = serde_json::to_string_pretty(&bootstrap).expect("serialize");
+        fs::write(config::vault_file(dir_path), bootstrap_json).expect("write vault");
+        let _ = zk_storage::SqliteStorage::open(config::db_file(dir_path)).expect("open db");
+
+        cmd_unlock(Some(dir_path), Some(initial_pass.clone()), None, None, None).expect("unlock");
+
+        let note_id = cmd_new(
+            Some(dir_path),
+            Some("ZK-074 Test Note".to_string()),
+            Some("Original confidential note content that must remain untouched.".to_string()),
+            vec!["security".to_string()],
+        )
+        .expect("create note");
+
+        // 2. Changing passphrase with incorrect current passphrase fails closed
+        let bad_err = cmd_passwd(
+            Some(dir_path),
+            Some("wrong-initial-passphrase".to_string()),
+            Some(new_pass.clone()),
+            true,
+        )
+        .unwrap_err();
+        match bad_err {
+            CliError::AuthenticationFailed => (),
+            other => panic!("expected AuthenticationFailed on wrong old passphrase, got {other:?}"),
+        }
+
+        // 3. Changing passphrase with short new passphrase fails
+        let short_err = cmd_passwd(
+            Some(dir_path),
+            Some(initial_pass.clone()),
+            Some("short".to_string()),
+            true,
+        )
+        .unwrap_err();
+        match short_err {
+            CliError::Io(msg) => assert!(msg.contains("at least 8 characters")),
+            other => panic!("expected Io error for short passphrase, got {other:?}"),
+        }
+
+        // 4. Successful password change
+        cmd_passwd(
+            Some(dir_path),
+            Some(initial_pass.clone()),
+            Some(new_pass.clone()),
+            true,
+        )
+        .expect("change password");
+
+        // Verify active session is preserved and note is decryptable
+        let note = cmd_show(Some(dir_path), &note_id, false).expect("show note after passwd");
+        assert_eq!(note.title, "ZK-074 Test Note");
+        assert_eq!(
+            note.body,
+            "Original confidential note content that must remain untouched."
+        );
+
+        // 5. Lock vault
+        cmd_lock(Some(dir_path)).expect("lock");
+
+        // 6. Old passphrase fails closed
+        let old_unlock_err =
+            cmd_unlock(Some(dir_path), Some(initial_pass), None, None, None).unwrap_err();
+        match old_unlock_err {
+            CliError::AuthenticationFailed => (),
+            other => panic!("expected AuthenticationFailed on old passphrase, got {other:?}"),
+        }
+
+        // 7. New passphrase unlocks successfully and note content is intact
+        cmd_unlock(Some(dir_path), Some(new_pass), None, None, None).expect("unlock with new pass");
+        let note_again = cmd_show(Some(dir_path), &note_id, false).expect("show note again");
+        assert_eq!(note_again.title, "ZK-074 Test Note");
+        assert_eq!(
+            note_again.body,
+            "Original confidential note content that must remain untouched."
+        );
+
+        // 8. Recovery key envelope was unchanged and still unlocks vault
+        cmd_lock(Some(dir_path)).expect("lock");
+        cmd_unlock(Some(dir_path), None, Some(recovery_str), None, None)
+            .expect("unlock with recovery key");
+        let note_rec =
+            cmd_show(Some(dir_path), &note_id, false).expect("show note after recovery unlock");
+        assert_eq!(note_rec.title, "ZK-074 Test Note");
+
+        let _ = fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn test_cli_auto_lock_policy_lifecycle() {
+        let test_dir = temp_test_dir("cli_autolock");
+        let dir_path = test_dir.as_path();
+        let pass = "autolock-master-pass".to_string();
+
+        // 1. Initialize vault
+        cmd_init(Some(dir_path), Some(pass.clone()), true).expect("init vault");
+        cmd_lock(Some(dir_path)).expect("lock initial");
+
+        // 2. Unlock with a 15-minute idle timeout
+        cmd_unlock(Some(dir_path), Some(pass.clone()), None, None, Some(15))
+            .expect("unlock with 15m timeout");
+
+        assert!(session::has_active_session(&config::session_file(dir_path)));
+
+        // 3. Inspect session autolock status
+        let session_file = config::session_file(dir_path);
+        let info = session::get_session_info(&session_file)
+            .expect("session info")
+            .expect("session present");
+        assert_eq!(info.idle_timeout_secs, Some(15 * 60));
+
+        // 4. Update autolock timeout to 30 minutes via cmd_autolock
+        cmd_autolock(Some(dir_path), Some(30), false).expect("set autolock to 30m");
+        let info30 = session::get_session_info(&session_file)
+            .expect("session info 30m")
+            .expect("session present");
+        assert_eq!(info30.idle_timeout_secs, Some(30 * 60));
+
+        // 5. Create a test note while unlocked
+        let note_id = cmd_new(
+            Some(dir_path),
+            Some("Autolock Note".to_string()),
+            Some("Encrypted content tested against idle timeout".to_string()),
+            vec!["test".to_string()],
+        )
+        .expect("create note");
+
+        // 6. Disable autolock via 0 timeout
+        cmd_autolock(Some(dir_path), Some(0), false).expect("disable autolock");
+        let info_disabled = session::get_session_info(&session_file)
+            .expect("session info disabled")
+            .expect("session present");
+        assert_eq!(info_disabled.idle_timeout_secs, None);
+
+        // 7. Simulate expired session file (idle timeout = 10s, last active = now - 100s)
+        let now = zk_core::time::now_epoch_secs();
+        let expired_envelope = session::SessionEnvelope {
+            key: [0u8; 32],
+            created_at: now.saturating_sub(200),
+            last_active_at: now.saturating_sub(100),
+            idle_timeout_secs: Some(10),
+        };
+        fs::write(
+            &session_file,
+            serde_json::to_string(&expired_envelope).unwrap(),
+        )
+        .expect("write expired session");
+
+        // 8. Any command attempting to load session should detect expiration and fail closed with VaultLocked
+        let show_err = cmd_show(Some(dir_path), &note_id, false).unwrap_err();
+        match show_err {
+            CliError::VaultLocked => (),
+            other => panic!("expected VaultLocked on expired idle session, got {other:?}"),
+        }
+
+        // Verify session was unlinked / wiped
+        assert!(!session_file.exists());
+        assert!(!session::has_active_session(&session_file));
+
+        // 9. Re-unlock and verify explicit cmd_lock wipes session immediately
+        cmd_unlock(Some(dir_path), Some(pass), None, None, None).expect("re-unlock");
+        assert!(session::has_active_session(&session_file));
+        cmd_lock(Some(dir_path)).expect("explicit lock");
+        assert!(!session::has_active_session(&session_file));
+
+        let _ = fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn test_attachment_attach_list_detach_lifecycle() {
+        let test_dir = std::env::temp_dir().join(format!("zk_cli_att_test_{}", Uuid::new_v4()));
+        let dir_path = test_dir.as_path();
+        let pass = "attachment-test-passphrase-12345".to_string();
+
+        // 1. Initialize and unlock vault
+        cmd_init(Some(dir_path), Some(pass.clone()), true).expect("init vault");
+        cmd_unlock(Some(dir_path), Some(pass), None, None, None).expect("unlock vault");
+
+        // 2. Create note
+        let note_id = cmd_new(
+            Some(dir_path),
+            Some("Note with Attachments".to_string()),
+            Some("Body content for attachment test".to_string()),
+            vec!["attach".to_string()],
+        )
+        .expect("create note");
+
+        // 3. Create a file to attach
+        let sample_file = test_dir.join("sample_document.txt");
+        let sample_content =
+            b"This is confidential attached content that should be chunked and encrypted.";
+        fs::write(&sample_file, sample_content).expect("write sample file");
+
+        // 4. Attach file to note
+        let att_id = cmd_attach(
+            Some(dir_path),
+            &note_id,
+            &sample_file,
+            Some("sample_document.txt".to_string()),
+            Some("text/plain".to_string()),
+        )
+        .expect("attach file");
+
+        // 5. List attachments via cmd_attachments
+        let manifests = cmd_attachments(Some(dir_path), &note_id, false).expect("list attachments");
+        assert_eq!(manifests.len(), 1);
+        assert_eq!(manifests[0].attachment_id, att_id);
+        assert_eq!(manifests[0].name, "sample_document.txt");
+        assert_eq!(manifests[0].mime, "text/plain");
+        assert_eq!(manifests[0].size, sample_content.len() as u64);
+
+        // 6. Show note reflects attachment
+        let note = cmd_show(Some(dir_path), &note_id, false).expect("show note");
+        assert_eq!(note.attachments, vec![att_id.clone()]);
+
+        // 7. Detach attachment
+        cmd_detach(Some(dir_path), &note_id, &att_id).expect("detach attachment");
+
+        // 8. List attachments is now empty
+        let manifests_after =
+            cmd_attachments(Some(dir_path), &note_id, false).expect("list attachments after");
+        assert!(manifests_after.is_empty());
+
+        // 9. Show note reflects removal
+        let note_after = cmd_show(Some(dir_path), &note_id, false).expect("show note after");
+        assert!(note_after.attachments.is_empty());
 
         let _ = fs::remove_dir_all(&test_dir);
     }

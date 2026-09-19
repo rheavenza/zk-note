@@ -20,9 +20,10 @@ export const SecurityRecoveryModal: React.FC<SecurityRecoveryModalProps> = ({
   isOpen,
   onClose,
 }) => {
-  const { vaultState, rewrapPassphrase } = useVault();
+  const { vaultState, rewrapPassphrase, autoLockTimeoutMinutes, setAutoLockTimeout, lock } = useVault();
 
-  const [activeTab, setActiveTab] = useState<"overview" | "changePassphrase">("overview");
+  const [activeTab, setActiveTab] = useState<"overview" | "changePassphrase" | "autoLock">("overview");
+  const [currentPassphrase, setCurrentPassphrase] = useState("");
   const [newPassphrase, setNewPassphrase] = useState("");
   const [confirmPassphrase, setConfirmPassphrase] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -30,11 +31,27 @@ export const SecurityRecoveryModal: React.FC<SecurityRecoveryModalProps> = ({
     null
   );
 
+  const handleClose = () => {
+    setCurrentPassphrase("");
+    setNewPassphrase("");
+    setConfirmPassphrase("");
+    setFeedback(null);
+    onClose();
+  };
+
   if (!isOpen) return null;
 
   const handleChangePassphrase = async (e: React.FormEvent) => {
     e.preventDefault();
     setFeedback(null);
+
+    if (!currentPassphrase) {
+      setFeedback({
+        type: "error",
+        message: "Current master passphrase is required.",
+      });
+      return;
+    }
 
     if (newPassphrase.length < 8) {
       setFeedback({
@@ -52,16 +69,19 @@ export const SecurityRecoveryModal: React.FC<SecurityRecoveryModalProps> = ({
       return;
     }
 
-    const pass = newPassphrase;
+    const currentPass = currentPassphrase;
+    const nextPass = newPassphrase;
+    setCurrentPassphrase("");
     setNewPassphrase("");
     setConfirmPassphrase("");
     setIsSubmitting(true);
 
     try {
-      await rewrapPassphrase(pass);
+      await rewrapPassphrase(nextPass, undefined, currentPass);
       setFeedback({
         type: "success",
-        message: "Master passphrase successfully updated! Your existing recovery key remains valid.",
+        message:
+          "Master passphrase successfully updated! Note ciphertexts remain untouched and your recovery key remains valid.",
       });
     } catch (err) {
       setFeedback({
@@ -77,7 +97,7 @@ export const SecurityRecoveryModal: React.FC<SecurityRecoveryModalProps> = ({
     <div
       style={overlayStyle}
       onClick={(e) => {
-        if (e.target === e.currentTarget) onClose();
+        if (e.target === e.currentTarget) handleClose();
       }}
       data-testid="security-recovery-modal"
     >
@@ -92,7 +112,7 @@ export const SecurityRecoveryModal: React.FC<SecurityRecoveryModalProps> = ({
           </div>
           <button
             type="button"
-            onClick={onClose}
+            onClick={handleClose}
             style={closeButtonStyle}
             aria-label="Close modal"
           >
@@ -106,6 +126,9 @@ export const SecurityRecoveryModal: React.FC<SecurityRecoveryModalProps> = ({
             type="button"
             onClick={() => {
               setActiveTab("overview");
+              setCurrentPassphrase("");
+              setNewPassphrase("");
+              setConfirmPassphrase("");
               setFeedback(null);
             }}
             style={activeTab === "overview" ? activeTabStyle : tabStyle}
@@ -116,12 +139,28 @@ export const SecurityRecoveryModal: React.FC<SecurityRecoveryModalProps> = ({
             type="button"
             onClick={() => {
               setActiveTab("changePassphrase");
+              setCurrentPassphrase("");
+              setNewPassphrase("");
+              setConfirmPassphrase("");
               setFeedback(null);
             }}
             style={activeTab === "changePassphrase" ? activeTabStyle : tabStyle}
             disabled={vaultState !== "UNLOCKED"}
           >
             Change Passphrase
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setActiveTab("autoLock");
+              setCurrentPassphrase("");
+              setNewPassphrase("");
+              setConfirmPassphrase("");
+              setFeedback(null);
+            }}
+            style={activeTab === "autoLock" ? activeTabStyle : tabStyle}
+          >
+            Auto-Lock
           </button>
         </div>
 
@@ -140,7 +179,7 @@ export const SecurityRecoveryModal: React.FC<SecurityRecoveryModalProps> = ({
             </div>
           )}
 
-          {activeTab === "overview" ? (
+          {activeTab === "overview" && (
             <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
               {/* Critical Warning Alert */}
               <div style={warningBoxStyle}>
@@ -181,12 +220,32 @@ export const SecurityRecoveryModal: React.FC<SecurityRecoveryModalProps> = ({
                 </ul>
               </div>
             </div>
-          ) : (
+          )}
+
+          {activeTab === "changePassphrase" && (
             <form onSubmit={handleChangePassphrase} style={{ display: "flex", flexDirection: "column", gap: 16 }}>
               <p style={{ fontSize: 13, color: "#4b5563", margin: 0 }}>
-                Enter a new master passphrase to re-wrap your vault. Your note ciphertexts are
-                preserved and your recovery key remains valid.
+                Enter your current passphrase and a new master passphrase to re-wrap your vault.
+                Existing note ciphertexts are preserved and your recovery key remains valid.
               </p>
+
+              <div>
+                <label htmlFor="modal-current-passphrase" style={labelStyle}>
+                  Current Master Passphrase
+                </label>
+                <input
+                  id="modal-current-passphrase"
+                  type="password"
+                  autoComplete="current-password"
+                  spellCheck={false}
+                  value={currentPassphrase}
+                  onChange={(e) => setCurrentPassphrase(e.target.value)}
+                  disabled={isSubmitting}
+                  placeholder="Enter your current passphrase"
+                  style={inputStyle}
+                  required
+                />
+              </div>
 
               <div>
                 <label htmlFor="modal-new-passphrase" style={labelStyle}>
@@ -227,7 +286,7 @@ export const SecurityRecoveryModal: React.FC<SecurityRecoveryModalProps> = ({
               <div style={{ display: "flex", justifyContent: "flex-end", gap: 10, marginTop: 8 }}>
                 <button
                   type="button"
-                  onClick={onClose}
+                  onClick={handleClose}
                   style={secondaryButtonStyle}
                   disabled={isSubmitting}
                 >
@@ -242,6 +301,104 @@ export const SecurityRecoveryModal: React.FC<SecurityRecoveryModalProps> = ({
                 </button>
               </div>
             </form>
+          )}
+
+          {activeTab === "autoLock" && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+              <div style={warningBoxStyle}>
+                <strong>⏱️ Inactivity Auto-Lock:</strong>
+                <p style={{ margin: "4px 0 0 0", fontSize: 13, lineHeight: 1.4 }}>
+                  Automatically locks your vault after an idle period. Locking immediately purges
+                  all decrypted plaintext notes, search indexes, and cryptographic keys from memory.
+                </p>
+              </div>
+
+              <div>
+                <label style={labelStyle}>Select Idle Timeout</label>
+                <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 6 }}>
+                  {[
+                    { value: 5, label: "5 minutes" },
+                    { value: 15, label: "15 minutes (default)" },
+                    { value: 30, label: "30 minutes" },
+                    { value: 60, label: "60 minutes (1 hour)" },
+                    { value: 0, label: "Never (manual lock only)" },
+                  ].map((option) => (
+                    <label
+                      key={option.value}
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 10,
+                        padding: "8px 12px",
+                        borderRadius: 6,
+                        border:
+                          autoLockTimeoutMinutes === option.value
+                            ? "1px solid #2563eb"
+                            : "1px solid #e5e7eb",
+                        backgroundColor:
+                          autoLockTimeoutMinutes === option.value ? "#eff6ff" : "#ffffff",
+                        cursor: "pointer",
+                        fontSize: 14,
+                      }}
+                    >
+                      <input
+                        type="radio"
+                        name="autolock-timeout"
+                        value={option.value}
+                        checked={autoLockTimeoutMinutes === option.value}
+                        onChange={() => {
+                          setAutoLockTimeout(option.value);
+                          setFeedback({
+                            type: "success",
+                            message: `Auto-lock timeout set to ${option.label}.`,
+                          });
+                        }}
+                      />
+                      <span style={{ fontWeight: autoLockTimeoutMinutes === option.value ? 600 : 400 }}>
+                        {option.label}
+                      </span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+
+              <div
+                style={{
+                  borderTop: "1px solid #e5e7eb",
+                  paddingTop: 14,
+                  marginTop: 4,
+                  display: "flex",
+                  justifyContent: "space-between",
+                  alignItems: "center",
+                }}
+              >
+                <span style={{ fontSize: 13, color: "#6b7280" }}>
+                  Current policy:{" "}
+                  <strong>
+                    {autoLockTimeoutMinutes === 0
+                      ? "Disabled (manual lock only)"
+                      : `${autoLockTimeoutMinutes} minutes`}
+                  </strong>
+                </span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    handleClose();
+                    lock();
+                  }}
+                  style={{
+                    ...secondaryButtonStyle,
+                    color: "#dc2626",
+                    borderColor: "#fca5a5",
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 6,
+                  }}
+                >
+                  <span>🔒</span> Lock Vault Now
+                </button>
+              </div>
+            </div>
           )}
         </div>
       </div>

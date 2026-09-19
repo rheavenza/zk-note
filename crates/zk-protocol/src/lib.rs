@@ -1,6 +1,7 @@
 //! Protocol types, constants, error codes, and serialization models
 //! for the zero-knowledge notes system.
 
+pub mod attachment;
 pub mod auth;
 pub mod constants;
 pub mod envelope;
@@ -10,6 +11,7 @@ pub mod sync;
 pub mod vault;
 pub mod webauthn;
 
+pub use attachment::{AttachmentManifest, ChunkFormatError, EncryptedChunk, CHUNK_BINARY_MAGIC};
 pub use auth::{AuthToken, AuthenticatedSession, SessionResponse, REDACTED_TOKEN};
 pub use constants::*;
 pub use envelope::{EncryptedEnvelope, EncryptedKeyContainer, EncryptedPayloadContainer};

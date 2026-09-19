@@ -46,13 +46,14 @@ function createMockConflictWorkerClient() {
     getStatus: async () => ({ isUnlocked: true, sessionInitialized: true }),
     onLock: () => () => {},
     dispose: () => {},
-    encryptNote: async (noteId: string, title: string, body: string, tags: string[]) => {
+    encryptNote: async (noteId: string, title: string, body: string, tags: string[], attachments: string[] = []) => {
       const now = new Date().toISOString();
       const note: PlaintextNoteDto = {
         id: noteId,
         title,
         body,
         tags,
+        attachments,
         createdAt: now,
         updatedAt: now,
       };
@@ -149,6 +150,7 @@ test("threeWayMergeNotes: Combines title, body diff3, and tags into candidate no
     title: "Original Title",
     body: "Header\nShared body\nFooter",
     tags: ["project"],
+    attachments: [],
     createdAt: "2026-01-01T00:00:00.000Z",
     updatedAt: "2026-01-01T00:00:00.000Z",
   };

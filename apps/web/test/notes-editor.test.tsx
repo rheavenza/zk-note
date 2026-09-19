@@ -117,6 +117,7 @@ function createMockWorkerClient() {
         title: parsed.title,
         body: parsed.body,
         tags: parsed.tags,
+        attachments: parsed.attachments || [],
         createdAt: "2026-09-10T12:00:00Z",
         updatedAt: "2026-09-10T12:00:00Z",
       };
@@ -131,6 +132,7 @@ function createMockWorkerClient() {
           title: parsed.title,
           body: parsed.body,
           tags: parsed.tags || [],
+          attachments: parsed.attachments || [],
           createdAt: "2026-09-10T12:00:00Z",
           updatedAt: "2026-09-10T12:00:00Z",
         };

@@ -14,7 +14,8 @@ use std::fmt;
 use std::path::Path;
 use uuid::Uuid;
 use zk_protocol::auth::{
-    AuthToken, DeviceAuthRequest, DeviceAuthResponse, SessionStatusResponse, REDACTED_TOKEN,
+    AuthToken, DeviceAuthRequest, DeviceAuthResponse, DeviceListResponse, RevokeDeviceResponse,
+    SessionStatusResponse, REDACTED_TOKEN,
 };
 use zk_protocol::constants::{ERROR_AUTH_REVOKED, ERROR_DEVICE_REVOKED};
 use zk_protocol::webauthn::RevokeSessionRequest;
@@ -376,6 +377,109 @@ pub async fn api_query_status(
 
     serde_json::from_slice(&body_bytes)
         .map_err(|e| CliError::CorruptedSession(format!("invalid session status response: {e}")))
+}
+
+/// Lists registered devices for the authenticated account via `GET /v1/devices` (ZK-075).
+pub async fn api_list_devices(session: &StoredAuthSession) -> Result<DeviceListResponse, CliError> {
+    let clean_url = clean_server_url(&session.server_url);
+    let endpoint = format!("{clean_url}/v1/devices");
+
+    let client = Client::new();
+    let auth_header = format!("Bearer {}", session.token.expose_secret());
+    let resp = client
+        .get(&endpoint)
+        .header(
+            AUTHORIZATION,
+            HeaderValue::from_str(&auth_header)
+                .map_err(|e| CliError::AuthError(format!("invalid token string: {e}")))?,
+        )
+        .send()
+        .await
+        .map_err(|e| {
+            CliError::Network(format!("failed to connect to server at {clean_url}: {e}"))
+        })?;
+
+    let status = resp.status();
+    let body_bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| CliError::Network(format!("failed to read response body: {e}")))?;
+
+    if !status.is_success() {
+        if let Ok(err_val) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+            let code = err_val
+                .get("code")
+                .and_then(|c| c.as_str())
+                .unwrap_or("UNKNOWN_ERROR");
+            let msg = err_val
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("Unknown server error");
+            if code == ERROR_AUTH_REVOKED || code == ERROR_DEVICE_REVOKED {
+                return Err(CliError::SessionRevoked);
+            }
+            return Err(CliError::AuthError(format!("{code}: {msg}")));
+        }
+        return Err(CliError::AuthError(format!(
+            "Server returned HTTP {status}"
+        )));
+    }
+
+    serde_json::from_slice(&body_bytes)
+        .map_err(|e| CliError::CorruptedSession(format!("invalid device list response: {e}")))
+}
+
+/// Revokes a device and all its active sessions via `DELETE /v1/devices/{device_id}` (ZK-075).
+pub async fn api_revoke_device(
+    session: &StoredAuthSession,
+    device_id: Uuid,
+) -> Result<RevokeDeviceResponse, CliError> {
+    let clean_url = clean_server_url(&session.server_url);
+    let endpoint = format!("{clean_url}/v1/devices/{device_id}");
+
+    let client = Client::new();
+    let auth_header = format!("Bearer {}", session.token.expose_secret());
+    let resp = client
+        .delete(&endpoint)
+        .header(
+            AUTHORIZATION,
+            HeaderValue::from_str(&auth_header)
+                .map_err(|e| CliError::AuthError(format!("invalid token string: {e}")))?,
+        )
+        .send()
+        .await
+        .map_err(|e| {
+            CliError::Network(format!("failed to connect to server at {clean_url}: {e}"))
+        })?;
+
+    let status = resp.status();
+    let body_bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| CliError::Network(format!("failed to read response body: {e}")))?;
+
+    if !status.is_success() {
+        if let Ok(err_val) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+            let code = err_val
+                .get("code")
+                .and_then(|c| c.as_str())
+                .unwrap_or("UNKNOWN_ERROR");
+            let msg = err_val
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("Unknown server error");
+            if code == ERROR_AUTH_REVOKED || code == ERROR_DEVICE_REVOKED {
+                return Err(CliError::SessionRevoked);
+            }
+            return Err(CliError::AuthError(format!("{code}: {msg}")));
+        }
+        return Err(CliError::AuthError(format!(
+            "Server returned HTTP {status}"
+        )));
+    }
+
+    serde_json::from_slice(&body_bytes)
+        .map_err(|e| CliError::CorruptedSession(format!("invalid revoke device response: {e}")))
 }
 
 #[cfg(test)]

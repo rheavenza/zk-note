@@ -25,6 +25,14 @@ import {
   MutationStatus,
   StoredEncryptedObject,
 } from "../storage/models.js";
+import {
+  AttachmentManager,
+  AttachmentProgress,
+  ProgressCallback,
+  AttachmentFileSource,
+  DownloadedAttachment,
+} from "../attachments/manager.js";
+import { AttachmentManifestDto } from "../worker/protocol.js";
 
 export type SaveStatus = "saved" | "saving" | "unsaved" | "error";
 
@@ -35,6 +43,7 @@ export interface NotesSnapshot {
   saveStatus: SaveStatus;
   lastSavedAt: Date | null;
   error: string | null;
+  attachmentProgress: AttachmentProgress | null;
 }
 
 export interface NotesContextType extends NotesSnapshot {
@@ -46,6 +55,17 @@ export interface NotesContextType extends NotesSnapshot {
   deleteNote: (id: string) => Promise<void>;
   reloadNotes: () => Promise<void>;
   clearError: () => void;
+  attachFile: (
+    noteId: string,
+    file: AttachmentFileSource,
+    onProgress?: ProgressCallback
+  ) => Promise<AttachmentManifestDto>;
+  detachAttachment: (noteId: string, attachmentId: string) => Promise<void>;
+  downloadAttachment: (
+    attachmentId: string,
+    onProgress?: ProgressCallback
+  ) => Promise<DownloadedAttachment>;
+  getAttachmentManifests: (noteId: string) => Promise<AttachmentManifestDto[]>;
   store: NotesStore;
 }
 
@@ -66,11 +86,16 @@ export class NotesStore {
   private listeners = new Set<() => void>();
   private saveTimers = new Map<string, NodeJS.Timeout | number>();
   private isUnlocked = false;
+  public readonly attachmentManager: AttachmentManager;
+  private attachmentProgress: AttachmentProgress | null = null;
 
   constructor(
     public readonly client: VaultWorkerClient,
-    public readonly storage: IndexedDbStorage
-  ) {}
+    public readonly storage: IndexedDbStorage,
+    attachmentConfig?: { serverUrl?: string; authToken?: string }
+  ) {
+    this.attachmentManager = new AttachmentManager(client, storage, attachmentConfig);
+  }
 
   public getSnapshot = (): NotesSnapshot => {
     return {
@@ -80,6 +105,7 @@ export class NotesStore {
       saveStatus: this.saveStatus,
       lastSavedAt: this.lastSavedAt,
       error: this.error,
+      attachmentProgress: this.attachmentProgress,
     };
   };
 
@@ -114,6 +140,7 @@ export class NotesStore {
    */
   public handleVaultLocked(): void {
     this.isUnlocked = false;
+    this.attachmentProgress = null;
     // Clear any pending autosave timers
     for (const timer of this.saveTimers.values()) {
       clearTimeout(timer);
@@ -219,6 +246,7 @@ export class NotesStore {
       title: initial?.title || "",
       body: initial?.body || "",
       tags: initial?.tags || [],
+      attachments: [],
       createdAt: now,
       updatedAt: now,
     };
@@ -259,6 +287,7 @@ export class NotesStore {
       title: updates.title !== undefined ? updates.title : existing.title,
       body: updates.body !== undefined ? updates.body : existing.body,
       tags: updates.tags !== undefined ? updates.tags : existing.tags,
+      attachments: existing.attachments || [],
       updatedAt: new Date().toISOString(),
     };
 
@@ -382,7 +411,8 @@ export class NotesStore {
       note.id,
       note.title,
       note.body,
-      note.tags
+      note.tags,
+      note.attachments || []
     );
     const envelope: EncryptedEnvelopeDto = JSON.parse(encRes.envelopeJson);
 
@@ -429,6 +459,126 @@ export class NotesStore {
       note.tags,
       note.updatedAt
     );
+  }
+
+  /**
+   * Encrypts and attaches a file to a note, reporting progress along the way.
+   */
+  public async attachFile(
+    noteId: string,
+    file: AttachmentFileSource,
+    onProgress?: ProgressCallback
+  ): Promise<AttachmentManifestDto> {
+    const idx = this.notes.findIndex((n) => n.id === noteId);
+    if (idx < 0) {
+      throw new Error(`Note '${noteId}' not found.`);
+    }
+
+    const progressWrapper: ProgressCallback = (p) => {
+      this.attachmentProgress = p;
+      this.notify();
+      onProgress?.(p);
+    };
+
+    try {
+      const manifest = await this.attachmentManager.uploadAttachment(file, progressWrapper);
+
+      const existing = this.notes[idx]!;
+      const existingAttachments = existing.attachments || [];
+      if (!existingAttachments.includes(manifest.attachment_id)) {
+        const updatedAttachments = [...existingAttachments, manifest.attachment_id];
+        const updatedNote: PlaintextNoteDto = {
+          ...existing,
+          attachments: updatedAttachments,
+          updatedAt: new Date().toISOString(),
+        };
+        const nextNotes = [...this.notes];
+        nextNotes[idx] = updatedNote;
+        this.notes = nextNotes;
+        await this.persistNoteToStorage(updatedNote);
+      }
+
+      this.attachmentProgress = null;
+      this.notify();
+      return manifest;
+    } catch (err: any) {
+      this.attachmentProgress = null;
+      this.error = `Failed to attach file: ${err?.message || err}`;
+      this.notify();
+      throw err;
+    }
+  }
+
+  /**
+   * Detaches an attachment from a note and creates a deletion tombstone.
+   */
+  public async detachAttachment(noteId: string, attachmentId: string): Promise<void> {
+    const idx = this.notes.findIndex((n) => n.id === noteId);
+    if (idx < 0) return;
+
+    const existing = this.notes[idx]!;
+    const updatedAttachments = (existing.attachments || []).filter((id) => id !== attachmentId);
+    const updatedNote: PlaintextNoteDto = {
+      ...existing,
+      attachments: updatedAttachments,
+      updatedAt: new Date().toISOString(),
+    };
+
+    const nextNotes = [...this.notes];
+    nextNotes[idx] = updatedNote;
+    this.notes = nextNotes;
+
+    await this.persistNoteToStorage(updatedNote);
+    await this.attachmentManager.deleteAttachment(attachmentId);
+    this.notify();
+  }
+
+  /**
+   * Downloads and decrypts an attachment.
+   */
+  public async downloadAttachment(
+    attachmentId: string,
+    onProgress?: ProgressCallback
+  ): Promise<DownloadedAttachment> {
+    const progressWrapper: ProgressCallback = (p) => {
+      this.attachmentProgress = p;
+      this.notify();
+      onProgress?.(p);
+    };
+
+    try {
+      const downloaded = await this.attachmentManager.downloadAttachment(
+        attachmentId,
+        progressWrapper
+      );
+      this.attachmentProgress = null;
+      this.notify();
+      return downloaded;
+    } catch (err: any) {
+      this.attachmentProgress = null;
+      this.error = `Failed to download attachment: ${err?.message || err}`;
+      this.notify();
+      throw err;
+    }
+  }
+
+  /**
+   * Retrieves manifests for all attachments linked to a note.
+   */
+  public async getAttachmentManifests(noteId: string): Promise<AttachmentManifestDto[]> {
+    const note = this.notes.find((n) => n.id === noteId);
+    if (!note || !note.attachments || note.attachments.length === 0) {
+      return [];
+    }
+
+    const manifests: AttachmentManifestDto[] = [];
+    for (const attId of note.attachments) {
+      const manifest = await this.attachmentManager.getManifest(attId);
+      if (manifest) {
+        manifests.push(manifest);
+      }
+    }
+    return manifests;
   }
 
   public dispose(): void {
@@ -486,6 +636,11 @@ export const NotesProvider: React.FC<NotesProviderProps> = ({ children }) => {
       deleteNote: (id) => store.deleteNote(id),
       reloadNotes: () => store.reloadNotes(),
       clearError: () => store.clearError(),
+      attachFile: (noteId, file, onProgress) => store.attachFile(noteId, file, onProgress),
+      detachAttachment: (noteId, attachmentId) => store.detachAttachment(noteId, attachmentId),
+      downloadAttachment: (attachmentId, onProgress) =>
+        store.downloadAttachment(attachmentId, onProgress),
+      getAttachmentManifests: (noteId) => store.getAttachmentManifests(noteId),
       store,
     }),
     [snapshot, selectedNote, store]
@@ -505,6 +660,7 @@ export function useNotes(): NotesContextType {
       saveStatus: "saved",
       lastSavedAt: null,
       error: null,
+      attachmentProgress: null,
       selectNote: () => {},
       createNote: async () => {
         throw new Error("NotesProvider not available");
@@ -514,6 +670,14 @@ export function useNotes(): NotesContextType {
       deleteNote: async () => {},
       reloadNotes: async () => {},
       clearError: () => {},
+      attachFile: async () => {
+        throw new Error("NotesProvider not available");
+      },
+      detachAttachment: async () => {},
+      downloadAttachment: async () => {
+        throw new Error("NotesProvider not available");
+      },
+      getAttachmentManifests: async () => [],
       store: null as any,
     };
   }

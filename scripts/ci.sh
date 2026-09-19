@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if ! command -v cargo >/dev/null 2>&1; then
+  export PATH="$HOME/.cargo/bin:$HOME/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin:$HOME/.npm-global/bin:$PATH"
+else
+  export PATH="$HOME/.cargo/bin:$PATH"
+fi
+
+export CARGO_INCREMENTAL=0
+
 echo "==> 1. Checking format (cargo fmt --check)..."
 cargo fmt --check
 
@@ -26,5 +34,8 @@ node --test tests/wasm_crypto_compat.test.mjs
 
 echo "==> 8. Running Web worker checks and test suite (npm run typecheck && npm test)..."
 (cd apps/web && npm run typecheck && npm test)
+
+echo "==> 9. Running dependency and supply-chain audits (./scripts/audit.sh)..."
+./scripts/audit.sh
 
 echo "==> All CI quality gates passed successfully!"

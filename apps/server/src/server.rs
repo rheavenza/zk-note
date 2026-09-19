@@ -3,12 +3,12 @@ use crate::config::ServerConfig;
 use crate::error::ServerError;
 use std::future::Future;
 
-/// Runs the HTTP server using an in-memory database until the shutdown signal completes.
+/// Runs the HTTP server using the configured database (file or in-memory) until shutdown.
 pub async fn run_server(
     config: ServerConfig,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), ServerError> {
-    let state = AppState::new_in_memory(config)?;
+    let state = AppState::new(config)?;
     run_server_with_state(state, shutdown).await
 }
 

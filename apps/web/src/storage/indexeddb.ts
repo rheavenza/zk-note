@@ -21,7 +21,7 @@ import {
   EncryptedEnvelopeDto,
 } from "./models.js";
 
-export const DB_SCHEMA_VERSION = 1;
+export const DB_SCHEMA_VERSION = 2;
 export const DEFAULT_DB_NAME = "zk_notes_db";
 
 export class IndexedDbStorage {
@@ -106,6 +106,11 @@ export class IndexedDbStorage {
       const conflictsStore = db.createObjectStore("conflicts", { keyPath: "conflict_id" });
       conflictsStore.createIndex("by_object_id", "object_id", { unique: false });
       conflictsStore.createIndex("by_resolved", "resolved", { unique: false });
+    }
+
+    // 6. Ciphertext Blobs Store (ZK-084)
+    if (!db.objectStoreNames.contains("blobs")) {
+      db.createObjectStore("blobs", { keyPath: "blob_id" });
     }
   }
 
@@ -554,6 +559,72 @@ export class IndexedDbStorage {
       const req = store.delete(conflictId);
 
       req.onsuccess = () => resolve(true);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  // ==========================================================================
+  // Ciphertext Blob Storage (ZK-084)
+  // SEC-001/SEC-009: Persists only opaque blob IDs and ciphertext bytes
+  // ==========================================================================
+
+  public async putBlob(blobId: string, data: Uint8Array): Promise<void> {
+    const db = await this.getDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction("blobs", "readwrite");
+      const store = tx.objectStore("blobs");
+      const req = store.put({
+        blob_id: blobId,
+        data,
+        size: data.length,
+        created_at: new Date().toISOString(),
+      });
+      req.onsuccess = () => resolve();
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  public async getBlob(blobId: string): Promise<Uint8Array | null> {
+    const db = await this.getDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction("blobs", "readonly");
+      const store = tx.objectStore("blobs");
+      const req = store.get(blobId);
+      req.onsuccess = () => {
+        if (!req.result) {
+          resolve(null);
+        } else {
+          resolve(req.result.data as Uint8Array);
+        }
+      };
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  public async deleteBlob(blobId: string): Promise<boolean> {
+    const existing = await this.getBlob(blobId);
+    if (!existing) {
+      return false;
+    }
+    const db = await this.getDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction("blobs", "readwrite");
+      const store = tx.objectStore("blobs");
+      const req = store.delete(blobId);
+      req.onsuccess = () => resolve(true);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  public async listBlobIds(): Promise<string[]> {
+    const db = await this.getDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction("blobs", "readonly");
+      const store = tx.objectStore("blobs");
+      const req = store.getAllKeys();
+      req.onsuccess = () => {
+        resolve((req.result as string[]) || []);
+      };
       req.onerror = () => reject(req.error);
     });
   }

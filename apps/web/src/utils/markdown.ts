@@ -16,6 +16,10 @@ export function escapeHtml(text: string): string {
 
 export function sanitizeUrl(url: string): string {
   const trimmed = url.trim();
+  // Disallow whitespace, quotes, angle brackets, backslashes, or control characters
+  if (/[\s"'<>\\]|[\x00-\x1F\x7F]/.test(trimmed)) {
+    return "#";
+  }
   if (
     trimmed.startsWith("http://") ||
     trimmed.startsWith("https://") ||
@@ -184,7 +188,7 @@ function renderInline(escapedText: string): string {
 
   // Links: [text](url)
   result = result.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_match, text, url) => {
-    const safeUrl = sanitizeUrl(url);
+    const safeUrl = escapeHtml(sanitizeUrl(url));
     return `<a href="${safeUrl}" target="_blank" rel="noopener noreferrer">${text}</a>`;
   });
 

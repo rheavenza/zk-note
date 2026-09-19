@@ -18,6 +18,7 @@ import {
   WorkerResponse,
   WorkerResponseError,
   PlaintextNoteDto,
+  AttachmentManifestDto,
   SearchResultDto,
   VaultInitResultDto,
   VaultRewrapResultDto,
@@ -145,6 +146,26 @@ export class VaultHandler {
         const session = this.ensureUnlocked();
         const payload = request.payload;
 
+        // If current passphrase verification is requested, verify it against the current envelope
+        if (
+          payload.oldPassphrase &&
+          payload.currentWrappedVaultKeyJson &&
+          payload.currentKdfParamsJson
+        ) {
+          try {
+            const verificationSession = zk.unlock_vault(
+              payload.oldPassphrase,
+              payload.currentWrappedVaultKeyJson,
+              payload.currentKdfParamsJson
+            );
+            verificationSession.lock();
+          } catch (_e) {
+            const err = new Error("Current master passphrase is incorrect.");
+            (err as any).code = WorkerErrorCode.DECRYPTION_FAILED;
+            throw err;
+          }
+        }
+
         let rewrapRes: zk.WasmRewrapResult;
         if (payload.kdfParamsJson) {
           rewrapRes = session.rewrap_passphrase_with_params(
@@ -164,12 +185,23 @@ export class VaultHandler {
       case "ENCRYPT_NOTE": {
         const session = this.ensureUnlocked();
         const payload = request.payload;
-        const envelopeJson = session.encrypt_note(
-          payload.noteId,
-          payload.title,
-          payload.body,
-          payload.tags
-        );
+        let envelopeJson: string;
+        if (payload.attachments && payload.attachments.length > 0) {
+          envelopeJson = session.encrypt_note_with_attachments(
+            payload.noteId,
+            payload.title,
+            payload.body,
+            payload.tags,
+            payload.attachments
+          );
+        } else {
+          envelopeJson = session.encrypt_note(
+            payload.noteId,
+            payload.title,
+            payload.body,
+            payload.tags
+          );
+        }
         return { envelopeJson };
       }
 
@@ -235,6 +267,70 @@ export class VaultHandler {
         );
       }
 
+      case "ENCRYPT_ATTACHMENT_CHUNK": {
+        const session = this.ensureUnlocked();
+        const payload = request.payload;
+        const chunkBinary = session.encrypt_attachment_chunk(
+          payload.chunkBytes,
+          payload.attachmentId,
+          payload.chunkIndex,
+          payload.totalChunks,
+          payload.attachmentKeyBase64
+        );
+        return { chunkBinary };
+      }
+
+      case "DECRYPT_ATTACHMENT_CHUNK": {
+        const session = this.ensureUnlocked();
+        const payload = request.payload;
+        const plaintextBytes = session.decrypt_attachment_chunk(
+          payload.chunkBinary,
+          payload.attachmentKeyBase64
+        );
+        return { plaintextBytes };
+      }
+
+      case "ENCRYPT_ATTACHMENT_MANIFEST": {
+        const session = this.ensureUnlocked();
+        const payload = request.payload;
+        const envelopeJson = session.encrypt_attachment_manifest(
+          JSON.stringify(payload.manifest),
+          payload.attachmentKeyBase64
+        );
+        return { envelopeJson };
+      }
+
+      case "DECRYPT_ATTACHMENT_MANIFEST": {
+        const session = this.ensureUnlocked();
+        const payload = request.payload;
+        const decResult = session.decrypt_attachment_manifest(payload.envelopeJson);
+        const manifestObj = decResult.manifest;
+        const manifest: AttachmentManifestDto = {
+          attachment_id: manifestObj.attachment_id,
+          name: manifestObj.name,
+          mime: manifestObj.mime,
+          size: manifestObj.size,
+          chunk_count: manifestObj.chunk_count,
+          chunk_size: manifestObj.chunk_size,
+          content_hash: manifestObj.content_hash,
+        };
+        return {
+          manifest,
+          attachmentKeyBase64: decResult.attachment_key_base64,
+        };
+      }
+
+      case "GENERATE_ATTACHMENT_KEY": {
+        const attachmentKeyBase64 = zk.wasm_generate_attachment_key();
+        return { attachmentKeyBase64 };
+      }
+
+      case "COMPUTE_CONTENT_HASH": {
+        const payload = request.payload;
+        const hash = zk.wasm_compute_content_hash(payload.bytes);
+        return { hash };
+      }
+
       default: {
         throw new Error(`Unknown request type: ${(request as any).type}`);
       }
@@ -256,6 +352,7 @@ export class VaultHandler {
       title: note.title,
       body: note.body,
       tags: note.tags,
+      attachments: note.attachments || [],
       createdAt: note.created_at,
       updatedAt: note.updated_at,
     };

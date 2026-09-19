@@ -42,6 +42,26 @@ pub fn now_utc_rfc3339() -> String {
     format_rfc3339_parts(total_secs, millis)
 }
 
+/// Returns the current Unix epoch timestamp in seconds.
+#[must_use]
+#[cfg(not(target_arch = "wasm32"))]
+pub fn now_epoch_secs() -> u64 {
+    let now = SystemTime::now();
+    now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+}
+
+/// Returns the current Unix epoch timestamp in seconds.
+#[must_use]
+#[cfg(target_arch = "wasm32")]
+pub fn now_epoch_secs() -> u64 {
+    let millis_f64 = js_sys::Date::now();
+    if millis_f64.is_sign_positive() && millis_f64.is_finite() {
+        (millis_f64 / 1000.0) as u64
+    } else {
+        0
+    }
+}
+
 /// Validates that a string conforms to RFC 3339 timestamp format.
 ///
 /// Accepts:

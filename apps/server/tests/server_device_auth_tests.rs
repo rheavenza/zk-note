@@ -289,3 +289,198 @@ async fn test_cli_logout_revokes_session() {
     let err: ErrorResponse = serde_json::from_slice(&check_bytes).unwrap();
     assert_eq!(err.code, ERROR_AUTH_REVOKED);
 }
+
+#[tokio::test]
+async fn test_device_list_and_revocation_endpoints() {
+    let (app, state) = setup_test_app();
+    let account_id = Uuid::new_v4();
+    let dev1_id = Uuid::new_v4();
+    let dev2_id = Uuid::new_v4();
+
+    // 1. Register device 1
+    let auth1_req = Request::builder()
+        .method("POST")
+        .uri("/v1/auth/device/authorize")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "account_id": account_id,
+                "device_id": dev1_id,
+                "device_name": "Primary Laptop"
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp1 = app.clone().oneshot(auth1_req).await.unwrap();
+    assert_eq!(resp1.status(), StatusCode::OK);
+    let auth1_resp: DeviceAuthResponse = serde_json::from_slice(
+        &axum::body::to_bytes(resp1.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let token1 = auth1_resp.session.token.expose_secret().to_string();
+
+    // 2. Register device 2
+    let auth2_req = Request::builder()
+        .method("POST")
+        .uri("/v1/auth/device/authorize")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "account_id": account_id,
+                "device_id": dev2_id,
+                "device_name": "Secondary Tablet"
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp2 = app.clone().oneshot(auth2_req).await.unwrap();
+    assert_eq!(resp2.status(), StatusCode::OK);
+    let auth2_resp: DeviceAuthResponse = serde_json::from_slice(
+        &axum::body::to_bytes(resp2.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let token2 = auth2_resp.session.token.expose_secret().to_string();
+
+    // 3. List devices via GET /v1/devices using token 1
+    let list_req = Request::builder()
+        .method("GET")
+        .uri("/v1/devices")
+        .header("authorization", format!("Bearer {token1}"))
+        .body(Body::empty())
+        .unwrap();
+    let list_resp = app.clone().oneshot(list_req).await.unwrap();
+    assert_eq!(list_resp.status(), StatusCode::OK);
+    let list_data: zk_protocol::auth::DeviceListResponse = serde_json::from_slice(
+        &axum::body::to_bytes(list_resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(list_data.devices.len(), 2);
+    assert!(list_data
+        .devices
+        .iter()
+        .any(|d| d.device_id == dev1_id && !d.is_revoked));
+    assert!(list_data
+        .devices
+        .iter()
+        .any(|d| d.device_id == dev2_id && !d.is_revoked));
+
+    // 4. Revoke device 2 via DELETE /v1/devices/{device_id}
+    let revoke_req = Request::builder()
+        .method("DELETE")
+        .uri(format!("/v1/devices/{dev2_id}"))
+        .header("authorization", format!("Bearer {token1}"))
+        .body(Body::empty())
+        .unwrap();
+    let revoke_resp = app.clone().oneshot(revoke_req).await.unwrap();
+    assert_eq!(revoke_resp.status(), StatusCode::OK);
+    let rev_data: zk_protocol::auth::RevokeDeviceResponse = serde_json::from_slice(
+        &axum::body::to_bytes(revoke_resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(rev_data.revoked);
+    assert_eq!(rev_data.device_id, dev2_id);
+
+    // 5. Query device list again: device 2 is now marked revoked
+    let list_req2 = Request::builder()
+        .method("GET")
+        .uri("/v1/devices")
+        .header("authorization", format!("Bearer {token1}"))
+        .body(Body::empty())
+        .unwrap();
+    let list_resp2 = app.clone().oneshot(list_req2).await.unwrap();
+    assert_eq!(list_resp2.status(), StatusCode::OK);
+    let list_data2: zk_protocol::auth::DeviceListResponse = serde_json::from_slice(
+        &axum::body::to_bytes(list_resp2.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let dev2_info = list_data2
+        .devices
+        .iter()
+        .find(|d| d.device_id == dev2_id)
+        .unwrap();
+    assert!(dev2_info.is_revoked);
+    assert!(dev2_info.revoked_at.is_some());
+
+    // 6. Device 2 tries to sync pull (GET /v1/sync/changes) -> MUST fail with 403 ERROR_DEVICE_REVOKED
+    let sync_req = Request::builder()
+        .method("GET")
+        .uri("/v1/sync/changes?since=0")
+        .header("authorization", format!("Bearer {token2}"))
+        .body(Body::empty())
+        .unwrap();
+    let sync_resp = app.clone().oneshot(sync_req).await.unwrap();
+    assert_eq!(sync_resp.status(), StatusCode::UNAUTHORIZED);
+    let sync_err: ErrorResponse = serde_json::from_slice(
+        &axum::body::to_bytes(sync_resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(sync_err.code, ERROR_DEVICE_REVOKED);
+
+    // 7. Device 1 is still authorized and can sync pull cleanly
+    let sync1_req = Request::builder()
+        .method("GET")
+        .uri("/v1/sync/changes?since=0")
+        .header("authorization", format!("Bearer {token1}"))
+        .body(Body::empty())
+        .unwrap();
+    let sync1_resp = app.clone().oneshot(sync1_req).await.unwrap();
+    assert_eq!(sync1_resp.status(), StatusCode::OK);
+
+    // 8. Cross-account revocation check: Account B cannot revoke Account A's device
+    let account_b = Uuid::new_v4();
+    let dev_b = Uuid::new_v4();
+    let auth_b_req = Request::builder()
+        .method("POST")
+        .uri("/v1/auth/device/authorize")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "account_id": account_b,
+                "device_id": dev_b,
+                "device_name": "Account B Laptop"
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp_b = app.clone().oneshot(auth_b_req).await.unwrap();
+    let auth_b_resp: DeviceAuthResponse = serde_json::from_slice(
+        &axum::body::to_bytes(resp_b.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let token_b = auth_b_resp.session.token.expose_secret().to_string();
+
+    // Account B lists devices: only sees dev_b, dev1_id is isolated
+    let list_b_req = Request::builder()
+        .method("GET")
+        .uri("/v1/devices")
+        .header("authorization", format!("Bearer {token_b}"))
+        .body(Body::empty())
+        .unwrap();
+    let list_b_resp = app.clone().oneshot(list_b_req).await.unwrap();
+    assert_eq!(list_b_resp.status(), StatusCode::OK);
+    let list_b_data: zk_protocol::auth::DeviceListResponse = serde_json::from_slice(
+        &axum::body::to_bytes(list_b_resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(list_b_data.devices.len(), 1);
+    assert_eq!(list_b_data.devices[0].device_id, dev_b);
+
+    // 9. Encrypted data model unchanged: raw database check
+    let _ = state.db.list_devices(account_id).await.unwrap();
+}

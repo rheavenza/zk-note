@@ -39,6 +39,12 @@ pub struct ServerConfig {
     pub log_level: String,
     /// Formatting style for structured log events.
     pub log_format: LogFormat,
+    /// Maximum allowed single blob size in bytes (default: 100 MiB).
+    pub max_blob_size: usize,
+    /// Total aggregate blob storage quota per account in bytes (default: 1 GiB).
+    pub account_blob_quota: u64,
+    /// Optional path to persistent SQLite database file on disk.
+    pub db_path: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -48,6 +54,9 @@ impl Default for ServerConfig {
             port: 8080,
             log_level: "info".to_string(),
             log_format: LogFormat::Json,
+            max_blob_size: 100 * 1024 * 1024,
+            account_blob_quota: 1024 * 1024 * 1024,
+            db_path: None,
         }
     }
 }
@@ -60,6 +69,8 @@ impl ServerConfig {
     /// - `ZK_SERVER_PORT` / `PORT` (default: 8080)
     /// - `ZK_SERVER_LOG_LEVEL` / `RUST_LOG` (default: info)
     /// - `ZK_SERVER_LOG_FORMAT` / `LOG_FORMAT` (default: json)
+    /// - `ZK_SERVER_MAX_BLOB_SIZE` / `MAX_BLOB_SIZE` (default: 100 MiB)
+    /// - `ZK_SERVER_ACCOUNT_BLOB_QUOTA` / `ACCOUNT_BLOB_QUOTA` (default: 1 GiB)
     pub fn from_env() -> Result<Self, ConfigError> {
         Self::from_lookup(|key| std::env::var(key).ok())
     }
@@ -102,11 +113,37 @@ impl ServerConfig {
             None => LogFormat::Json,
         };
 
+        let max_blob_size =
+            match lookup("ZK_SERVER_MAX_BLOB_SIZE").or_else(|| lookup("MAX_BLOB_SIZE")) {
+                Some(raw) => raw.trim().parse::<usize>().map_err(|e| {
+                    ConfigError::InvalidHost(format!("failed to parse max_blob_size '{raw}': {e}"))
+                })?,
+                None => 100 * 1024 * 1024,
+            };
+
+        let account_blob_quota = match lookup("ZK_SERVER_ACCOUNT_BLOB_QUOTA")
+            .or_else(|| lookup("ACCOUNT_BLOB_QUOTA"))
+        {
+            Some(raw) => raw.trim().parse::<u64>().map_err(|e| {
+                ConfigError::InvalidHost(format!("failed to parse account_blob_quota '{raw}': {e}"))
+            })?,
+            None => 1024 * 1024 * 1024,
+        };
+
+        let db_path = lookup("ZK_SERVER_DB_PATH")
+            .or_else(|| lookup("DATABASE_PATH"))
+            .or_else(|| lookup("DATABASE_URL"))
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
         let config = Self {
             host,
             port,
             log_level,
             log_format,
+            max_blob_size,
+            account_blob_quota,
+            db_path,
         };
 
         // Validate that the host:port combination parses into a valid SocketAddr
@@ -147,12 +184,17 @@ mod tests {
         env.insert("ZK_SERVER_PORT".to_string(), "9000".to_string());
         env.insert("ZK_SERVER_LOG_LEVEL".to_string(), "debug".to_string());
         env.insert("ZK_SERVER_LOG_FORMAT".to_string(), "text".to_string());
+        env.insert(
+            "ZK_SERVER_DB_PATH".to_string(),
+            "/var/lib/notes.db".to_string(),
+        );
 
         let cfg = ServerConfig::from_lookup(|k| env.get(k).cloned()).unwrap();
         assert_eq!(cfg.host, "0.0.0.0");
         assert_eq!(cfg.port, 9000);
         assert_eq!(cfg.log_level, "debug");
         assert_eq!(cfg.log_format, LogFormat::Text);
+        assert_eq!(cfg.db_path, Some("/var/lib/notes.db".to_string()));
         assert_eq!(
             cfg.socket_addr().unwrap(),
             "0.0.0.0:9000".parse::<SocketAddr>().unwrap()

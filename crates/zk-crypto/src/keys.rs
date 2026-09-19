@@ -122,3 +122,8 @@ define_key_type!(
     KeyEncryptionKey,
     "A 256-bit Key Encryption Key (KEK) derived from the user passphrase via Argon2id."
 );
+
+define_key_type!(
+    AttachmentKey,
+    "A 256-bit random per-attachment key used to encrypt and decrypt attachment chunks."
+);

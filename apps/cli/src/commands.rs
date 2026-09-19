@@ -2,14 +2,17 @@
 //! `new`, `edit`, `show`, `search`, `delete`, `history`, and `list`.
 
 use crate::auth::{
-    api_device_authorize, api_query_status, api_revoke_session, api_verify_token,
-    clear_auth_session, get_or_create_device_id, has_auth_session, load_auth_session,
-    save_auth_session,
+    api_device_authorize, api_list_devices, api_query_status, api_revoke_device,
+    api_revoke_session, api_verify_token, clear_auth_session, get_or_create_device_id,
+    has_auth_session, load_auth_session, save_auth_session,
 };
 use crate::config::{auth_session_file, db_file, resolve_data_dir, session_file, vault_file};
 use crate::edit::{note_to_edit_buffer, parse_edit_buffer, run_editor, TempFileGuard};
 use crate::error::CliError;
-use crate::session::{clear_session, has_active_session, load_session_key, save_session_key};
+use crate::session::{
+    clear_session, get_session_info, has_active_session, load_session_key, save_session_key,
+    save_session_key_with_timeout, update_session_timeout,
+};
 use serde::Serialize;
 use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::Path;
@@ -21,7 +24,8 @@ use zk_core::time::now_utc_rfc3339;
 use zk_core::vault::VaultManager;
 use zk_crypto::kdf::{KdfParams, TEST_MEMORY_KIB};
 use zk_protocol::constants::{
-    INITIAL_EXPECTED_REVISION, INITIAL_OBJECT_REVISION, INITIAL_SERVER_SEQ, OBJECT_KIND_NOTE,
+    INITIAL_EXPECTED_REVISION, INITIAL_OBJECT_REVISION, INITIAL_SERVER_SEQ,
+    OBJECT_KIND_ATTACHMENT_MANIFEST, OBJECT_KIND_NOTE,
 };
 use zk_protocol::vault::VaultBootstrap;
 use zk_storage::models::ConflictRecord;
@@ -124,6 +128,7 @@ pub fn cmd_unlock(
     explicit_passphrase: Option<String>,
     explicit_recovery_key: Option<String>,
     new_passphrase: Option<String>,
+    idle_timeout_mins: Option<u64>,
 ) -> Result<(), CliError> {
     let data_dir = resolve_data_dir(custom_data_dir);
     let vault_path = vault_file(&data_dir);
@@ -191,8 +196,124 @@ pub fn cmd_unlock(
         println!("New master passphrase set successfully! Existing note ciphertexts remain valid.");
     }
 
-    save_session_key(&sess_path, &vault_key)?;
+    let timeout_secs = match idle_timeout_mins {
+        Some(0) => None,
+        Some(m) => Some(m * 60),
+        None => crate::session::resolve_default_timeout(),
+    };
+
+    save_session_key_with_timeout(&sess_path, &vault_key, timeout_secs)?;
     println!("Vault unlocked successfully.");
+    match timeout_secs {
+        Some(s) => println!("Auto-lock: Active ({} minute(s) idle timeout)", s / 60),
+        None => println!("Auto-lock: Disabled (never expires)"),
+    }
+
+    Ok(())
+}
+
+/// Changes the vault master passphrase (ZK-074).
+///
+/// Invariants:
+/// - Verifies the current master passphrase fails closed before rotation.
+/// - Derives a fresh KEK and wraps the same VaultKey (rewrap only).
+/// - Note ciphertexts in storage are untouched (old object ciphertext unchanged).
+/// - Recovery key envelope is preserved verbatim (recovery wrapper remains valid).
+/// - Atomically replaces vault.json with fs::rename.
+pub fn cmd_passwd(
+    custom_data_dir: Option<&Path>,
+    explicit_old_passphrase: Option<String>,
+    explicit_new_passphrase: Option<String>,
+    test_kdf: bool,
+) -> Result<(), CliError> {
+    let data_dir = resolve_data_dir(custom_data_dir);
+    let vault_path = vault_file(&data_dir);
+    let sess_path = session_file(&data_dir);
+
+    if !vault_path.exists() {
+        return Err(CliError::VaultUninitialized);
+    }
+
+    let vault_bytes = std::fs::read(&vault_path).map_err(|e| {
+        CliError::Io(format!(
+            "failed to read vault file {}: {e}",
+            vault_path.display()
+        ))
+    })?;
+
+    let bootstrap: VaultBootstrap = serde_json::from_slice(&vault_bytes)
+        .map_err(|e| CliError::Io(format!("corrupted vault.json: {e}")))?;
+
+    // 1. Obtain and verify current master passphrase
+    let old_pass = if let Some(p) = explicit_old_passphrase {
+        p
+    } else {
+        rpassword::prompt_password("Enter current vault passphrase: ")
+            .map_err(|e| CliError::Io(format!("failed to read current passphrase: {e}")))?
+    };
+
+    if old_pass.is_empty() {
+        return Err(CliError::Io(
+            "current passphrase cannot be empty".to_string(),
+        ));
+    }
+
+    println!("Verifying current master passphrase...");
+    let vault_key = VaultManager::unlock_with_passphrase(&bootstrap, old_pass.as_bytes())?;
+
+    // 2. Obtain and validate new master passphrase
+    let new_pass = if let Some(p) = explicit_new_passphrase {
+        if p.len() < 8 {
+            return Err(CliError::Io(
+                "new passphrase must be at least 8 characters long".to_string(),
+            ));
+        }
+        p
+    } else {
+        let p1 = rpassword::prompt_password("Enter new vault passphrase: ")
+            .map_err(|e| CliError::Io(format!("failed to read new passphrase: {e}")))?;
+        if p1.len() < 8 {
+            return Err(CliError::Io(
+                "new passphrase must be at least 8 characters long".to_string(),
+            ));
+        }
+        let p2 = rpassword::prompt_password("Confirm new vault passphrase: ")
+            .map_err(|e| CliError::Io(format!("failed to read confirmation: {e}")))?;
+        if p1 != p2 {
+            return Err(CliError::PassphraseMismatch);
+        }
+        p1
+    };
+
+    let existing_kdf: KdfParams = bootstrap.kdf.clone().into();
+    let kdf_params = if test_kdf || existing_kdf.memory_kib == TEST_MEMORY_KIB {
+        KdfParams::new_test()
+    } else {
+        KdfParams::new_production()
+    };
+
+    println!("Re-wrapping vault key under new master passphrase...");
+    let updated_bootstrap =
+        VaultManager::set_new_passphrase(&bootstrap, &vault_key, new_pass.as_bytes(), &kdf_params)?;
+
+    // Atomic replacement of vault.json
+    let updated_json = serde_json::to_string_pretty(&updated_bootstrap)
+        .map_err(|e| CliError::Io(format!("serialize vault bootstrap: {e}")))?;
+    let tmp_path = data_dir.join(format!("vault.json.tmp.{}", std::process::id()));
+    std::fs::write(&tmp_path, updated_json)
+        .map_err(|e| CliError::Io(format!("failed to write temporary vault file: {e}")))?;
+    std::fs::rename(&tmp_path, &vault_path)
+        .map_err(|e| CliError::Io(format!("failed to atomically update vault.json: {e}")))?;
+
+    // Keep active session valid if unlocked
+    if has_active_session(&sess_path) {
+        save_session_key(&sess_path, &vault_key)?;
+    }
+
+    println!("Master passphrase changed successfully!");
+    println!("  - Re-wrapped vault key envelope with fresh salt and nonce.");
+    println!("  - Existing note ciphertexts remain unchanged and decryptable.");
+    println!("  - Recovery key envelope remains unchanged and valid.");
 
     Ok(())
 }
@@ -354,15 +475,40 @@ pub fn cmd_status(custom_data_dir: Option<&Path>) -> Result<(), CliError> {
         println!("Path: {}", data_dir.display());
         println!("Run 'zk-note init' to create a new vault.");
     } else if has_active_session(&sess_path) {
-        match load_session_key(&sess_path) {
-            Ok(_) => {
+        match get_session_info(&sess_path) {
+            Ok(Some(info)) if info.is_active => {
                 println!("Vault status: UNLOCKED");
                 println!("Path: {}", data_dir.display());
+                if let Some(timeout) = info.idle_timeout_secs {
+                    let rem_mins = info.remaining_secs.unwrap_or(0) / 60;
+                    let rem_secs = info.remaining_secs.unwrap_or(0) % 60;
+                    println!(
+                        "Auto-lock:    Active (timeout: {}m, idle: {}s, remaining: {}m {}s)",
+                        timeout / 60,
+                        info.idle_secs,
+                        rem_mins,
+                        rem_secs
+                    );
+                } else {
+                    println!("Auto-lock:    Disabled (never expires)");
+                }
             }
-            Err(_) => {
-                println!("Vault status: LOCKED (corrupted session file)");
+            Ok(Some(info)) if info.is_expired => {
+                let _ = clear_session(&sess_path);
+                println!("Vault status: LOCKED (idle auto-lock timeout expired)");
                 println!("Path: {}", data_dir.display());
+                println!("Run 'zk-note unlock' to unlock the vault.");
             }
+            _ => match load_session_key(&sess_path) {
+                Ok(_) => {
+                    println!("Vault status: UNLOCKED");
+                    println!("Path: {}", data_dir.display());
+                }
+                Err(_) => {
+                    println!("Vault status: LOCKED (corrupted session file)");
+                    println!("Path: {}", data_dir.display());
+                }
+            },
         }
     } else {
         println!("Vault status: LOCKED");
@@ -596,6 +742,9 @@ pub fn cmd_show(
         println!("Title:    {}", note.title);
         if !note.tags.is_empty() {
             println!("Tags:     {}", note.tags.join(", "));
+        }
+        if !note.attachments.is_empty() {
+            println!("Attachments: {}", note.attachments.join(", "));
         }
         println!("Updated:  {}", note.updated_at);
         println!("Created:  {}", note.created_at);
@@ -1948,4 +2097,417 @@ pub async fn cmd_whoami(custom_data_dir: Option<&Path>, json_output: bool) -> Re
     }
 
     Ok(())
+}
+
+/// Lists registered devices and their status for the authenticated account (ZK-075).
+pub async fn cmd_device_list(
+    custom_data_dir: Option<&Path>,
+    json_output: bool,
+) -> Result<(), CliError> {
+    let data_dir = resolve_data_dir(custom_data_dir);
+    let auth_path = auth_session_file(&data_dir);
+
+    if !has_auth_session(&auth_path) {
+        return Err(CliError::NotLoggedIn);
+    }
+
+    let session = load_auth_session(&auth_path)?;
+    let dev_list = api_list_devices(&session).await?;
+
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&dev_list)
+                .map_err(|e| CliError::Io(format!("serialize device list: {e}")))?
+        );
+    } else {
+        println!(
+            "{:<38} {:<24} {:<10} {:<24}",
+            "DEVICE ID", "NAME", "STATUS", "LAST SEEN"
+        );
+        println!("{}", "-".repeat(98));
+        for dev in &dev_list.devices {
+            let is_current = dev.device_id == session.device_id;
+            let current_marker = if is_current { " (current)" } else { "" };
+            let name = format!(
+                "{}{}",
+                dev.display_name.as_deref().unwrap_or("<unnamed>"),
+                current_marker
+            );
+            let status = if dev.is_revoked { "REVOKED" } else { "ACTIVE" };
+            let last_seen = dev.last_seen.as_deref().unwrap_or("-");
+            println!(
+                "{:<38} {:<24} {:<10} {:<24}",
+                dev.device_id, name, status, last_seen
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Revokes a device and its active sessions by device ID (ZK-075).
+pub async fn cmd_device_revoke(
+    custom_data_dir: Option<&Path>,
+    device_id_str: &str,
+    json_output: bool,
+) -> Result<(), CliError> {
+    let data_dir = resolve_data_dir(custom_data_dir);
+    let auth_path = auth_session_file(&data_dir);
+
+    if !has_auth_session(&auth_path) {
+        return Err(CliError::NotLoggedIn);
+    }
+
+    let target_device_id = Uuid::parse_str(device_id_str)
+        .map_err(|e| CliError::Io(format!("invalid device UUID '{device_id_str}': {e}")))?;
+
+    let session = load_auth_session(&auth_path)?;
+    let resp = api_revoke_device(&session, target_device_id).await?;
+
+    // If the revoked device was this device, clear local auth session too
+    let was_current = target_device_id == session.device_id;
+    if was_current {
+        let _ = clear_auth_session(&auth_path);
+    }
+
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&resp)
+                .map_err(|e| CliError::Io(format!("serialize revoke device response: {e}")))?
+        );
+    } else {
+        println!("Device {} successfully revoked.", resp.device_id);
+        if was_current {
+            println!("Current device was revoked. Local session cleared.");
+        }
+    }
+
+    Ok(())
+}
+
+/// Configures or displays the vault auto-lock idle timeout policy (ZK-076).
+pub fn cmd_autolock(
+    custom_data_dir: Option<&Path>,
+    timeout_mins: Option<u64>,
+    json_output: bool,
+) -> Result<(), CliError> {
+    let data_dir = resolve_data_dir(custom_data_dir);
+    let sess_path = session_file(&data_dir);
+
+    if !sess_path.exists() {
+        return Err(CliError::VaultLocked);
+    }
+
+    if let Some(mins) = timeout_mins {
+        let secs = if mins == 0 { None } else { Some(mins * 60) };
+        let info = update_session_timeout(&sess_path, secs)?;
+        if json_output {
+            let json = serde_json::to_string_pretty(&info)
+                .map_err(|e| CliError::Io(format!("serialize autolock info: {e}")))?;
+            println!("{json}");
+        } else if mins == 0 {
+            println!("Auto-lock disabled for active session (never expires).");
+        } else {
+            println!("Auto-lock idle timeout set to {mins} minute(s).");
+        }
+    } else {
+        let info_opt = get_session_info(&sess_path)?;
+        match info_opt {
+            Some(info) => {
+                if json_output {
+                    let json = serde_json::to_string_pretty(&info)
+                        .map_err(|e| CliError::Io(format!("serialize autolock info: {e}")))?;
+                    println!("{json}");
+                } else {
+                    match info.idle_timeout_secs {
+                        Some(timeout) => {
+                            let timeout_mins = timeout / 60;
+                            let rem_mins = info.remaining_secs.unwrap_or(0) / 60;
+                            let rem_secs = info.remaining_secs.unwrap_or(0) % 60;
+                            println!("Auto-lock: Active");
+                            println!("Timeout:   {timeout_mins} minute(s) ({timeout}s)");
+                            println!("Idle:      {}s", info.idle_secs);
+                            println!("Remaining: {rem_mins}m {rem_secs}s");
+                        }
+                        None => {
+                            println!("Auto-lock: Disabled (never expires)");
+                        }
+                    }
+                }
+            }
+            None => return Err(CliError::VaultLocked),
+        }
+    }
+
+    Ok(())
+}
+
+/// Attaches a file from disk to an existing note (ZK-083).
+///
+/// Chunks and encrypts the file locally with a fresh random `AttachmentKey`,
+/// creates and encrypts an `AttachmentManifest` envelope (`OBJECT_KIND_ATTACHMENT_MANIFEST`),
+/// updates the parent note's attachments list, and persists both in local storage.
+pub fn cmd_attach(
+    custom_data_dir: Option<&Path>,
+    note_id: &str,
+    file_path: &Path,
+    custom_name: Option<String>,
+    custom_mime: Option<String>,
+) -> Result<String, CliError> {
+    let data_dir = resolve_data_dir(custom_data_dir);
+    let vault_path = vault_file(&data_dir);
+    let db_path = db_file(&data_dir);
+    let sess_path = session_file(&data_dir);
+
+    if !vault_path.exists() {
+        return Err(CliError::VaultUninitialized);
+    }
+
+    if !file_path.exists() || !file_path.is_file() {
+        return Err(CliError::Io(format!(
+            "attachment file '{}' does not exist or is not a regular file",
+            file_path.display()
+        )));
+    }
+
+    let vault_key = load_session_key(&sess_path)?;
+    let storage = SqliteStorage::open(&db_path)?;
+    let stored = find_note_object(&storage, note_id, false)?;
+
+    let mut note = PlaintextNote::decrypt(&stored.envelope, &vault_key)?;
+
+    let attachment_id = uuid::Uuid::new_v4().to_string();
+    let attachment_key = zk_crypto::keys::AttachmentKey::generate();
+
+    // 1. Chunk and encrypt attachment file
+    let (manifest, _chunks) = zk_core::attachment::encrypt_attachment_file(
+        file_path,
+        &attachment_id,
+        &attachment_key,
+        custom_name.as_deref(),
+        custom_mime.as_deref(),
+        None,
+    )?;
+
+    // 2. Encrypt attachment manifest envelope (OBJECT_KIND_ATTACHMENT_MANIFEST)
+    let manifest_envelope =
+        zk_core::attachment::encrypt_attachment_manifest(&manifest, &attachment_key, &vault_key)?;
+
+    let now = now_utc_rfc3339();
+
+    // 3. Persist manifest object in local encrypted storage
+    let manifest_stored_obj = StoredEncryptedObject {
+        object_id: attachment_id.clone(),
+        object_kind: OBJECT_KIND_ATTACHMENT_MANIFEST,
+        revision: INITIAL_OBJECT_REVISION,
+        server_seq: INITIAL_SERVER_SEQ,
+        is_deleted: false,
+        envelope: manifest_envelope.clone(),
+        updated_at: now.clone(),
+    };
+    storage.put_object(&manifest_stored_obj)?;
+
+    // Enqueue mutation for manifest
+    let manifest_mutation = PendingMutation {
+        mutation_id: uuid::Uuid::new_v4().to_string(),
+        object_id: attachment_id.clone(),
+        expected_revision: INITIAL_EXPECTED_REVISION,
+        object_kind: OBJECT_KIND_ATTACHMENT_MANIFEST,
+        mutation_type: MutationType::Upsert,
+        envelope: manifest_envelope,
+        created_at: now.clone(),
+        retry_count: 0,
+        status: MutationStatus::Pending,
+    };
+    storage.enqueue_mutation(&manifest_mutation)?;
+
+    // 4. Update note's attachment list
+    zk_core::attachment::add_attachment_to_note(&mut note, &attachment_id)?;
+
+    let updated_note_envelope = note.encrypt(&vault_key, &stored.object_id)?;
+    let new_revision = stored.revision + 1;
+
+    let updated_note_obj = StoredEncryptedObject {
+        object_id: stored.object_id.clone(),
+        object_kind: OBJECT_KIND_NOTE,
+        revision: new_revision,
+        server_seq: stored.server_seq,
+        is_deleted: false,
+        envelope: updated_note_envelope.clone(),
+        updated_at: now.clone(),
+    };
+    storage.put_object(&updated_note_obj)?;
+
+    let note_mutation = PendingMutation {
+        mutation_id: uuid::Uuid::new_v4().to_string(),
+        object_id: stored.object_id.clone(),
+        expected_revision: stored.revision,
+        object_kind: OBJECT_KIND_NOTE,
+        mutation_type: MutationType::Upsert,
+        envelope: updated_note_envelope,
+        created_at: now,
+        retry_count: 0,
+        status: MutationStatus::Pending,
+    };
+    storage.enqueue_mutation(&note_mutation)?;
+
+    println!("Attached file to note: {}", stored.object_id);
+    println!("Attachment ID: {}", manifest.attachment_id);
+    println!("Name:          {}", manifest.name);
+    println!("Size:          {} bytes", manifest.size);
+    println!("Chunks:        {}", manifest.chunk_count);
+    if let Some(ref hash) = manifest.content_hash {
+        println!("Hash:          {}", hash);
+    }
+
+    Ok(attachment_id)
+}
+
+/// Detaches an attachment from a note (ZK-083).
+pub fn cmd_detach(
+    custom_data_dir: Option<&Path>,
+    note_id: &str,
+    attachment_id: &str,
+) -> Result<(), CliError> {
+    let data_dir = resolve_data_dir(custom_data_dir);
+    let vault_path = vault_file(&data_dir);
+    let db_path = db_file(&data_dir);
+    let sess_path = session_file(&data_dir);
+
+    if !vault_path.exists() {
+        return Err(CliError::VaultUninitialized);
+    }
+
+    let vault_key = load_session_key(&sess_path)?;
+    let storage = SqliteStorage::open(&db_path)?;
+    let stored = find_note_object(&storage, note_id, false)?;
+
+    let mut note = PlaintextNote::decrypt(&stored.envelope, &vault_key)?;
+
+    let removed = zk_core::attachment::remove_attachment_from_note(&mut note, attachment_id);
+    if !removed {
+        return Err(CliError::Io(format!(
+            "attachment '{attachment_id}' not found on note '{}'",
+            stored.object_id
+        )));
+    }
+
+    let now = now_utc_rfc3339();
+    let updated_note_envelope = note.encrypt(&vault_key, &stored.object_id)?;
+    let new_revision = stored.revision + 1;
+
+    let updated_note_obj = StoredEncryptedObject {
+        object_id: stored.object_id.clone(),
+        object_kind: OBJECT_KIND_NOTE,
+        revision: new_revision,
+        server_seq: stored.server_seq,
+        is_deleted: false,
+        envelope: updated_note_envelope.clone(),
+        updated_at: now.clone(),
+    };
+    storage.put_object(&updated_note_obj)?;
+
+    let note_mutation = PendingMutation {
+        mutation_id: uuid::Uuid::new_v4().to_string(),
+        object_id: stored.object_id.clone(),
+        expected_revision: stored.revision,
+        object_kind: OBJECT_KIND_NOTE,
+        mutation_type: MutationType::Upsert,
+        envelope: updated_note_envelope,
+        created_at: now.clone(),
+        retry_count: 0,
+        status: MutationStatus::Pending,
+    };
+    storage.enqueue_mutation(&note_mutation)?;
+
+    // If attachment manifest is stored, create a tombstone for it
+    if let Ok(Some(manifest_obj)) = storage.get_object(attachment_id) {
+        let manifest_tombstone = StoredEncryptedObject {
+            object_id: attachment_id.to_string(),
+            object_kind: OBJECT_KIND_ATTACHMENT_MANIFEST,
+            revision: manifest_obj.revision + 1,
+            server_seq: manifest_obj.server_seq,
+            is_deleted: true,
+            envelope: manifest_obj.envelope.clone(),
+            updated_at: now.clone(),
+        };
+        storage.put_object(&manifest_tombstone)?;
+
+        let tombstone_mutation = PendingMutation {
+            mutation_id: uuid::Uuid::new_v4().to_string(),
+            object_id: attachment_id.to_string(),
+            expected_revision: manifest_obj.revision,
+            object_kind: OBJECT_KIND_ATTACHMENT_MANIFEST,
+            mutation_type: MutationType::Delete,
+            envelope: manifest_obj.envelope,
+            created_at: now,
+            retry_count: 0,
+            status: MutationStatus::Pending,
+        };
+        storage.enqueue_mutation(&tombstone_mutation)?;
+    }
+
+    println!(
+        "Detached attachment '{attachment_id}' from note '{}'.",
+        stored.object_id
+    );
+    Ok(())
+}
+
+/// Lists attachments associated with a note (ZK-083).
+pub fn cmd_attachments(
+    custom_data_dir: Option<&Path>,
+    note_id: &str,
+    json_output: bool,
+) -> Result<Vec<zk_protocol::attachment::AttachmentManifest>, CliError> {
+    let data_dir = resolve_data_dir(custom_data_dir);
+    let vault_path = vault_file(&data_dir);
+    let db_path = db_file(&data_dir);
+    let sess_path = session_file(&data_dir);
+
+    if !vault_path.exists() {
+        return Err(CliError::VaultUninitialized);
+    }
+
+    let vault_key = load_session_key(&sess_path)?;
+    let storage = SqliteStorage::open(&db_path)?;
+    let stored = find_note_object(&storage, note_id, false)?;
+
+    let note = PlaintextNote::decrypt(&stored.envelope, &vault_key)?;
+
+    let mut manifests = Vec::new();
+    for att_id in &note.attachments {
+        if let Ok(Some(obj)) = storage.get_object(att_id) {
+            if !obj.is_deleted {
+                if let Ok((manifest, _key)) =
+                    zk_core::attachment::decrypt_attachment_manifest(&obj.envelope, &vault_key)
+                {
+                    manifests.push(manifest);
+                }
+            }
+        }
+    }
+
+    if json_output {
+        let json = serde_json::to_string_pretty(&manifests)
+            .map_err(|e| CliError::Io(format!("serialize manifests json: {e}")))?;
+        println!("{json}");
+    } else {
+        println!("Attachments for note '{}':", stored.object_id);
+        if manifests.is_empty() {
+            println!("  (no attachments)");
+        } else {
+            for m in &manifests {
+                println!("- ID:     {}", m.attachment_id);
+                println!("  Name:   {}", m.name);
+                println!("  Size:   {} bytes", m.size);
+                println!("  Chunks: {}", m.chunk_count);
+                println!("  MIME:   {}", m.mime);
+            }
+        }
+    }
+
+    Ok(manifests)
 }

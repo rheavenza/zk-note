@@ -19,11 +19,11 @@ fn test_migrations_reproducible_clean_state_and_idempotent() {
     conn.execute_batch("PRAGMA foreign_keys = ON;")
         .expect("enable foreign keys");
 
-    // Clean run applies migrations 2, 3, 4, 7, and 8
+    // Clean run applies migrations 2, 3, 4, 7, 8, and 9
     let applied = run_server_migrations(&mut conn).expect("run migrations");
-    assert_eq!(applied, vec![2, 3, 4, 7, 8]);
+    assert_eq!(applied, vec![2, 3, 4, 7, 8, 9]);
 
-    // Verify all 11 tables and 8 indexes exist
+    // Verify all 12 tables and 9 indexes exist
     verify_database_schema(&conn).expect("schema verification");
 
     // Check schema_migrations rows
@@ -76,6 +76,16 @@ fn test_migrations_reproducible_clean_state_and_idempotent() {
         .expect("query migration 8 row");
     assert_eq!(v8, 8);
     assert_eq!(n8, "008_webauthn_credentials");
+
+    let (v9, n9): (i32, String) = conn
+        .query_row(
+            "SELECT version, name FROM schema_migrations WHERE version = 9",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("query migration 9 row");
+    assert_eq!(v9, 9);
+    assert_eq!(n9, "009_ciphertext_blobs");
 
     // Second run is idempotent
     let second_run = run_server_migrations(&mut conn).expect("second run");
@@ -372,4 +382,80 @@ fn test_zero_knowledge_schema_invariants_sec_001_and_sec_002() {
     assert!(columns.contains(&"wrapped_key".to_string()));
     assert!(columns.contains(&"payload".to_string()));
     assert!(columns.contains(&"envelope_version".to_string()));
+
+    // Inspect columns of blobs table (ZK-082)
+    let mut blob_stmt = conn.prepare("PRAGMA table_info(blobs)").expect("blob info");
+    let blob_columns: Vec<String> = blob_stmt
+        .query_map([], |row| row.get(1))
+        .expect("query blob columns")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect blob columns");
+
+    // Blobs table MUST NEVER store plaintext note or file metadata (SEC-001/SEC-002)
+    let forbidden_blob = [
+        "filename",
+        "name",
+        "mime",
+        "mime_type",
+        "content_type",
+        "title",
+        "tags",
+        "plaintext",
+        "note_id",
+    ];
+    for col in &blob_columns {
+        let col_lower = col.to_ascii_lowercase();
+        for f in forbidden_blob {
+            assert_ne!(
+                col_lower, f,
+                "Blobs schema must not contain plaintext metadata field '{f}'"
+            );
+        }
+    }
+
+    assert!(blob_columns.contains(&"account_id".to_string()));
+    assert!(blob_columns.contains(&"blob_id".to_string()));
+    assert!(blob_columns.contains(&"size".to_string()));
+    assert!(blob_columns.contains(&"data".to_string()));
+}
+
+#[test]
+fn test_blobs_uniqueness_and_isolation() {
+    let conn = create_in_memory_db().expect("init db");
+
+    let acc_1 = Uuid::new_v4().to_string();
+    let acc_2 = Uuid::new_v4().to_string();
+    conn.execute(
+        "INSERT INTO accounts (id, status) VALUES (?1, 'active')",
+        [&acc_1],
+    )
+    .expect("insert acc_1");
+    conn.execute(
+        "INSERT INTO accounts (id, status) VALUES (?1, 'active')",
+        [&acc_2],
+    )
+    .expect("insert acc_2");
+
+    let blob_id = "blob-uuid-1";
+
+    // Insert blob for acc_1
+    conn.execute(
+        "INSERT INTO blobs (account_id, blob_id, size, data) VALUES (?1, ?2, 4, X'01020304')",
+        rusqlite::params![acc_1, blob_id],
+    )
+    .expect("insert blob 1 for acc_1");
+
+    // Duplicate (acc_1, blob_id) fails primary key constraint
+    let dup = conn.execute(
+        "INSERT INTO blobs (account_id, blob_id, size, data) VALUES (?1, ?2, 4, X'05060708')",
+        rusqlite::params![acc_1, blob_id],
+    );
+    assert!(dup.is_err(), "duplicate (account_id, blob_id) must fail PK");
+
+    // Same blob_id for different account acc_2 succeeds (cross-account isolation)
+    conn.execute(
+        "INSERT INTO blobs (account_id, blob_id, size, data) VALUES (?1, ?2, 4, X'05060708')",
+        rusqlite::params![acc_2, blob_id],
+    )
+    .expect("same blob_id for acc_2 must succeed");
 }

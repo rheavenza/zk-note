@@ -2021,7 +2021,7 @@ Completion notes:
 ---
 
 ## ZK-074 — Password change UX
-Status: TODO  
+Status: DONE  
 Priority: P1  
 Dependencies: ZK-017
 
@@ -2031,10 +2031,27 @@ Acceptance criteria:
 - old object ciphertext unchanged;
 - recovery wrapper remains valid unless intentionally rotated.
 
+Completion notes:
+- CLI (`apps/cli`):
+  - In `commands.rs`: Implemented `cmd_passwd` (`zk-note passwd`, aliases: `change-password`, `password`).
+  - Verifies current master passphrase fails closed before allowing rotation.
+  - Prompts for new passphrase with minimum 8-character length validation and confirmation matching.
+  - Re-wraps existing `VaultKey` with a fresh KEK derived from new passphrase and fresh salt/nonce via `VaultManager::set_new_passphrase`.
+  - Atomically replaces `vault.json` using atomic temporary file rename (`vault.json.tmp.<pid>`).
+  - Preserves unchanged `recovery_wrapped_vault_key` envelope in `VaultBootstrap` verbatim.
+  - Guarantees zero modification to stored SQLite note ciphertexts; notes remain decryptable under preserved VaultKey.
+  - Added CLI integration tests in `apps/cli/src/main.rs::test_cli_passwd_command_lifecycle` verifying authentication verification, fail-closed behavior on wrong old passphrase, note decryptability, rejection of old passphrase on unlock, and continued validity of recovery key (37/37 passing).
+- Web UI (`apps/web`):
+  - In `apps/web/src/worker/protocol.ts`, `vault-handler.ts`, and `client.ts`: Enhanced `REWRAP_PASSPHRASE` message payload to support verifying `oldPassphrase` against the current stored `wrappedVaultKey` and KDF parameters using `zk.unlock_vault` prior to re-wrapping. If old passphrase fails verification, rejects with `WorkerErrorCode.DECRYPTION_FAILED` ("Current master passphrase is incorrect.").
+  - In `apps/web/src/context/VaultContext.tsx`: Updated `rewrapPassphrase` and `sanitizeError` to pass `oldPassphrase` and current bootstrap envelopes to worker client and handle error messages cleanly.
+  - In `apps/web/src/components/SecurityRecoveryModal.tsx`: Updated "Change Passphrase" tab to require `Current Master Passphrase`, `New Master Passphrase`, and `Confirm New Passphrase`, clearing inputs from component memory immediately upon submit and close.
+  - In `apps/web/test/unlock-screen.test.tsx`: Added end-to-end worker integration tests verifying fail-closed rejection on wrong current passphrase, note decryptability, old passphrase invalidation, and recovery key validity (73/73 passing).
+- Quality gates: All 8 CI quality gates in `./scripts/ci.sh` pass cleanly.
+
 ---
 
 ## ZK-075 — Device list/revoke
-Status: TODO  
+Status: DONE  
 Priority: P1  
 Dependencies: ZK-070
 
@@ -2045,10 +2062,33 @@ Acceptance criteria:
 - revoked device cannot sync with invalidated credentials;
 - encrypted data model unchanged.
 
+Implementation notes:
+- Protocol (`crates/zk-protocol/src/auth.rs`): Added `DeviceInfo`, `DeviceListResponse`, `RevokeDeviceRequest`, and `RevokeDeviceResponse` structs with serialization/deserialization tests.
+- Server (`apps/server`):
+  - Added endpoints `GET /v1/devices`, `DELETE /v1/devices/{device_id}`, and `POST /v1/devices/revoke`.
+  - Enforced device revocation check prior to session check in `ServerDb::validate_session_token`, ensuring revoked devices immediately fail closed across sync pull and mutations with HTTP 401 and error code `ERROR_DEVICE_REVOKED`.
+  - Added integration tests covering device registration, listing, cross-account authorization isolation, cascading active session invalidation, and sync rejection.
+- CLI (`apps/cli`):
+  - Added `api_list_devices` and `api_revoke_device` in `apps/cli/src/auth.rs`.
+  - Implemented `cmd_device_list` and `cmd_device_revoke` in `apps/cli/src/commands.rs`.
+  - Added `zk-note device [list|revoke]` CLI subcommands with tabular and JSON output, clearing local session if the current device was revoked.
+  - Added end-to-end multi-client test `test_cli_device_list_and_revoke` in `apps/cli/src/main.rs`.
+- Web Client (`apps/web`):
+  - Added `DeviceInfo`, `listDevices`, and `revokeDevice` API helpers in `apps/web/src/auth/webauthn.ts`.
+  - Integrated `listDevices` and `revokeDevice` into `AuthContext` and `AuthProvider`.
+  - Created accessible `DeviceManagementModal` displaying authorized devices, current device badging, active/revoked status, and confirmation before revoking.
+  - Added `📱 Devices` button in `NotesWorkspace` navbar.
+  - Added unit and SSR component tests in `apps/web/test/device-management.test.tsx`.
+- Security invariants preserved:
+  - SEC-001 / SEC-002: Plaintext notes, Vault Keys, and passphrases are never transmitted or handled during device listing/revoking.
+  - SEC-003: Tokens and credentials are never logged.
+  - Encrypted note format and database schema remain untouched.
+- Quality gates: All 8 CI gates pass cleanly via `./scripts/ci.sh`.
+
 ---
 
 ## ZK-076 — Auto-lock policy
-Status: TODO  
+Status: DONE  
 Priority: P1  
 Dependencies: M6
 
@@ -2058,12 +2098,37 @@ Acceptance criteria:
 - explicit lock;
 - secret/plaintext in-memory state disposed best-effort.
 
+Completion notes:
+- Shared Core (`crates/zk-core`):
+  - Added `now_epoch_secs()` supporting both native and wasm32 targets (`crates/zk-core/src/time.rs`).
+  - Extended `VaultSession` (`crates/zk-core/src/vault.rs`) with `idle_timeout_secs: Option<u64>` and `last_active_secs: u64`.
+  - Added methods `with_idle_timeout`, `set_idle_timeout`, `idle_timeout`, `last_active_secs`, `touch`, and `check_idle_timeout` which automatically locks the session and purges the volatile search index when idle timeout is exceeded.
+  - Added unit test `test_vault_session_idle_timeout_and_auto_lock`.
+- WASM Bridge (`crates/zk-wasm`):
+  - Bound `set_idle_timeout`, `idle_timeout`, `touch`, and `check_idle_timeout` on `WasmVaultSession`.
+- CLI Client (`apps/cli`):
+  - Upgraded session storage (`apps/cli/src/session.rs`) to store JSON `SessionEnvelope` containing `key`, `created_at`, `last_active_at`, and `idle_timeout_secs` while maintaining full backward compatibility with raw 32-byte session files.
+  - `load_session_key_and_touch` and `load_session_key` verify idle expiration; if expired, the session file is securely zeroed across its entire length, unlinked from disk, and fails closed with `CliError::VaultLocked`.
+  - Added `autolock` command (`apps/cli/src/commands.rs` and `apps/cli/src/main.rs`) to inspect and update idle timeout policies (`zk-note autolock [timeout_mins]`).
+  - Added `--timeout <MINUTES>` flag to `zk-note unlock`.
+  - Added integration test `test_cli_auto_lock_policy_lifecycle` verifying configuration, activity tracking, auto-lock on expiration, and explicit lock.
+- Web Client (`apps/web`):
+  - In `VaultStore` and `VaultContext` (`apps/web/src/context/VaultContext.tsx`):
+    - Added configurable `autoLockTimeoutMinutes` (default 15m), stored in `localStorage` under `zk_autolock_minutes` (0 disables auto-lock).
+    - Periodic idle checker (every 2s, unref'd in Node test environments) and `visibilitychange` listener invoke `checkIdleLock()`, locking the vault on inactivity.
+    - Throttled window user activity listeners (`mousedown`, `keydown`, `touchstart`, `scroll`, `mousemove`) invoke `recordActivity()`.
+    - Best-effort secret disposal: `VaultSession.lock()` zeroizes key material and clears search indexes; `NotesStore.handleVaultLocked()` purges all decrypted notes and drafts from memory (`this.notes = []`).
+  - In `SecurityRecoveryModal` (`apps/web/src/components/SecurityRecoveryModal.tsx`):
+    - Added "Auto-Lock" tab with radio choices (5m, 15m, 30m, 60m, Never) and immediate "Lock Vault Now" action button.
+  - Added unit and UI tests in `apps/web/test/unlock-screen.test.tsx` verifying idle lock triggering, activity reset, and modal rendering.
+- Quality gates: All 8 CI gates pass cleanly via `./scripts/ci.sh`.
+
 ---
 
 # M8 — Encrypted attachments
 
 ## ZK-080 — Attachment cryptographic format
-Status: TODO  
+Status: DONE  
 Priority: P0  
 Dependencies: M1
 
@@ -2074,10 +2139,22 @@ Acceptance criteria:
 - unique nonce per chunk;
 - authenticated chunk index/attachment ID via AAD.
 
+Completion notes:
+- Strongly typed `AttachmentKey`: 256-bit symmetric key (`[u8; 32]`) defined in `crates/zk-crypto/src/keys.rs` with `ZeroizeOnDrop`, constant-time equality comparison, and CSPRNG generation (`AttachmentKey::generate()`).
+- Attachment protocol models: Defined `EncryptedChunk`, `AttachmentManifest`, and binary format with magic header `ZKCK` in `crates/zk-protocol/src/attachment.rs`. Added constants `ATTACHMENT_CHUNK_VERSION_V1`, `DEFAULT_ATTACHMENT_CHUNK_SIZE` (4 MiB), and `MAX_ATTACHMENT_SIZE` (100 MiB) in `crates/zk-protocol/src/constants.rs`.
+- Cryptographic chunk operations in `crates/zk-crypto/src/attachment.rs`:
+  - `build_chunk_aad`: Binds format version, attachment ID, chunk index, and total chunks.
+  - `encrypt_chunk` / `encrypt_chunk_with_rng`: Generates unique 24-byte random nonce per chunk and encrypts using XChaCha20-Poly1305 with AAD.
+  - `decrypt_chunk`: Decrypts and authenticates chunk; fails closed on wrong key, corrupted ciphertext, or tampered AAD.
+  - `encrypt_chunk_binary` / `decrypt_chunk_binary`: High-performance binary serialization bypassing base64 allocations.
+  - `wrap_attachment_key` / `unwrap_attachment_key`: Wraps and unwraps `AttachmentKey` under master `VaultKey` with AAD binding.
+- Tests added: Round-trip encrypt/decrypt (JSON and binary), wrong key failure, tampered ciphertext, tampered chunk index, tampered attachment ID, tampered total chunks, truncated nonce, and unsupported version.
+- Quality gates: All 8 CI gates pass cleanly via `./scripts/ci.sh`.
+
 ---
 
 ## ZK-081 — Chunked native encryption
-Status: TODO  
+Status: DONE  
 Priority: P0  
 Dependencies: ZK-080
 
@@ -2087,10 +2164,23 @@ Acceptance criteria:
 - corrupted chunk fails;
 - no need to buffer entire large file in memory.
 
+Completion notes:
+- Implemented streaming chunked encryption and decryption in `crates/zk-core/src/attachment.rs`:
+  - `encrypt_attachment_stream_with_sink`: Streams from any `std::io::Read` without loading the full file into memory; buffers at most one chunk (`params.chunk_size`, defaulting to 4 MiB) and passes encrypted chunks to an output sink callback.
+  - `encrypt_attachment_stream`: Collects encrypted chunks into a vector while incrementally computing BLAKE2b-512 content integrity hash.
+  - `encrypt_attachment_file`: Streams file from disk directly to chunked ciphertext without buffering the entire file.
+  - `decrypt_attachment_stream_with_source`: Streams decrypted plaintext directly to any `std::io::Write` sink, verifying sequential ordering (0, 1, ..., N-1), total chunk count consistency, and BLAKE2b content hash integrity.
+  - `decrypt_attachment_to_file`: Decrypts chunks directly to disk with automatic fail-closed cleanup if verification or decryption fails.
+- Strict security invariants enforced:
+  - Any corrupted chunk, tampered ciphertext, out-of-order chunk, or missing chunk fails closed immediately (`CoreError::Crypto` / `AttachmentError`).
+  - Strict size enforcement against `MAX_ATTACHMENT_SIZE` (100 MiB).
+- Comprehensive unit tests added in `crates/zk-core/src/attachment.rs` covering streaming round-trip, empty file streaming, corrupted chunks, out-of-order chunks, missing chunks, oversize rejection, and file-to-file round trip.
+- Quality gates: All 8 CI gates pass cleanly via `./scripts/ci.sh`.
+
 ---
 
 ## ZK-082 — Ciphertext blob server API
-Status: TODO  
+Status: DONE  
 Priority: P1  
 Dependencies: ZK-081
 
@@ -2101,10 +2191,32 @@ Acceptance criteria:
 - size quotas;
 - no filename/MIME plaintext.
 
+Completion notes:
+- Migration and schema:
+  - Created `migrations/009_ciphertext_blobs.sql` adding `blobs` table (`account_id`, `blob_id`, `size`, `data`, `created_at`, `updated_at`, PK `(account_id, blob_id)`) and index `idx_blobs_account_id`.
+  - Registered migration 9 in `apps/server/src/db/migrations.rs` and updated `ALL_TABLES`/`ALL_INDEXES` in `apps/server/src/db/schema.rs`.
+- Server storage operations (`apps/server/src/db/store.rs`):
+  - `put_blob`: Upserts opaque ciphertext bytes; enforces single blob size limit (`max_blob_size`) and account aggregate storage quota (`account_blob_quota`).
+  - `get_blob`: Retrieves blob data strictly scoped to authenticated `account_id` (returns `None` for cross-account or missing blobs).
+  - `delete_blob`: Deletes blob strictly scoped to authenticated `account_id`.
+  - `get_account_blob_usage`: Computes total storage consumed by account's blobs.
+- Server API endpoints (`apps/server/src/routes/blob.rs` and `apps/server/src/app.rs`):
+  - `PUT /v1/blobs/{blob_id}`: Accepts binary/octet-stream ciphertext chunk; enforces authentication, opaque blob ID format, max blob size, and aggregate quota; returns 201 Created.
+  - `GET /v1/blobs/{blob_id}`: Returns raw ciphertext chunk with `Content-Type: application/octet-stream`; returns 404 Not Found if missing or belonging to another account.
+  - `DELETE /v1/blobs/{blob_id}`: Deletes chunk; returns 200 OK or 404 Not Found.
+- Security and zero-knowledge invariants (SEC-001, SEC-002, SEC-003):
+  - Opaque IDs: strictly validates 1-128 alphanumeric, hyphen, or underscore characters.
+  - Authorization: routes are protected by `auth_middleware`; cross-account access is strictly prevented.
+  - Plaintext leakage prevention: requests containing metadata headers (such as `x-filename`, `x-mime-type`, `x-note-id`) are immediately rejected with 400 Bad Request (`PLAINTEXT_METADATA_FORBIDDEN`). No plaintext note or file fields exist in the schema or endpoints.
+- Integration tests added:
+  - `apps/server/tests/server_blob_tests.rs`: Comprehensive coverage of full put/get/delete lifecycle, cross-account isolation, unauthenticated/revoked token rejection, single blob size limit enforcement (HTTP 413), account aggregate storage quota enforcement (HTTP 413), forbidden plaintext header rejection, and invalid blob ID validation.
+  - `apps/server/tests/server_db_migration_tests.rs`: Verified migration 9 clean state, idempotency, foreign key cascade, primary key uniqueness, and schema zero-knowledge invariants.
+- Quality gates: All 8 CI gates pass cleanly via `./scripts/ci.sh`.
+
 ---
 
 ## ZK-083 — Attachment manifest integration
-Status: TODO  
+Status: DONE  
 Priority: P1  
 Dependencies: ZK-082
 
@@ -2114,10 +2226,30 @@ Acceptance criteria:
 - note references stable attachment ID;
 - delete/update semantics defined.
 
+Completion notes:
+- Attachment manifest envelope encryption:
+  - Added `encrypt_attachment_manifest` and `decrypt_attachment_manifest` in `crates/zk-core/src/attachment.rs`.
+  - Serializes `AttachmentManifest` (containing name, mime, size, chunk_count, chunk_size, content_hash) into JSON and encrypts into standard `EncryptedEnvelope` with `OBJECT_KIND_ATTACHMENT_MANIFEST = 4`, wrapping `AttachmentKey` under `VaultKey` with AAD authentication.
+  - Decryption fails closed if ciphertext is tampered or key is invalid.
+- Note attachment reference model & domain helpers:
+  - Added `add_attachment_to_note`, `remove_attachment_from_note`, and `find_orphaned_attachments` in `crates/zk-core/src/attachment.rs`.
+  - Notes reference stable attachment IDs in `note.attachments: Vec<String>`.
+  - Set-based 3-way merge in `crates/zk-sync/src/merge.rs` (`merge_attachments`) ensures convergent conflict resolution across concurrent devices.
+- CLI attachment management commands (`apps/cli/src/commands.rs`):
+  - `cmd_attach`: Reads file, creates random `AttachmentKey` and attachment ID, chunks/encrypts data, stores encrypted manifest object (`OBJECT_KIND_ATTACHMENT_MANIFEST`), updates note's attachment list, and enqueues pending sync mutations.
+  - `cmd_detach`: Removes attachment ID from note, enqueues note update mutation, and writes tombstone for manifest object with pending delete mutation.
+  - `cmd_attachments`: Lists attachments for a note by decrypting their stored manifests.
+  - Updated `cmd_show` to display note attachments.
+- Unit and integration tests:
+  - Added unit tests in `crates/zk-core/src/attachment.rs` for manifest encryption/decryption round trip and note attachment lifecycle.
+  - Added CLI integration test `test_attachment_attach_list_detach_lifecycle` in `apps/cli/src/main.rs`.
+- Quality gates: All 8 CI quality gates pass cleanly via `./scripts/ci.sh`.
+
+
 ---
 
 ## ZK-084 — Web attachment support
-Status: TODO  
+Status: DONE  
 Priority: P1  
 Dependencies: ZK-083, M6
 
@@ -2128,12 +2260,45 @@ Acceptance criteria:
 - progress shown;
 - network sees ciphertext only.
 
+Completion notes:
+- WebAssembly attachment operations (`crates/zk-wasm/src/lib.rs`):
+  - Added `attachments: Vec<String>` to `WasmPlaintextNote`.
+  - Exported `WasmAttachmentManifest` and `WasmDecryptedManifest` via `wasm-bindgen`.
+  - Added session methods to `WasmVaultSession`: `encrypt_note_with_attachments`, `encrypt_attachment_manifest`, `decrypt_attachment_manifest`, `encrypt_attachment_chunk` (with binary ZKCK wire format serialization), and `decrypt_attachment_chunk` (validating format, version, and AAD).
+  - Exported standalone helpers: `wasm_generate_attachment_key`, `wasm_compute_content_hash`, and `wasm_calculate_chunk_count`.
+  - Added comprehensive wasm unit test `test_wasm_attachment_manifest_and_chunks` and recompiled via `wasm-pack build --target web crates/zk-wasm --out-dir pkg`.
+- Dedicated Web Worker integration (`apps/web/src/worker/`):
+  - Updated `PlaintextNoteDto` to include `attachments: string[]`.
+  - Defined `AttachmentManifestDto` and worker request/response RPC protocol types for attachment key generation, content hashing, manifest encryption/decryption, and chunk encryption/decryption.
+  - Implemented handlers in `vault-handler.ts` delegating to active `WasmVaultSession` without exposing key material to the UI thread.
+  - Extended `VaultWorkerClient` with type-safe asynchronous worker call wrappers.
+- IndexedDB ciphertext blob caching (`apps/web/src/storage/indexeddb.ts`):
+  - Bumped schema version to `DB_SCHEMA_VERSION = 2` with new `blobs` object store.
+  - Added `putBlob`, `getBlob`, `deleteBlob`, and `listBlobIds` APIs for storing encrypted chunk bytes locally.
+- Web Attachment Manager (`apps/web/src/attachments/manager.ts`):
+  - Implemented `AttachmentManager` orchestrating chunked upload and download workflows.
+  - Enforced 100 MiB file size limit (`MAX_ATTACHMENT_SIZE`).
+  - Chunked streaming (4 MiB default) with unique 24-byte nonces and AAD binding per chunk.
+  - Progress callbacks reporting `encrypting`, `uploading`, `downloading`, `decrypting`, and `complete` phases with accurate percentage calculations.
+  - Generates and encrypts `AttachmentManifest` envelope (object kind 4) under active VaultKey and enqueues sync mutation.
+  - Verifies BLAKE2b content hash and chunk integrity upon download, failing closed immediately if ciphertext or AAD is tampered (SEC-010).
+  - Tombstone deletion lifecycle: `deleteAttachment` marks manifest object deleted, enqueues delete mutation with `expected_revision`, and scrubs cached blobs.
+- UI & Editor integration (`apps/web/src/context/NotesContext.tsx`, `apps/web/src/components/MarkdownEditor.tsx`):
+  - Integrated `AttachmentManager` into `NotesContext` (`attachFile`, `detachAttachment`, `downloadAttachment`, `getAttachmentManifests`, `attachmentProgress`).
+  - Rendered Attachments section in `MarkdownEditor` with file upload trigger, progress bar indicator, attachment chips with file size formatting, download action, and detach action.
+  - Extended note 3-way merge (`apps/web/src/utils/diff3.ts`) with set-based attachment ID merging.
+- Security & Zero-Knowledge validation:
+  - Added `apps/web/test/attachments.test.ts` covering worker chunk crypto, manifest crypto, multi-chunk upload/download roundtrip, progress event emissions, oversized file rejection, tampered chunk fail-closed enforcement, and network traffic inspection.
+  - Verified network traffic sees CIPHERTEXT ONLY: `PUT /v1/blobs/{blob_id}` transfers binary ZKCK wire format with `Content-Type: application/octet-stream`; URLs, headers, and request bodies contain zero plaintext filenames, MIME types, or note content (SEC-001, SEC-002, SEC-003).
+- Quality gates: All 8 CI quality gates pass cleanly via `./scripts/ci.sh`.
+
+
 ---
 
 # M9 — Hardening and release candidate
 
 ## ZK-090 — Protocol property tests
-Status: TODO  
+Status: DONE  
 Priority: P0  
 Dependencies: M8
 
@@ -2144,10 +2309,18 @@ Acceptance criteria:
 - idempotency property;
 - cursor monotonicity property.
 
+Completion notes:
+- Implemented dedicated property testing suite in `apps/server/tests/protocol_property_tests.rs`:
+  - `test_property_no_invalid_silent_state_transitions`: Verified strict compare-and-swap state machine semantics (non-existent object requires `expected_revision = 0`; existing objects require exact matching revision; stale or future revisions reject with `Conflict`; tombstones increment revision monotonically; stale writes cannot silently resurrect deleted objects; explicit updates after deletion require matching revision).
+  - `test_property_idempotency_exact_replay_preserves_state`: Proved that replaying identical accepted mutations repeatedly returns original revision and server sequence without allocating new sequence numbers or modifying database state; verified that altered payload replays reject with `ReplayMismatch`.
+  - `test_property_cursor_monotonicity_and_pagination`: Proved strict sequence monotonicity across sequential writes ($S_{k+1} > S_k$); verified pagination across multiple page sizes ($L \in \{1, 2, 3, 5, 7, 10, 25, 50\}$) ensuring cursor advances strictly monotonically ($C_{k+1} > C_k$), all changes are visited without omissions or duplicates, and trailing cursor queries return empty pages with `has_more = false`.
+  - `test_property_randomized_multi_object_sequence_simulation`: Built a 500-step model-based randomized fuzz test across 10 distinct object IDs, validating state transitions, idempotency, and sequence monotonicity against an in-memory reference model at every step.
+- Quality gates: All 8 CI quality gates pass cleanly via `./scripts/ci.sh`.
+
 ---
 
 ## ZK-091 — Concurrency stress suite
-Status: TODO  
+Status: DONE  
 Priority: P0  
 Dependencies: M5
 
@@ -2159,10 +2332,20 @@ Acceptance criteria:
 - network retry;
 - no duplicate accepted logical mutation.
 
+Completion notes:
+- Implemented comprehensive concurrency stress test suite in `apps/server/tests/concurrency_stress_tests.rs`:
+  - `test_stress_concurrent_writers_same_object_cas_race`: 50 concurrent writers raced to update the same object from revision 1; verified that exactly 1 writer succeeded with revision 2, and exactly 49 writers were rejected with HTTP 409 Conflict containing current revision 2.
+  - `test_stress_concurrent_writers_distinct_objects`: 50 concurrent writers created 50 distinct objects simultaneously; verified that all 50 succeeded and received strictly unique sequence numbers spanning `1..=50` with no duplicates or gaps.
+  - `test_stress_duplicate_mutation_races`: 50 concurrent tasks fired the exact same mutation ID and payload simultaneously; verified that all tasks received identical `PushResponse` with revision 1 and server sequence 1, and only 1 logical sequence was allocated.
+  - `test_stress_network_retry_lost_response`: Simulated dropped responses across multiple consecutive revisions; verified that client retries yielded idempotent responses and no duplicate logical mutations were created.
+  - `test_stress_server_restart_persistence_and_sequence_continuity`: Booted on-disk SQLite database, committed mutations 1 and 2, terminated server connection, re-opened SQLite database in a new server instance, and verified sequence allocator continued monotonically (mutation 3 received sequence 3), idempotency cache survived restart, and change streams were intact.
+  - `test_stress_mixed_concurrent_workload_no_duplicate_logical_mutations`: Launched 30 concurrent workers performing mixed updates and retries across 10 objects, verifying global invariant that total sequences allocated matched exact logical successes and no duplicate sequence numbers were issued.
+- Quality gates: All 8 CI quality gates pass cleanly via `./scripts/ci.sh`.
+
 ---
 
 ## ZK-092 — Plaintext leakage test suite
-Status: TODO  
+Status: DONE  
 Priority: P0  
 Dependencies: M6
 
@@ -2179,10 +2362,24 @@ Acceptance criteria:
 
 No note title/body/tag plaintext in prohibited locations.
 
+Implementation notes:
+- Implemented comprehensive server and native client leakage test suite in `apps/server/tests/plaintext_leakage_tests.rs`:
+  - Canary secrets injected across test fixtures: `CANARY_TITLE`, `CANARY_BODY`, `CANARY_TAG_1`, `CANARY_TAG_2`, `CANARY_ATTACHMENT_NAME`, `CANARY_ATTACHMENT_MIME`, `CANARY_ATTACHMENT_DATA`, and `CANARY_PASSPHRASE`.
+  - Audited Server DB: Scanned every row, column, text field, and BLOB across all tables (`accounts`, `vault_roots`, `sync_objects`, `object_history`, `blobs`, `devices`, `sessions`), followed by a raw binary byte scan of the SQLite `.sqlite` database file on disk.
+  - Audited Server Application Logs: In-memory tracing subscriber capturing all log records emitted during vault bootstrap, note creation, blob upload/download, and sync pull. Verified zero canary matches.
+  - Audited Full API Captures: Captured HTTP request/response URLs, headers, and bodies across `/v1/vault/bootstrap`, `/v1/sync/push`, `/v1/blobs/{id}`, and `/v1/sync/changes`. Verified zero canary leakage.
+  - Audited Native Client SQLite Persistence: Created and mutated encrypted notes with `zk-storage::SqliteStorage` (verifying `objects`, `base_versions`, `pending_mutations`, `conflicts`), and scanned both table contents and raw disk bytes of the `.sqlite` file.
+  - Audited Crash/Error Responses: Tested HTTP 409 Conflict, HTTP 400 Bad Request with malformed JSON containing canaries, HTTP 404 Object Not Found, and HTTP 404 Missing Blob. Verified error payloads never reflect canary plaintext.
+- Implemented browser-side leakage test suite in `apps/web/test/plaintext-leakage.test.ts`:
+  - IndexedDB Audit: Populated all 6 object stores (`objects`, `base_versions`, `mutations`, `conflicts`, `blobs`, `sync_state`) and inspected raw serialized store entries via direct IndexedDB transactions, verifying 0 canary occurrences.
+  - Network Payloads: Verified that client-side `PushRequest` and blob requests contain no forbidden properties (`title`, `body`, `tags`, `passphrase`, `filename`, `mime_type`).
+  - Error Reporting: Verified that client error formatting sanitizes note contexts and never leaks titles, bodies, or passphrases.
+- All gates verified clean via `./scripts/ci.sh`.
+
 ---
 
 ## ZK-093 — Dependency and supply-chain audit
-Status: TODO  
+Status: DONE  
 Priority: P0  
 Dependencies: M8
 
@@ -2194,10 +2391,21 @@ Acceptance criteria:
 - lockfiles present;
 - crypto dependencies manually reviewed.
 
+Implementation notes:
+- Audited all workspace dependencies using `cargo-audit` against the RustSec Advisory Database (scanned 191 crates, 0 vulnerabilities found).
+- Audited web dependencies via `npm audit --audit-level=moderate` (scanned all dependencies, 0 vulnerabilities found).
+- Authored formal policy and audit report in `docs/threat-model/dependency-audit.md`:
+  - Defined vulnerability remediation SLA (Critical within 24h, High within 72h, Medium/Low within 14 days).
+  - Reviewed and documented all cryptographic dependencies (`chacha20poly1305`, `argon2`, `blake2`, `zeroize`, `rand_core`/`getrandom`, `subtle`, `base64ct`), confirming verified RustCrypto implementations, constant-time guarantees, memory zeroization on drop, and 192-bit nonce collision resistance.
+  - Verified lockfile presence (`Cargo.lock` and `apps/web/package-lock.json`) and committed state.
+  - Verified supply-chain hardening: zero external runtime CDN scripts, zero trackers/analytics, and root `#![forbid(unsafe_code)]`.
+- Created automated audit script `scripts/audit.sh` and wired it into CI gate 9 in `scripts/ci.sh`.
+- All gates verified clean via `./scripts/ci.sh`.
+
 ---
 
 ## ZK-094 — Browser XSS/CSP security review
-Status: TODO  
+Status: DONE  
 Priority: P0  
 Dependencies: ZK-069
 
@@ -2208,10 +2416,27 @@ Acceptance criteria:
 - Markdown renderer sanitization;
 - no third-party origin script execution.
 
+Implementation notes:
+- Hardened `apps/web/src/utils/markdown.ts`:
+  - Enforced strict character validation in `sanitizeUrl` rejecting whitespace, quotes, angle brackets, backslashes, and control characters to prevent HTML attribute breakout.
+  - Applied `escapeHtml` to link `href` attributes as defense-in-depth.
+- Created `apps/web/test/xss-csp-review.test.ts` implementing a comprehensive penetration suite:
+  - Validated raw `<script>` tags across casing and nested structures are escaped to `&lt;`.
+  - Validated HTML event handlers (`onload`, `onerror`, `onfocus`, etc.) and object/iframe embeds are neutralized.
+  - Validated dangerous link URI schemes (`javascript:`, `vbscript:`, `data:`, `file:`, obfuscated control chars) are neutralized to `#`.
+  - Validated attribute breakout payloads (`" onclick="alert(1)"`) are neutralized.
+  - Validated safe Markdown formatting and links remain fully operational with `rel="noopener noreferrer"`.
+  - Validated CSP directives in `index.html` as well as Nginx and Caddy deployment templates.
+- Authored detailed security review in `docs/threat-model/web-security-review.md`:
+  - Detailed Content Security Policy directive rationale and exfiltration mitigations (`connect-src 'self'`).
+  - Audited and documented dangerous HTML rendering sink inventory across all components.
+  - Documented browser hardening headers (`nosniff`, `DENY`, `no-referrer`, `COOP/COEP`).
+- All gates verified clean via `./scripts/ci.sh`.
+
 ---
 
 ## ZK-095 — Authorization penetration tests
-Status: TODO  
+Status: DONE  
 Priority: P0  
 Dependencies: M7
 
@@ -2223,10 +2448,21 @@ Acceptance criteria:
 - history access;
 - revoked credential tests.
 
+Implementation notes:
+- Implemented comprehensive penetration test suite in `apps/server/tests/authorization_penetration_tests.rs`:
+  - IDOR Mutation & Deletion: Verified that Account B attempting to update or delete Account A's object returns HTTP 404 (`ERROR_OBJECT_NOT_FOUND`) without leaking object existence, leaving Account A's object revision and content intact.
+  - Cross-Account Object Guesses: Probed with 20 randomly generated UUIDs under CAS updates; all returned HTTP 404 without timing side-channels.
+  - Ciphertext Blob IDOR: Account A uploaded a blob; Account B's GET and HEAD requests returned HTTP 404. Account B uploading under the identical blob ID created an isolated record without corrupting or overwriting Account A's blob data.
+  - History & Sync Stream Isolation: Verified that Account B pulling `/v1/sync/changes` receives strictly Account B's mutations, completely isolating Account A's mutations.
+  - Revoked Session Credentials: Explicitly revoked an active session token via `db.revoke_session` and verified that subsequent requests to all protected endpoints (`/v1/sync/changes`, `/v1/devices`, `/v1/auth/session/status`, `/v1/blobs/*`) fail immediately with HTTP 401 Unauthorized.
+  - Revoked Device Credentials: Created a second session and revoked the entire device via `DELETE /v1/devices/{id}`; verified all sessions bound to that device are immediately rejected with HTTP 401 Unauthorized (`ERROR_DEVICE_REVOKED`).
+  - Forged / Malformed Tokens: Tested missing tokens, wrong auth schemes (`Basic`), non-session tokens, SQL injection strings, and forged JWT structures; all fail closed with HTTP 401 Unauthorized.
+- All gates verified clean via `./scripts/ci.sh`.
+
 ---
 
 ## ZK-096 — Backup/restore test
-Status: TODO  
+Status: DONE  
 Priority: P1  
 Dependencies: M7
 
@@ -2236,10 +2472,24 @@ Acceptance criteria:
 - server still contains ciphertext only;
 - fresh authorized client can sync and decrypt with user-held secrets.
 
+Implementation notes:
+- Implemented end-to-end database backup and restoration test suite in `apps/server/tests/backup_restore_tests.rs`:
+  - Database Backup: Initialized an on-disk SQLite server instance, bootstrapped a user vault with Argon2id KDF and wrapped VaultKey, and populated active notes, multi-revision updates, tombstone deletions, and encrypted blob attachments. Generated a transactionally consistent online backup snapshot via `VACUUM INTO`.
+  - Zero-Knowledge Backup Audit: Audited every table and row in the backup SQLite database file, as well as the raw disk bytes. Confirmed zero occurrences of note titles, bodies, tags, attachment plaintexts, or vault passphrases (SEC-001, SEC-002).
+  - Server Restoration: Restored the backup file into a completely separate, fresh server instance.
+  - Client Decryption: A fresh client connected to the restored server, fetched the vault bootstrap, derived the KEK from user-held passphrase, unwrapped the VaultKey, pulled sync changes, and decrypted all notes:
+    - Note 1 decrypted with verified title, body, and tags.
+    - Note 2 decrypted with verified latest Revision 2 update.
+    - Note 3 verified as an un-resurrected deletion tombstone (Revision 2).
+    - Downloaded and decrypted the ciphertext blob chunk, verifying original document plaintext.
+  - Operational Continuity: Verified the restored server continues compare-and-swap (CAS) push mutations and monotonic sequence allocations for new client notes without regression or sequence collisions.
+- Updated `apps/server/src/routes/sync.rs` to accept `after`, `since`, and `cursor` query parameters interchangeably for cursor synchronization.
+- All gates verified clean via `./scripts/ci.sh`.
+
 ---
 
 ## ZK-097 — Threat model review
-Status: TODO  
+Status: DONE  
 Priority: P0  
 Dependencies: ZK-092, ZK-094, ZK-095
 
@@ -2249,10 +2499,19 @@ Acceptance criteria:
 - known residual risks listed;
 - web-origin trust limitation clearly documented.
 
+Implementation notes:
+- Authored comprehensive application threat model review in `docs/threat-model/threat-model-review.md`:
+  - Detailed system trust boundaries across passive eavesdroppers, compromised server/cloud operators, malicious multi-tenant peers, and local multi-user workstations.
+  - Formally analyzed and documented the **Web-Origin Trust Limitation** (the fundamental web crypto delivery paradox): analyzed risks of compromised server origins serving malicious JavaScript, detailed mitigations (strict CSP, COOP/COEP, Web Worker key isolation, no third-party scripts), and documented high-assurance guidance recommending compiled/signed native CLI (`zk-note`) or self-hosted origins.
+  - Documented known residual risks: traffic analysis/metadata leakage, volatile RAM remanence across JS/WASM runtimes, browser extension attacks, and offline dictionary exhaustion against weak user passphrases.
+  - Created a complete mapping matrix connecting invariants SEC-001 through SEC-010 to concrete automated test suites.
+- Created `docs/threat-model/README.md` indexing all security reviews and threat model documentation.
+- All gates verified clean via `./scripts/ci.sh`.
+
 ---
 
 ## ZK-098 — External security review preparation
-Status: TODO  
+Status: DONE  
 Priority: P1  
 Dependencies: ZK-097
 
@@ -2268,10 +2527,19 @@ Prepare:
 - reproducible demo accounts/data;
 - list of security claims.
 
+Completion notes:
+- Authored comprehensive external security review package in `docs/security-review-package.md`:
+  - System architecture Mermaid diagram documenting trust boundaries, Web Worker RPC isolation, native CLI core, untrusted network TLS boundary, and server CAS engine.
+  - Links to wire protocol specification (`docs/protocol/v1.md`), Web Worker API spec (`docs/protocol/worker-api.md`), cryptographic architecture ADR (`docs/adr/0003-cryptographic-architecture.md`), CLI editor security review (`docs/threat-model/cli-editor-security.md`), web security review (`docs/threat-model/web-security-review.md`), dependency audit (`docs/threat-model/dependency-audit.md`), and comprehensive threat model review (`docs/threat-model/threat-model-review.md`).
+  - Cataloged 7 formal verified security claims (`CLAIM-01` through `CLAIM-07`) mapping to invariants `SEC-001` through `SEC-010` and their corresponding test suites.
+  - Detailed auditor verification commands covering full repository CI gate (`./scripts/ci.sh`) and targeted test suites for plaintext leakage, concurrency stress, protocol properties, authorization penetration, backup/restore, browser XSS/CSP, and IndexedDB storage audits.
+  - Documented reproducible demo credentials, Argon2id KDF parameters, recovery key formats, and cross-runtime test vectors (`crates/zk-crypto/tests/test_vectors.rs` and `tests/wasm_crypto_compat.test.mjs`).
+- Verified via `./scripts/ci.sh`.
+
 ---
 
 ## ZK-099 — Release candidate gate
-Status: TODO  
+Status: DONE  
 Priority: P0  
 Dependencies: all required P0/P1 V1 tasks
 
@@ -2284,6 +2552,16 @@ Acceptance criteria:
 - recovery demo passes;
 - no prohibited plaintext leakage found;
 - release notes include known limitations.
+
+Completion notes:
+- Verified all P0 and P1 V1 tasks across Milestone 0 through Milestone 9 are marked `DONE` with 0 remaining tasks.
+- Created dedicated Release Candidate verification test suite in `apps/server/tests/release_candidate_tests.rs`:
+  - `test_rc_two_client_offline_conflict_demo`: Spun up live HTTP sync server and two independent client instances with isolated SQLite databases. Demonstrated initial note creation, sync, concurrent offline editing based on the same revision, CAS rejection of stale edit (`409 Conflict`), local conflict preservation of base/local/remote envelopes, 3-way merge resolution, re-encryption, push, and remote convergence. Audited raw server SQLite bytes to guarantee zero plaintext leakage.
+  - `test_rc_recovery_lifecycle_demo`: Demonstrated full vault initialization with Argon2id master passphrase and 288-bit formatted `RecoveryKey`, note creation and encryption, simulated passphrase loss (wrong passphrase fails closed), vault unlock using recovery key, rotation to a new master passphrase, verification that old passphrase fails closed, new passphrase unlocks successfully, and 100% data integrity across all notes (zero data loss).
+- Created executable demonstration runner `scripts/demo_rc.sh` allowing automated one-step verification (`./scripts/demo_rc.sh`).
+- Verified zero prohibited plaintext leakage across server database, server logs, network captures, native client SQLite files, and browser IndexedDB stores via `apps/server/tests/plaintext_leakage_tests.rs` and `apps/web/test/plaintext-leakage.test.ts`.
+- Authored release notes in `docs/release-notes-v1.0.0-rc1.md` documenting architecture, security guarantees, test suite results, deployment instructions, and known limitations / residual risks (Web crypto delivery paradox / origin trust limitation, workstation endpoint compromise boundaries, traffic analysis/metadata side-channels, weak passphrase offline exhaustion, and forward secrecy boundaries).
+- Successfully executed full 9-gate repository CI gate (`./scripts/ci.sh`) with 100% passing checks.
 
 ---
 

@@ -108,6 +108,8 @@ use crate::search::InMemorySearchIndex;
 pub struct VaultSession {
     active_key: Option<VaultKey>,
     search_index: Option<InMemorySearchIndex>,
+    last_active_secs: u64,
+    idle_timeout_secs: Option<u64>,
 }
 
 impl VaultSession {
@@ -117,6 +119,8 @@ impl VaultSession {
         Self {
             active_key: None,
             search_index: None,
+            last_active_secs: crate::time::now_epoch_secs(),
+            idle_timeout_secs: None,
         }
     }
 
@@ -126,13 +130,67 @@ impl VaultSession {
         Self {
             active_key: Some(key),
             search_index: Some(InMemorySearchIndex::new()),
+            last_active_secs: crate::time::now_epoch_secs(),
+            idle_timeout_secs: None,
         }
+    }
+
+    /// Creates an unlocked session with a specific idle timeout in seconds (ZK-076).
+    #[must_use]
+    pub fn with_idle_timeout(key: VaultKey, timeout_secs: Option<u64>) -> Self {
+        Self {
+            active_key: Some(key),
+            search_index: Some(InMemorySearchIndex::new()),
+            last_active_secs: crate::time::now_epoch_secs(),
+            idle_timeout_secs: timeout_secs.filter(|&s| s > 0),
+        }
+    }
+
+    /// Sets or updates the idle timeout in seconds (None or Some(0) disables auto-lock).
+    pub fn set_idle_timeout(&mut self, timeout_secs: Option<u64>) {
+        self.idle_timeout_secs = timeout_secs.filter(|&s| s > 0);
+    }
+
+    /// Returns the configured idle timeout in seconds.
+    #[must_use]
+    pub fn idle_timeout(&self) -> Option<u64> {
+        self.idle_timeout_secs
+    }
+
+    /// Returns the Unix epoch timestamp in seconds of last recorded activity.
+    #[must_use]
+    pub fn last_active_secs(&self) -> u64 {
+        self.last_active_secs
+    }
+
+    /// Updates the last active timestamp to the current time.
+    pub fn touch(&mut self) {
+        self.last_active_secs = crate::time::now_epoch_secs();
+    }
+
+    /// Checks if the session has timed out due to inactivity (ZK-076).
+    ///
+    /// If the idle timeout has elapsed, immediately locks the session, zeroizes key material,
+    /// clears decrypted search index, and returns `true`. Returns `false` otherwise.
+    pub fn check_idle_timeout(&mut self) -> bool {
+        if !self.is_unlocked() {
+            return false;
+        }
+        if let Some(timeout) = self.idle_timeout_secs {
+            let now = crate::time::now_epoch_secs();
+            if now.saturating_sub(self.last_active_secs) >= timeout {
+                self.lock();
+                return true;
+            }
+        }
+        false
     }
 
     /// Unlocks the session with the provided [`VaultKey`].
     pub fn unlock(&mut self, key: VaultKey) {
         self.active_key = Some(key);
         self.search_index = Some(InMemorySearchIndex::new());
+        self.last_active_secs = crate::time::now_epoch_secs();
     }
 
     /// Locks the session and zeroes the active [`VaultKey`] and volatile search index from memory.
@@ -143,7 +201,7 @@ impl VaultSession {
         }
     }
 
-    /// Returns `true` if the session is currently unlocked.
+    /// Returns `true` if the session is currently unlocked and not expired.
     #[must_use]
     pub fn is_unlocked(&self) -> bool {
         self.active_key.is_some()
@@ -281,5 +339,33 @@ mod tests {
             VaultManager::unlock_with_recovery_key(&updated_bootstrap, &recovery_key_str)
                 .expect("unlock recovery");
         assert_eq!(vault_key, recovered_after_pass_change);
+    }
+
+    #[test]
+    fn test_vault_session_idle_timeout_and_auto_lock() {
+        let key = VaultKey::generate();
+        let mut session = VaultSession::with_idle_timeout(key.clone(), Some(3600));
+
+        assert!(session.is_unlocked());
+        assert_eq!(session.idle_timeout(), Some(3600));
+        assert!(!session.check_idle_timeout());
+        assert!(session.is_unlocked());
+
+        // Update timeout to 0 (disabled)
+        session.set_idle_timeout(Some(0));
+        assert_eq!(session.idle_timeout(), None);
+
+        // Update timeout to 1 second and simulate passage of time
+        session.set_idle_timeout(Some(1));
+        assert_eq!(session.idle_timeout(), Some(1));
+
+        // Simulate elapsed time by rewinding last_active_secs
+        session.last_active_secs -= 2;
+        assert!(session.check_idle_timeout());
+
+        // Session must be locked and zeroized
+        assert!(!session.is_unlocked());
+        assert_eq!(session.active_key().unwrap_err(), CoreError::VaultLocked);
+        assert_eq!(session.search_index().unwrap_err(), CoreError::VaultLocked);
     }
 }

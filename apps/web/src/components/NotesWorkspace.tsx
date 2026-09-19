@@ -16,6 +16,7 @@ import { SearchModal } from "./SearchModal.js";
 import { SyncStatusIndicator } from "./SyncStatusIndicator.js";
 import { ConflictResolverModal } from "./ConflictResolverModal.js";
 import { SecurityRecoveryModal } from "./SecurityRecoveryModal.js";
+import { DeviceManagementModal } from "./DeviceManagementModal.js";
 
 export interface NotesWorkspaceProps {
   className?: string;
@@ -23,6 +24,7 @@ export interface NotesWorkspaceProps {
 
 export const NotesWorkspace: React.FC<NotesWorkspaceProps> = ({ className }) => {
   const [isSecurityModalOpen, setIsSecurityModalOpen] = useState(false);
+  const [isDeviceModalOpen, setIsDeviceModalOpen] = useState(false);
 
   return (
     <div
@@ -55,6 +57,16 @@ export const NotesWorkspace: React.FC<NotesWorkspaceProps> = ({ className }) => 
           >
             🛡️ Security
           </button>
+          <button
+            type="button"
+            onClick={() => setIsDeviceModalOpen(true)}
+            title="Authorized Devices"
+            style={securityButtonStyle}
+            aria-label="Authorized devices management"
+            className="zk-device-management-btn"
+          >
+            📱 Devices
+          </button>
           <LockVaultButton />
         </div>
       </header>
@@ -81,6 +93,14 @@ export const NotesWorkspace: React.FC<NotesWorkspaceProps> = ({ className }) => 
         isOpen={isSecurityModalOpen}
         onClose={() => setIsSecurityModalOpen(false)}
       />
+
+      {/* Authorized Devices & Sessions Modal (ZK-075) */}
+      {isDeviceModalOpen && (
+        <DeviceManagementModal
+          isOpen={isDeviceModalOpen}
+          onClose={() => setIsDeviceModalOpen(false)}
+        />
+      )}
     </div>
   );
 };
