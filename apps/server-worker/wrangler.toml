@@ -1,0 +1,16 @@
+name = "zk-server-worker"
+main = "build/worker/shim.mjs"
+compatibility_date = "2024-09-23"
+
+[build]
+command = "export PATH=\"$HOME/.cargo/bin:$PATH\"; worker-build --release"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "zk-notes-db"
+database_id = "00000000-0000-0000-0000-000000000000"
+migrations_dir = "migrations"
+
+[[r2_buckets]]
+binding = "BLOBS"
+bucket_name = "zk-notes-blobs"

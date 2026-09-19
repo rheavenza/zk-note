@@ -1,0 +1,21 @@
+[package]
+name = "zk-server-worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Zero-knowledge ciphertext store and sync coordination Cloudflare Worker"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+zk-protocol = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+worker = { version = "0.8.6", features = ["d1"] }
+console_error_panic_hook = "0.1"

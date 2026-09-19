@@ -9,6 +9,7 @@ members = [
     "crates/zk-wasm",
     "apps/cli",
     "apps/server",
+    "apps/server-worker",
 ]
 
 [workspace.package]
