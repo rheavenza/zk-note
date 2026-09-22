@@ -37,7 +37,7 @@ try {
   await run('worker-build',['--release']);
   await run('cargo',['build','-p','zk-server'],{cwd:root});
   const native=await start(path.join(root,'target/debug/zk-server'),[],{env:{...env,ZK_SERVER_PORT:String(nativePort),ZK_SERVER_DB_PATH:path.join(temp,'native.db')}});
-  const worker=await start('npx',['wrangler','dev','--local','--port',String(workerPort),'--persist-to',temp]);
+  const worker=await start('npx',['wrangler','dev','--local','--port',String(workerPort),'--persist-to',temp,'--var','WEBAUTHN_RP_ID:localhost','--var','WEBAUTHN_ORIGIN:http://localhost:5173']);
   await Promise.all([ready(nativeUrl,native),ready(workerUrl,worker)]);
   await run('node',[path.join(root,'scripts/server-contract.mjs'),nativeUrl,workerUrl]);
   passed=true;

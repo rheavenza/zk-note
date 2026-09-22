@@ -28,10 +28,11 @@ cargo install worker-build --version 0.8.6 --locked
 npm install --prefix apps/cloudflare-worker
 cd apps/cloudflare-worker
 npx wrangler d1 migrations apply zk-note-staging-db --local
-npx wrangler dev --local
+npm run dev
 ```
 
-Wrangler uses simulated local D1 and R2 by default. Its generated `.wrangler`
+The `dev` script overrides the deployed WebAuthn settings with `localhost` and
+uses simulated local D1 and R2. Its generated `.wrangler`
 state, Worker build output, local variables, and staging overrides are ignored
 by Git. No Cloudflare account or production resource is used by these commands.
 

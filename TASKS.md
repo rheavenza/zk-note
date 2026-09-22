@@ -72,10 +72,10 @@ Completion notes:
 - Hardened both servers with verified ES256 WebAuthn ceremonies, single-use challenges, authenticated existing-account enrollment/device authorization, and rejection of UUID bearer tokens. Updated the CLI and browser adapters for the verified ceremony and recorded the decision in ADR 0006.
 - Added a shared HTTP contract suite for the native server and Worker, including authentication, account/session isolation, sync CAS and concurrent replay, cursors, tombstones, and blob lifecycle. Added Miniflare/D1/R2 fault tests for storage compensation and query plans, plus an isolated Wrangler local smoke runner.
 - Added pinned Wrangler/Miniflare tooling, local bindings and scripts, CI checks, ignore rules, and `docs/deployment-cloudflare.md`. Local D1 and R2 are simulated by default.
-- Created remote D1 database `zk-note-staging-db` (`c1c16c84-bb64-474b-8ef7-a0c2d645d6f8`) in APAC and applied migration `0001_server.sql`.
+- Created remote D1 database `zk-note-staging-db` (`c1c16c84-bb64-474b-8ef7-a0c2d645d6f8`) in APAC and applied migration `0001_server.sql`. Created private R2 bucket `zk-note-ciphertext-staging` and deployed staging Worker version `efbde019-8572-44e2-b7a8-d60f9e2bee2e` at `https://zk-note-staging.trustymountainyak.workers.dev`.
 
 Remote staging note:
-- Cloudflare rejected R2 bucket creation with API code 10042 because R2 is not enabled for the account. The Worker was therefore not deployed and no staging URL exists. After account-level R2 activation, create `zk-note-ciphertext-staging`, deploy, and run the same contract script against the workers.dev URL. No DNS or client endpoint was changed.
+- After account-level R2 activation, the remote migration state was confirmed current and the shared contract passed against staging with 84 protocol checks plus CAS/replay concurrency. Error-level log tailing during a repeated contract run produced no exceptions or D1/R2/reconciliation errors. No production DNS or client endpoint was changed.
 
 Validation:
 - Shared native/Worker contract: 84 protocol checks plus CAS/replay concurrency passed for each backend.

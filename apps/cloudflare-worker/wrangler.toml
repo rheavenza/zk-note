@@ -7,8 +7,8 @@ workers_dev = true
 command = "worker-build --release"
 
 [vars]
-WEBAUTHN_RP_ID = "localhost"
-WEBAUTHN_ORIGIN = "http://localhost:5173"
+WEBAUTHN_RP_ID = "zk-note-staging.trustymountainyak.workers.dev"
+WEBAUTHN_ORIGIN = "https://zk-note-staging.trustymountainyak.workers.dev"
 MAX_BLOB_SIZE = "1048576"
 ACCOUNT_BLOB_QUOTA = "1073741824"
 

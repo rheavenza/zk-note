@@ -4,8 +4,6 @@ import assert from 'node:assert/strict';
 import { generateKeyPairSync, randomBytes, randomUUID, createHash, sign } from 'node:crypto';
 const b64 = b => Buffer.from(b).toString('base64url');
 const sha = b => createHash('sha256').update(b).digest();
-const origin = process.env.ZK_TEST_ORIGIN || 'http://localhost:5173';
-const rp = process.env.ZK_TEST_RP_ID || 'localhost';
 function cbor(value) {
   const head = (major, n) => n < 24 ? Buffer.from([major * 32 + n]) : n < 256 ? Buffer.from([major * 32 + 24, n]) : Buffer.from([major * 32 + 25, n >> 8, n & 255]);
   if (Number.isInteger(value)) return value >= 0 ? head(0, value) : head(1, -1-value);
@@ -15,6 +13,10 @@ function cbor(value) {
   throw Error('unsupported test CBOR fixture');
 }
 async function contract(base) {
+  const target=new URL(base);
+  const deployed=target.hostname.endsWith('.workers.dev');
+  const origin=process.env.ZK_TEST_ORIGIN || (deployed?target.origin:'http://localhost:5173');
+  const rp=process.env.ZK_TEST_RP_ID || (deployed?target.hostname:'localhost');
   let checks=0;
   async function call(path,{method='GET',body,token,raw=false,status=200,headers={}}={}) {
     const response=await fetch(base+path,{method,headers:{...(body!==undefined&&!raw?{'content-type':'application/json'}:{}),...(token?{authorization:`Bearer ${token}`} : {}),...headers},body:body===undefined?undefined:raw?body:JSON.stringify(body)});

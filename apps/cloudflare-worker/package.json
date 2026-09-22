@@ -2,7 +2,7 @@
   "name": "zk-cloudflare-worker",
   "private": true,
   "scripts": {
-    "dev": "wrangler dev --local",
+    "dev": "wrangler dev --local --var WEBAUTHN_RP_ID:localhost --var WEBAUTHN_ORIGIN:http://localhost:5173",
     "migrate:local": "wrangler d1 migrations apply zk-note-staging-db --local",
     "smoke": "node ../../scripts/server-contract.mjs",
     "build": "worker-build --release",
