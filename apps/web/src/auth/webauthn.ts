@@ -23,7 +23,7 @@ export interface WebAuthnRpInfo {
 export interface WebAuthnUserInfo {
   id: string;
   name: string;
-  displayName: string;
+  display_name: string;
 }
 
 export interface RegisterStartResponse {
@@ -75,11 +75,11 @@ export function base64UrlToBuffer(base64url: string): Uint8Array {
  */
 export async function startRegistration(
   serverUrl: string,
-  options?: { username?: string; displayName?: string; accountId?: string }
+  options?: { username?: string; displayName?: string; accountId?: string; token?: string }
 ): Promise<RegisterStartResponse> {
   const res = await fetch(`${serverUrl}/v1/auth/webauthn/register/start`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...(options?.token ? { Authorization: `Bearer ${options.token}` } : {}) },
     body: JSON.stringify({
       username: options?.username,
       display_name: options?.displayName,
@@ -104,6 +104,8 @@ export async function finishRegistration(
     challengeId: string;
     credentialId: string;
     publicKey: string;
+    attestationObject: string;
+    clientDataJSON: string;
     displayName?: string;
     deviceId?: string;
   }
@@ -115,6 +117,8 @@ export async function finishRegistration(
       challenge_id: params.challengeId,
       credential_id: params.credentialId,
       public_key: params.publicKey,
+      attestation_object: params.attestationObject,
+      client_data_json: params.clientDataJSON,
       display_name: params.displayName,
       device_id: params.deviceId,
     }),
@@ -167,6 +171,8 @@ export async function finishLogin(
     challengeId: string;
     credentialId: string;
     signature: string;
+    authenticatorData: string;
+    clientDataJSON: string;
     deviceId?: string;
   }
 ): Promise<WebAuthnSession> {
@@ -177,6 +183,8 @@ export async function finishLogin(
       challenge_id: params.challengeId,
       credential_id: params.credentialId,
       signature: params.signature,
+      authenticator_data: params.authenticatorData,
+      client_data_json: params.clientDataJSON,
       device_id: params.deviceId,
     }),
   });
@@ -233,7 +241,7 @@ export async function revokeSession(
  */
 export async function registerPasskey(
   serverUrl: string,
-  options?: { username?: string; displayName?: string; accountId?: string; deviceId?: string }
+  options?: { username?: string; displayName?: string; accountId?: string; deviceId?: string; token?: string }
 ): Promise<WebAuthnSession> {
   const start = await startRegistration(serverUrl, options);
 
@@ -244,20 +252,20 @@ export async function registerPasskey(
     const credential = (await navigator.credentials.create({
       publicKey: {
         challenge: challengeBuffer.buffer as ArrayBuffer,
-        rp: { name: start.rp.name, id: window.location.hostname },
+        rp: { name: start.rp.name, id: start.rp.id },
         user: {
           id: userIdBuffer.buffer as ArrayBuffer,
           name: start.user.name,
-          displayName: start.user.displayName,
+          displayName: start.user.display_name,
         },
         pubKeyCredParams: [
           { alg: -7, type: "public-key" }, // ES256
-          { alg: -257, type: "public-key" }, // RS256
         ],
         authenticatorSelection: {
-          residentKey: "preferred",
-          userVerification: "preferred",
+          residentKey: "required",
+          userVerification: "required",
         },
+        attestation: "none",
         timeout: 60000,
       },
     })) as PublicKeyCredential;
@@ -276,21 +284,14 @@ export async function registerPasskey(
       challengeId: start.challenge_id,
       credentialId: rawId,
       publicKey: publicKey || rawId,
+      attestationObject: bufferToBase64Url(response.attestationObject),
+      clientDataJSON: bufferToBase64Url(response.clientDataJSON),
       displayName: options?.displayName,
       deviceId: options?.deviceId,
     });
   }
 
-  // Fallback for non-browser/test environments: generate mock credential
-  const mockCredId = bufferToBase64Url(new TextEncoder().encode(`cred-${Date.now()}`));
-  const mockPubKey = bufferToBase64Url(new TextEncoder().encode(`pubkey-${Date.now()}`));
-  return finishRegistration(serverUrl, {
-    challengeId: start.challenge_id,
-    credentialId: mockCredId,
-    publicKey: mockPubKey,
-    displayName: options?.displayName,
-    deviceId: options?.deviceId,
-  });
+  throw new Error("WebAuthn navigator.credentials is not available in the current environment.");
 }
 
 /**
@@ -309,8 +310,8 @@ export async function signInWithPasskey(
     const assertion = (await navigator.credentials.get({
       publicKey: {
         challenge: challengeBuffer.buffer as ArrayBuffer,
-        rpId: window.location.hostname,
-        userVerification: "preferred",
+        rpId: start.rp_id,
+        userVerification: "required",
         timeout: 60000,
       },
     })) as PublicKeyCredential;
@@ -327,7 +328,8 @@ export async function signInWithPasskey(
       challengeId: start.challenge_id,
       credentialId: rawId,
       signature,
-      deviceId: options?.deviceId,
+      authenticatorData: bufferToBase64Url(response.authenticatorData),
+      clientDataJSON: bufferToBase64Url(response.clientDataJSON),      deviceId: options?.deviceId,
     });
   }
 

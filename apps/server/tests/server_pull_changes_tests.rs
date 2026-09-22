@@ -58,10 +58,10 @@ fn helper_push_request(
 #[tokio::test]
 async fn test_pull_changes_empty_account() {
     let state = AppState::new_in_memory(ServerConfig::default()).unwrap();
-    let app = create_app(state);
+    let app = create_app(state.clone());
 
     let account_id = Uuid::new_v4();
-    let auth_header = format!("Bearer {account_id}");
+    let auth_header = common::bearer(&state, account_id).await;
 
     let req = Request::builder()
         .uri("/v1/sync/changes")
@@ -85,10 +85,10 @@ async fn test_pull_changes_empty_account() {
 #[tokio::test]
 async fn test_pull_changes_ordered_server_seq() {
     let state = AppState::new_in_memory(ServerConfig::default()).unwrap();
-    let app = create_app(state);
+    let app = create_app(state.clone());
 
     let account_id = Uuid::new_v4();
-    let auth_header = format!("Bearer {account_id}");
+    let auth_header = common::bearer(&state, account_id).await;
 
     // Create 5 distinct objects
     let mut obj_ids = Vec::new();
@@ -141,10 +141,10 @@ async fn test_pull_changes_ordered_server_seq() {
 #[tokio::test]
 async fn test_pull_changes_pagination_flow() {
     let state = AppState::new_in_memory(ServerConfig::default()).unwrap();
-    let app = create_app(state);
+    let app = create_app(state.clone());
 
     let account_id = Uuid::new_v4();
-    let auth_header = format!("Bearer {account_id}");
+    let auth_header = common::bearer(&state, account_id).await;
 
     // Create 7 objects
     for i in 1..=7 {
@@ -251,10 +251,10 @@ async fn test_pull_changes_pagination_flow() {
 #[tokio::test]
 async fn test_pull_changes_includes_tombstones() {
     let state = AppState::new_in_memory(ServerConfig::default()).unwrap();
-    let app = create_app(state);
+    let app = create_app(state.clone());
 
     let account_id = Uuid::new_v4();
-    let auth_header = format!("Bearer {account_id}");
+    let auth_header = common::bearer(&state, account_id).await;
 
     let obj1 = Uuid::new_v4().to_string();
     let obj2 = Uuid::new_v4().to_string();
@@ -350,10 +350,10 @@ async fn test_pull_changes_includes_tombstones() {
 #[tokio::test]
 async fn test_pull_changes_endpoint_aliases() {
     let state = AppState::new_in_memory(ServerConfig::default()).unwrap();
-    let app = create_app(state);
+    let app = create_app(state.clone());
 
     let account_id = Uuid::new_v4();
-    let auth_header = format!("Bearer {account_id}");
+    let auth_header = common::bearer(&state, account_id).await;
     let obj_id = Uuid::new_v4().to_string();
 
     let push_req = helper_push_request(&obj_id, 0, b"note");
@@ -416,12 +416,12 @@ async fn test_pull_changes_endpoint_aliases() {
 #[tokio::test]
 async fn test_pull_changes_cross_account_isolation() {
     let state = AppState::new_in_memory(ServerConfig::default()).unwrap();
-    let app = create_app(state);
+    let app = create_app(state.clone());
 
     let account_a = Uuid::new_v4();
     let account_b = Uuid::new_v4();
-    let auth_a = format!("Bearer {account_a}");
-    let auth_b = format!("Bearer {account_b}");
+    let auth_a = common::bearer(&state, account_a).await;
+    let auth_b = common::bearer(&state, account_b).await;
 
     // Account A creates 3 objects
     for i in 1..=3 {
@@ -465,7 +465,7 @@ async fn test_pull_changes_cross_account_isolation() {
 #[tokio::test]
 async fn test_pull_changes_auth_required() {
     let state = AppState::new_in_memory(ServerConfig::default()).unwrap();
-    let app = create_app(state);
+    let app = create_app(state.clone());
 
     let req = Request::builder()
         .uri("/v1/sync/changes")
@@ -486,10 +486,10 @@ async fn test_pull_changes_auth_required() {
 #[tokio::test]
 async fn test_pull_changes_invalid_query_parameters() {
     let state = AppState::new_in_memory(ServerConfig::default()).unwrap();
-    let app = create_app(state);
+    let app = create_app(state.clone());
 
     let account_id = Uuid::new_v4();
-    let auth_header = format!("Bearer {account_id}");
+    let auth_header = common::bearer(&state, account_id).await;
 
     // Invalid 'after' cursor parameter
     let req1 = Request::builder()
@@ -525,10 +525,10 @@ async fn test_pull_changes_invalid_query_parameters() {
 #[tokio::test]
 async fn test_pull_changes_concurrency_no_missed_rows() {
     let state = AppState::new_in_memory(ServerConfig::default()).unwrap();
-    let app = create_app(state);
+    let app = create_app(state.clone());
 
     let account_id = Uuid::new_v4();
-    let auth_header = Arc::new(format!("Bearer {account_id}"));
+    let auth_header = Arc::new(common::bearer(&state, account_id).await);
 
     const NUM_WRITES: usize = 30;
     let mut write_handles = Vec::with_capacity(NUM_WRITES);
@@ -632,3 +632,5 @@ async fn test_pull_changes_concurrency_no_missed_rows() {
         assert_eq!(read_set, pushed_objects);
     }
 }
+
+mod common;

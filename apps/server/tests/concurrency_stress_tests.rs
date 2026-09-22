@@ -68,7 +68,7 @@ async fn test_stress_concurrent_writers_same_object_cas_race() {
     let app = create_app(state.clone());
 
     let account_id = Uuid::new_v4();
-    let auth_header = format!("Bearer {account_id}");
+    let auth_header = common::bearer(&state, account_id).await;
     let object_id = Uuid::new_v4().to_string();
 
     // Initial creation -> revision 1
@@ -167,7 +167,7 @@ async fn test_stress_concurrent_writers_distinct_objects() {
     let app = create_app(state.clone());
 
     let account_id = Uuid::new_v4();
-    let auth_header = format!("Bearer {account_id}");
+    let auth_header = common::bearer(&state, account_id).await;
 
     const NUM_OBJECTS: usize = 50;
     let mut handles = Vec::with_capacity(NUM_OBJECTS);
@@ -233,7 +233,7 @@ async fn test_stress_duplicate_mutation_races() {
     let app = create_app(state.clone());
 
     let account_id = Uuid::new_v4();
-    let auth_header = format!("Bearer {account_id}");
+    let auth_header = common::bearer(&state, account_id).await;
     let object_id = Uuid::new_v4().to_string();
     let mutation_id = Uuid::new_v4().to_string();
 
@@ -457,7 +457,7 @@ async fn test_stress_mixed_concurrent_workload_no_duplicate_logical_mutations() 
     let app = create_app(state.clone());
 
     let account_id = Uuid::new_v4();
-    let auth_header = format!("Bearer {account_id}");
+    let auth_header = common::bearer(&state, account_id).await;
 
     // Create 10 base objects first
     let mut object_ids = Vec::with_capacity(10);
@@ -566,3 +566,5 @@ async fn test_stress_mixed_concurrent_workload_no_duplicate_logical_mutations() 
         );
     }
 }
+
+mod common;

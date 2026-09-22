@@ -11,7 +11,7 @@ use crate::error::DbError;
 use crate::routes::vault::contains_forbidden_keys;
 use axum::body::Bytes;
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use base64ct::{Base64, Base64UrlUnpadded, Encoding};
@@ -69,8 +69,15 @@ fn generate_secure_challenge() -> (Uuid, [u8; 32], String) {
 /// Handler for `POST /v1/auth/webauthn/register/start`.
 pub async fn webauthn_register_start_handler(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<WebAuthnRegisterStartRequest>,
 ) -> Response {
+    let user_id = req.account_id.unwrap_or_else(Uuid::new_v4);
+    if req.account_id.is_some() {
+        if let Err(response) = require_owner(&state, &headers, user_id).await {
+            return response.into_response();
+        }
+    }
     let (challenge_id, challenge_bytes, challenge_b64) = generate_secure_challenge();
 
     // 5-minute challenge TTL
@@ -79,7 +86,7 @@ pub async fn webauthn_register_start_handler(
         .create_webauthn_challenge(
             challenge_id,
             &challenge_bytes,
-            req.account_id,
+            Some(user_id),
             "register",
             300,
         )
@@ -96,7 +103,6 @@ pub async fn webauthn_register_start_handler(
             .into_response();
     }
 
-    let user_id = req.account_id.unwrap_or_else(Uuid::new_v4);
     let username = req
         .username
         .unwrap_or_else(|| format!("user_{}", &user_id.to_string()[..8]));
@@ -107,7 +113,10 @@ pub async fn webauthn_register_start_handler(
         Json(WebAuthnRegisterStartResponse {
             challenge_id,
             challenge_b64,
-            rp: WebAuthnRpInfo::default(),
+            rp: WebAuthnRpInfo {
+                name: "Zero-Knowledge Notes".into(),
+                id: state.config.webauthn_rp_id.clone(),
+            },
             user: WebAuthnUserInfo {
                 id: user_id.to_string(),
                 name: username,
@@ -194,7 +203,7 @@ pub async fn webauthn_register_finish_handler(
         }
     };
 
-    // 4. Decode credential ID and public key
+    // 4. Decode credential ID and validate the authenticator proof
     let cred_id_bytes = match decode_base64_flexible(&req.credential_id) {
         Ok(b) if !b.is_empty() => b,
         _ => {
@@ -209,18 +218,14 @@ pub async fn webauthn_register_finish_handler(
         }
     };
 
-    let pubkey_bytes = match decode_base64_flexible(&req.public_key) {
-        Ok(b) if !b.is_empty() => b,
-        _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse {
-                    code: "INVALID_PUBLIC_KEY".to_string(),
-                    message: "Public key is not valid base64/base64url".to_string(),
-                }),
-            )
-                .into_response();
-        }
+    let pubkey_bytes = match zk_server_auth::register(
+        &req,
+        &challenge_record.challenge,
+        &state.config.webauthn_rp_id,
+        &state.config.webauthn_origin,
+    ) {
+        Ok(key) => key,
+        Err(_) => return verification_failure(),
     };
 
     let account_id = challenge_record.account_id.unwrap_or_else(Uuid::new_v4);
@@ -320,7 +325,7 @@ pub async fn webauthn_login_start_handler(
         Json(WebAuthnLoginStartResponse {
             challenge_id,
             challenge_b64,
-            rp_id: "localhost".to_string(),
+            rp_id: state.config.webauthn_rp_id.clone(),
         }),
     )
         .into_response()
@@ -466,18 +471,45 @@ pub async fn webauthn_login_finish_handler(
         }
     }
 
-    // 6. Update usage sign counter
-    let _ = state
-        .db
-        .update_webauthn_credential_usage(&cred_id_bytes, credential.sign_count + 1)
-        .await;
+    let count = match zk_server_auth::login(
+        &req,
+        &challenge_record.challenge,
+        &state.config.webauthn_rp_id,
+        &state.config.webauthn_origin,
+        &credential.public_key,
+        credential.sign_count,
+    ) {
+        Ok(count) => count,
+        Err(_) => return verification_failure(),
+    };
+    // A revoked enrolled device cannot be bypassed by supplying a new device ID.
+    if let Some(device) = credential.device_id {
+        if !matches!(
+            state
+                .db
+                .is_device_revoked(credential.account_id, device)
+                .await,
+            Ok(false)
+        ) {
+            return crate::auth::AuthError::DeviceRevoked.into_response();
+        }
+    }
+    if !matches!(
+        state
+            .db
+            .advance_webauthn_counter(&cred_id_bytes, credential.sign_count, count)
+            .await,
+        Ok(true)
+    ) {
+        return verification_failure();
+    }
 
     // 7. Provision active session
     let (session, token) = match state
         .db
         .create_session(
             credential.account_id,
-            req.device_id.or(credential.device_id),
+            credential.device_id.or(req.device_id),
             credential.display_name,
             None,
         )
@@ -504,7 +536,7 @@ pub async fn webauthn_login_finish_handler(
                 token,
                 session_id: session.session_id,
                 account_id: credential.account_id,
-                device_id: req.device_id.or(credential.device_id),
+                device_id: credential.device_id.or(req.device_id),
                 expires_at: session.expires_at,
             },
         }),
@@ -572,6 +604,7 @@ pub async fn revoke_session_handler(
 /// - Validates that the device is registered and not revoked.
 pub async fn device_authorize_handler(
     State(state): State<AppState>,
+    headers: HeaderMap,
     body_bytes: Bytes,
 ) -> Response {
     let parsed_json: serde_json::Value = match serde_json::from_slice(&body_bytes) {
@@ -614,6 +647,10 @@ pub async fn device_authorize_handler(
                 .into_response();
         }
     };
+
+    if let Err(response) = require_owner(&state, &headers, req.account_id).await {
+        return response.into_response();
+    }
 
     // Check if device is revoked
     match state
@@ -816,4 +853,32 @@ pub async fn revoke_device_post_handler(
                 .into_response()
         }
     }
+}
+
+fn verification_failure() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ErrorResponse {
+            code: ERROR_WEBAUTHN_VERIFICATION_FAILED.into(),
+            message: "WebAuthn verification failed".into(),
+        }),
+    )
+        .into_response()
+}
+
+async fn require_owner(
+    state: &AppState,
+    headers: &HeaderMap,
+    account: Uuid,
+) -> Result<(), crate::auth::AuthError> {
+    let token = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .ok_or(crate::auth::AuthError::MissingHeader)?;
+    let auth = crate::auth::authenticate_bearer_token(&state.db, token).await?;
+    if auth.account_id != account {
+        return Err(crate::auth::AuthError::ForbiddenAccountAccess);
+    }
+    Ok(())
 }

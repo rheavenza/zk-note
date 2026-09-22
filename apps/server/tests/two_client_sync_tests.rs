@@ -92,11 +92,24 @@ struct ClientDevice {
 }
 
 impl ClientDevice {
-    fn new(base_url: &str, account_id: Uuid, vault_key: VaultKey, prefix: &str) -> Self {
+    async fn new(server: &TestServer, account_id: Uuid, vault_key: VaultKey, prefix: &str) -> Self {
         let db_path = std::env::temp_dir().join(format!("zk_{prefix}_{}.db", Uuid::new_v4()));
         let storage = Arc::new(SqliteStorage::open(&db_path).expect("open client sqlite"));
-        let adapter = NativeHttpSyncAdapter::new(base_url, Some(account_id.to_string()))
-            .expect("init sync adapter");
+        let adapter = NativeHttpSyncAdapter::new(
+            &server.base_url,
+            Some(
+                server
+                    .state
+                    .db
+                    .create_session(account_id, None, None, Some(3600))
+                    .await
+                    .unwrap()
+                    .1
+                    .expose_secret()
+                    .to_string(),
+            ),
+        )
+        .expect("init sync adapter");
         let engine = SyncEngine::new(adapter, storage.clone());
         let session = VaultSession::from_key(vault_key.clone());
 
@@ -175,18 +188,10 @@ async fn test_two_client_m4_gate_complete_scenario() {
     let shared_vault_key = VaultKey::generate();
 
     // 1. Spin up client A local DB and client B local DB
-    let mut client_a = ClientDevice::new(
-        &server.base_url,
-        account_id,
-        shared_vault_key.clone(),
-        "devA",
-    );
-    let mut client_b = ClientDevice::new(
-        &server.base_url,
-        account_id,
-        shared_vault_key.clone(),
-        "devB",
-    );
+    let mut client_a =
+        ClientDevice::new(&server, account_id, shared_vault_key.clone(), "devA").await;
+    let mut client_b =
+        ClientDevice::new(&server, account_id, shared_vault_key.clone(), "devB").await;
 
     let note_id = Uuid::new_v4().to_string();
 
@@ -341,18 +346,10 @@ async fn test_two_client_ten_sequential_alternating_edits() {
     let account_id = Uuid::new_v4();
     let shared_vault_key = VaultKey::generate();
 
-    let mut client_a = ClientDevice::new(
-        &server.base_url,
-        account_id,
-        shared_vault_key.clone(),
-        "seqA",
-    );
-    let mut client_b = ClientDevice::new(
-        &server.base_url,
-        account_id,
-        shared_vault_key.clone(),
-        "seqB",
-    );
+    let mut client_a =
+        ClientDevice::new(&server, account_id, shared_vault_key.clone(), "seqA").await;
+    let mut client_b =
+        ClientDevice::new(&server, account_id, shared_vault_key.clone(), "seqB").await;
 
     let note_id = Uuid::new_v4().to_string();
 
@@ -405,18 +402,10 @@ async fn test_two_client_tombstone_deletion_propagation() {
     let account_id = Uuid::new_v4();
     let shared_vault_key = VaultKey::generate();
 
-    let mut client_a = ClientDevice::new(
-        &server.base_url,
-        account_id,
-        shared_vault_key.clone(),
-        "delA",
-    );
-    let mut client_b = ClientDevice::new(
-        &server.base_url,
-        account_id,
-        shared_vault_key.clone(),
-        "delB",
-    );
+    let mut client_a =
+        ClientDevice::new(&server, account_id, shared_vault_key.clone(), "delA").await;
+    let mut client_b =
+        ClientDevice::new(&server, account_id, shared_vault_key.clone(), "delB").await;
 
     let note_id = Uuid::new_v4().to_string();
 
@@ -458,18 +447,10 @@ async fn test_two_client_killed_sync_resumes_from_durable_cursor() {
     let account_id = Uuid::new_v4();
     let shared_vault_key = VaultKey::generate();
 
-    let mut client_a = ClientDevice::new(
-        &server.base_url,
-        account_id,
-        shared_vault_key.clone(),
-        "killA",
-    );
-    let mut client_b = ClientDevice::new(
-        &server.base_url,
-        account_id,
-        shared_vault_key.clone(),
-        "killB",
-    );
+    let mut client_a =
+        ClientDevice::new(&server, account_id, shared_vault_key.clone(), "killA").await;
+    let mut client_b =
+        ClientDevice::new(&server, account_id, shared_vault_key.clone(), "killB").await;
 
     let note_ids: Vec<String> = (0..5).map(|_| Uuid::new_v4().to_string()).collect();
 

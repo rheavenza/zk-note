@@ -1,0 +1,20 @@
+{
+  "name": "zk-cloudflare-worker",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev --local",
+    "migrate:local": "wrangler d1 migrations apply zk-note-staging-db --local",
+    "smoke": "node ../../scripts/server-contract.mjs",
+    "build": "worker-build --release",
+    "deploy": "wrangler deploy",
+    "logs": "wrangler tail",
+    "test": "node tests/storage-failures.mjs",
+    "test:local": "node ../../scripts/cloudflare-smoke.mjs",
+    "deploy:staging": "wrangler deploy",
+    "setup": "cargo install worker-build --version 0.8.6 --locked"
+  },
+  "devDependencies": {
+    "miniflare": "5.20260921.0-alpha",
+    "wrangler": "4.136.1"
+  }
+}

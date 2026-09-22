@@ -68,13 +68,13 @@ fn helper_push_request(
 
 #[tokio::test]
 async fn test_penetration_idor_object_mutation_and_deletion() {
-    let (app, _state) = setup_test_app();
+    let (app, state) = setup_test_app();
 
     let account_a = Uuid::new_v4();
-    let auth_a = format!("Bearer {account_a}");
+    let auth_a = common::bearer(&state, account_a).await;
 
     let account_b = Uuid::new_v4();
-    let auth_b = format!("Bearer {account_b}");
+    let auth_b = common::bearer(&state, account_b).await;
 
     let obj_id = Uuid::new_v4().to_string();
 
@@ -169,10 +169,10 @@ async fn test_penetration_idor_object_mutation_and_deletion() {
 
 #[tokio::test]
 async fn test_penetration_object_enumeration_attempts() {
-    let (app, _state) = setup_test_app();
+    let (app, state) = setup_test_app();
 
     let attacker = Uuid::new_v4();
-    let auth_attacker = format!("Bearer {attacker}");
+    let auth_attacker = common::bearer(&state, attacker).await;
 
     // Attacker attempts to update 20 randomly generated UUIDs
     for _ in 0..20 {
@@ -202,13 +202,13 @@ async fn test_penetration_object_enumeration_attempts() {
 
 #[tokio::test]
 async fn test_penetration_blob_access_and_isolation() {
-    let (app, _state) = setup_test_app();
+    let (app, state) = setup_test_app();
 
     let account_a = Uuid::new_v4();
-    let auth_a = format!("Bearer {account_a}");
+    let auth_a = common::bearer(&state, account_a).await;
 
     let account_b = Uuid::new_v4();
-    let auth_b = format!("Bearer {account_b}");
+    let auth_b = common::bearer(&state, account_b).await;
 
     let blob_id = "target-blob-attachment-xyz-123";
     let blob_data_a = b"CIPHERTEXT_BLOB_OWNED_BY_ACCOUNT_A";
@@ -329,13 +329,13 @@ async fn test_penetration_blob_access_and_isolation() {
 
 #[tokio::test]
 async fn test_penetration_sync_changes_stream_isolation() {
-    let (app, _state) = setup_test_app();
+    let (app, state) = setup_test_app();
 
     let account_a = Uuid::new_v4();
-    let auth_a = format!("Bearer {account_a}");
+    let auth_a = common::bearer(&state, account_a).await;
 
     let account_b = Uuid::new_v4();
-    let auth_b = format!("Bearer {account_b}");
+    let auth_b = common::bearer(&state, account_b).await;
 
     // Account A creates 5 objects
     for i in 0..5 {
@@ -413,6 +413,7 @@ async fn test_penetration_revoked_session_and_device_credentials() {
     let auth_req = Request::builder()
         .method("POST")
         .uri("/v1/auth/device/authorize")
+        .header("authorization", common::bearer(&state, account_id).await)
         .header("content-type", "application/json")
         .body(Body::from(
             json!({
@@ -481,6 +482,7 @@ async fn test_penetration_revoked_session_and_device_credentials() {
     let auth_req2 = Request::builder()
         .method("POST")
         .uri("/v1/auth/device/authorize")
+        .header("authorization", common::bearer(&state, account_id).await)
         .header("content-type", "application/json")
         .body(Body::from(
             json!({
@@ -566,3 +568,5 @@ async fn test_penetration_forged_and_malformed_tokens() {
         );
     }
 }
+
+mod common;

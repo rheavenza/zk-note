@@ -2390,7 +2390,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cli_login_and_whoami_lifecycle() {
-        let (server_url, _state, _shutdown) = start_test_server().await;
+        let (server_url, state, _shutdown) = start_test_server().await;
         let test_dir = temp_test_dir("cli_login_lifecycle");
         let dir_path = test_dir.as_path();
 
@@ -2400,13 +2400,18 @@ mod tests {
 
         // 2. Perform CLI device authorization
         let account_id = Uuid::new_v4();
+        let (_, authorizer) = state
+            .db
+            .create_session(account_id, None, None, Some(3600))
+            .await
+            .unwrap();
         cmd_login(
             Some(dir_path),
             Some(server_url.clone()),
             Some(account_id.to_string()),
             Some("My CLI Workstation".to_string()),
             None,
-            None,
+            Some(authorizer.expose_secret().to_string()),
         )
         .await
         .expect("login succeeds");
@@ -2506,6 +2511,11 @@ mod tests {
         let dir_path = test_dir.as_path();
 
         let account_id = Uuid::new_v4();
+        let (_, authorizer) = state
+            .db
+            .create_session(account_id, None, None, Some(3600))
+            .await
+            .unwrap();
         let device_id = Uuid::new_v4();
 
         // 1. Authorize device
@@ -2515,7 +2525,7 @@ mod tests {
             Some(account_id.to_string()),
             Some("Laptop".to_string()),
             Some(device_id.to_string()),
-            None,
+            Some(authorizer.expose_secret().to_string()),
         )
         .await
         .expect("login succeeds");
@@ -2535,7 +2545,7 @@ mod tests {
             Some(account_id.to_string()),
             Some("Laptop".to_string()),
             Some(device_id.to_string()),
-            None,
+            Some(authorizer.expose_secret().to_string()),
         )
         .await
         .unwrap_err();
@@ -2550,13 +2560,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_cli_device_list_and_revoke() {
-        let (server_url, _state, _shutdown) = start_test_server().await;
+        let (server_url, state, _shutdown) = start_test_server().await;
         let test_dir1 = temp_test_dir("cli_device_mgr_1");
         let dir1 = test_dir1.as_path();
         let test_dir2 = temp_test_dir("cli_device_mgr_2");
         let dir2 = test_dir2.as_path();
 
         let account_id = Uuid::new_v4();
+        let (_, authorizer) = state
+            .db
+            .create_session(account_id, None, None, Some(3600))
+            .await
+            .unwrap();
         let dev1_id = Uuid::new_v4();
         let dev2_id = Uuid::new_v4();
 
@@ -2567,7 +2582,7 @@ mod tests {
             Some(account_id.to_string()),
             Some("Laptop Workstation".to_string()),
             Some(dev1_id.to_string()),
-            None,
+            Some(authorizer.expose_secret().to_string()),
         )
         .await
         .expect("client 1 login succeeds");
@@ -2579,7 +2594,7 @@ mod tests {
             Some(account_id.to_string()),
             Some("Mobile Device".to_string()),
             Some(dev2_id.to_string()),
-            None,
+            Some(authorizer.expose_secret().to_string()),
         )
         .await
         .expect("client 2 login succeeds");

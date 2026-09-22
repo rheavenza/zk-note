@@ -47,6 +47,7 @@ use zk_sync::orchestrator::{SyncCycleOptions, SyncEngine};
 
 /// Ephemeral test server instance.
 struct TestServer {
+    state: AppState,
     base_url: String,
     db_file: PathBuf,
     shutdown_tx: Option<oneshot::Sender<()>>,
@@ -68,7 +69,7 @@ async fn start_test_server() -> TestServer {
     let db = ServerDb::from_connection(conn);
     let config = ServerConfig::default();
     let state = AppState { config, db };
-    let app = create_app(state);
+    let app = create_app(state.clone());
 
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -85,6 +86,7 @@ async fn start_test_server() -> TestServer {
     });
 
     TestServer {
+        state,
         base_url: format!("http://{}", addr),
         db_file,
         shutdown_tx: Some(shutdown_tx),
@@ -107,11 +109,24 @@ impl Drop for ClientDevice {
 }
 
 impl ClientDevice {
-    fn new(base_url: &str, account_id: Uuid, vault_key: VaultKey, prefix: &str) -> Self {
+    async fn new(server: &TestServer, account_id: Uuid, vault_key: VaultKey, prefix: &str) -> Self {
         let db_path = std::env::temp_dir().join(format!("zk_rc_{prefix}_{}.db", Uuid::new_v4()));
         let storage = Arc::new(SqliteStorage::open(&db_path).expect("open client sqlite"));
-        let adapter = NativeHttpSyncAdapter::new(base_url, Some(account_id.to_string()))
-            .expect("init sync adapter");
+        let adapter = NativeHttpSyncAdapter::new(
+            &server.base_url,
+            Some(
+                server
+                    .state
+                    .db
+                    .create_session(account_id, None, None, Some(3600))
+                    .await
+                    .unwrap()
+                    .1
+                    .expose_secret()
+                    .to_string(),
+            ),
+        )
+        .expect("init sync adapter");
         let engine = SyncEngine::new(adapter, storage.clone());
         let session = VaultSession::from_key(vault_key.clone());
 
@@ -187,18 +202,10 @@ async fn test_rc_two_client_offline_conflict_demo() {
     let account_id = Uuid::new_v4();
     let shared_vault_key = VaultKey::generate();
 
-    let mut client_a = ClientDevice::new(
-        &server.base_url,
-        account_id,
-        shared_vault_key.clone(),
-        "client_a",
-    );
-    let mut client_b = ClientDevice::new(
-        &server.base_url,
-        account_id,
-        shared_vault_key.clone(),
-        "client_b",
-    );
+    let mut client_a =
+        ClientDevice::new(&server, account_id, shared_vault_key.clone(), "client_a").await;
+    let mut client_b =
+        ClientDevice::new(&server, account_id, shared_vault_key.clone(), "client_b").await;
 
     let note_id = Uuid::new_v4().to_string();
 

@@ -1,387 +1,203 @@
-//! Integration tests for WebAuthn / Passkey web authentication (ZK-071).
-//!
-//! Enforces:
-//! - Complete registration and login lifecycle (register, sign in, revoke session);
-//! - Rejection of expired or replayed challenges;
-//! - Strict separation of server authentication from vault encryption (no passphrase reuse - SEC-001, SEC-002);
-//! - Session revocation invalidates tokens immediately.
-
-#![allow(clippy::expect_used, clippy::unwrap_used)]
-
-use axum::body::Body;
-use axum::http::{Request, StatusCode};
+//! Signed WebAuthn fixtures exercise real verification and account enrollment boundaries.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+use axum::{
+    body::{to_bytes, Body},
+    http::{Request, StatusCode},
+};
 use base64ct::{Base64UrlUnpadded, Encoding};
-use serde_json::json;
+use ciborium::Value as Cbor;
+use p256::ecdsa::{signature::Signer, Signature, SigningKey};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tower::ServiceExt;
 use uuid::Uuid;
-use zk_protocol::constants::{
-    ERROR_AUTH_REVOKED, ERROR_CRYPTO_AUTH_FAILED, ERROR_WEBAUTHN_CHALLENGE_NOT_FOUND,
-    ERROR_WEBAUTHN_CREDENTIAL_NOT_FOUND,
-};
-use zk_protocol::webauthn::{
-    RevokeSessionResponse, WebAuthnLoginFinishResponse, WebAuthnLoginStartResponse,
-    WebAuthnRegisterFinishResponse, WebAuthnRegisterStartResponse,
-};
-use zk_server::{create_app, AppState, ErrorResponse, ServerConfig};
+use zk_server::{create_app, AppState, ServerConfig};
+mod common;
 
-fn setup_test_app() -> axum::Router {
-    let config = ServerConfig::default();
-    let state = AppState::new_in_memory(config).expect("create test app state");
-    create_app(state)
+fn b64(bytes: &[u8]) -> String {
+    Base64UrlUnpadded::encode_string(bytes)
 }
-
-#[tokio::test]
-async fn test_webauthn_registration_and_login_full_lifecycle() {
-    let app = setup_test_app();
-
-    // 1. Start WebAuthn registration
-    let start_req = Request::builder()
-        .method("POST")
-        .uri("/v1/auth/webauthn/register/start")
-        .header("content-type", "application/json")
-        .body(Body::from(json!({ "username": "alice" }).to_string()))
-        .unwrap();
-
-    let resp = app.clone().oneshot(start_req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let reg_start: WebAuthnRegisterStartResponse = serde_json::from_slice(&body_bytes).unwrap();
-    assert!(!reg_start.challenge_b64.is_empty());
-
-    // 2. Finish WebAuthn registration
-    let cred_id = Base64UrlUnpadded::encode_string(b"credential-alice-macbook-touchid");
-    let pub_key = Base64UrlUnpadded::encode_string(b"cose-public-key-bytes-p256-mock");
-
-    let finish_req = Request::builder()
-        .method("POST")
-        .uri("/v1/auth/webauthn/register/finish")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            json!({
-                "challenge_id": reg_start.challenge_id,
-                "credential_id": cred_id,
-                "public_key": pub_key,
-                "display_name": "Alice MacBook TouchID",
-            })
-            .to_string(),
-        ))
-        .unwrap();
-
-    let resp = app.clone().oneshot(finish_req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let reg_finish: WebAuthnRegisterFinishResponse = serde_json::from_slice(&body_bytes).unwrap();
-    let account_id = reg_finish.session.account_id;
-    let initial_token = reg_finish.session.token.expose_secret().to_string();
-    assert!(!initial_token.is_empty());
-
-    // 3. Verify initial token grants access to protected routes
-    let sync_req = Request::builder()
-        .method("GET")
-        .uri("/v1/sync/changes")
-        .header("authorization", format!("Bearer {initial_token}"))
-        .body(Body::empty())
-        .unwrap();
-
-    let resp = app.clone().oneshot(sync_req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    // 4. Start WebAuthn login (sign-in)
-    let login_start_req = Request::builder()
-        .method("POST")
-        .uri("/v1/auth/webauthn/login/start")
-        .header("content-type", "application/json")
-        .body(Body::from(json!({ "account_id": account_id }).to_string()))
-        .unwrap();
-
-    let resp = app.clone().oneshot(login_start_req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let login_start: WebAuthnLoginStartResponse = serde_json::from_slice(&body_bytes).unwrap();
-
-    // 5. Finish WebAuthn login
-    let signature = Base64UrlUnpadded::encode_string(b"assertion-signature-mock-bytes");
-    let login_finish_req = Request::builder()
-        .method("POST")
-        .uri("/v1/auth/webauthn/login/finish")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            json!({
-                "challenge_id": login_start.challenge_id,
-                "credential_id": cred_id,
-                "signature": signature,
-            })
-            .to_string(),
-        ))
-        .unwrap();
-
-    let resp = app.clone().oneshot(login_finish_req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let login_finish: WebAuthnLoginFinishResponse = serde_json::from_slice(&body_bytes).unwrap();
-    assert_eq!(login_finish.session.account_id, account_id);
-    let login_token = login_finish.session.token.expose_secret().to_string();
-    assert!(!login_token.is_empty());
-
-    // 6. Verify sign-in token grants access to protected routes
-    let sync_req2 = Request::builder()
-        .method("GET")
-        .uri("/v1/sync/changes")
-        .header("authorization", format!("Bearer {login_token}"))
-        .body(Body::empty())
-        .unwrap();
-
-    let resp = app.clone().oneshot(sync_req2).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+fn cbor(value: Cbor) -> Vec<u8> {
+    let mut out = Vec::new();
+    ciborium::ser::into_writer(&value, &mut out).unwrap();
+    out
 }
-
-#[tokio::test]
-async fn test_webauthn_session_revocation() {
-    let app = setup_test_app();
-
-    // 1. Register a passkey to obtain an active session
-    let start_req = Request::builder()
-        .method("POST")
-        .uri("/v1/auth/webauthn/register/start")
-        .header("content-type", "application/json")
-        .body(Body::from(json!({}).to_string()))
-        .unwrap();
-    let resp = app.clone().oneshot(start_req).await.unwrap();
-    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let reg_start: WebAuthnRegisterStartResponse = serde_json::from_slice(&body_bytes).unwrap();
-
-    let cred_id = Base64UrlUnpadded::encode_string(b"cred-revoke-test");
-    let pub_key = Base64UrlUnpadded::encode_string(b"pubkey-revoke-test");
-
-    let finish_req = Request::builder()
-        .method("POST")
-        .uri("/v1/auth/webauthn/register/finish")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            json!({
-                "challenge_id": reg_start.challenge_id,
-                "credential_id": cred_id,
-                "public_key": pub_key,
-            })
-            .to_string(),
-        ))
-        .unwrap();
-
-    let resp = app.clone().oneshot(finish_req).await.unwrap();
-    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let reg_finish: WebAuthnRegisterFinishResponse = serde_json::from_slice(&body_bytes).unwrap();
-    let token = reg_finish.session.token.expose_secret().to_string();
-
-    // 2. Verify active session works
-    let req = Request::builder()
-        .method("GET")
-        .uri("/v1/sync/changes")
-        .header("authorization", format!("Bearer {token}"))
-        .body(Body::empty())
-        .unwrap();
-    let resp = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    // 3. Explicitly revoke the session via POST /v1/auth/session/revoke
-    let revoke_req = Request::builder()
-        .method("POST")
-        .uri("/v1/auth/session/revoke")
-        .header("authorization", format!("Bearer {token}"))
-        .header("content-type", "application/json")
-        .body(Body::from(json!({}).to_string()))
-        .unwrap();
-
-    let resp = app.clone().oneshot(revoke_req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let revoke_resp: RevokeSessionResponse = serde_json::from_slice(&body_bytes).unwrap();
-    assert_eq!(revoke_resp.status, "revoked");
-
-    // 4. Verify subsequent requests with revoked token are rejected with 401 (AUTH_REVOKED)
-    let req2 = Request::builder()
-        .method("GET")
-        .uri("/v1/sync/changes")
-        .header("authorization", format!("Bearer {token}"))
-        .body(Body::empty())
-        .unwrap();
-    let resp2 = app.clone().oneshot(req2).await.unwrap();
-    assert_eq!(resp2.status(), StatusCode::UNAUTHORIZED);
-
-    let body_bytes = axum::body::to_bytes(resp2.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let err_resp: ErrorResponse = serde_json::from_slice(&body_bytes).unwrap();
-    assert_eq!(err_resp.code, ERROR_AUTH_REVOKED);
+fn n(n: i64) -> Cbor {
+    Cbor::Integer(n.into())
 }
-
-#[tokio::test]
-async fn test_webauthn_rejects_vault_passphrase_or_keys_sec_001_sec_002() {
-    let app = setup_test_app();
-
-    // 1. Rejects registration payload with passphrase
-    let bad_finish_req = Request::builder()
-        .method("POST")
-        .uri("/v1/auth/webauthn/register/finish")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            json!({
-                "challenge_id": Uuid::new_v4(),
-                "credential_id": "YWJj",
-                "public_key": "ZGVm",
-                "passphrase": "ForbiddenVaultPassphrase123!",
-            })
-            .to_string(),
-        ))
-        .unwrap();
-
-    let resp = app.clone().oneshot(bad_finish_req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-
-    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+async fn post(
+    app: &axum::Router,
+    path: &str,
+    body: Value,
+    auth: Option<&str>,
+) -> (StatusCode, Value) {
+    let mut req = Request::post(path).header("content-type", "application/json");
+    if let Some(auth) = auth {
+        req = req.header("authorization", auth);
+    }
+    let response = app
+        .clone()
+        .oneshot(req.body(Body::from(body.to_string())).unwrap())
         .await
         .unwrap();
-    let err: ErrorResponse = serde_json::from_slice(&body_bytes).unwrap();
-    assert_eq!(err.code, ERROR_CRYPTO_AUTH_FAILED);
-
-    // 2. Rejects login payload with vault_key
-    let bad_login_req = Request::builder()
-        .method("POST")
-        .uri("/v1/auth/webauthn/login/finish")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            json!({
-                "challenge_id": Uuid::new_v4(),
-                "credential_id": "YWJj",
-                "signature": "ZGVm",
-                "vault_key": "ForbiddenVaultKeySecret",
-            })
-            .to_string(),
-        ))
-        .unwrap();
-
-    let resp2 = app.clone().oneshot(bad_login_req).await.unwrap();
-    assert_eq!(resp2.status(), StatusCode::BAD_REQUEST);
-    let body_bytes = axum::body::to_bytes(resp2.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let err2: ErrorResponse = serde_json::from_slice(&body_bytes).unwrap();
-    assert_eq!(err2.code, ERROR_CRYPTO_AUTH_FAILED);
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), 100000).await.unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap())
 }
-
-#[tokio::test]
-async fn test_webauthn_replayed_challenge_fails_closed() {
-    let app = setup_test_app();
-
-    // Start registration
-    let start_req = Request::builder()
-        .method("POST")
-        .uri("/v1/auth/webauthn/register/start")
-        .header("content-type", "application/json")
-        .body(Body::from(json!({}).to_string()))
-        .unwrap();
-    let resp = app.clone().oneshot(start_req).await.unwrap();
-    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let reg_start: WebAuthnRegisterStartResponse = serde_json::from_slice(&body_bytes).unwrap();
-
-    let cred_id = Base64UrlUnpadded::encode_string(b"cred-replay-test");
-    let pub_key = Base64UrlUnpadded::encode_string(b"pubkey-replay-test");
-
-    let finish_payload = json!({
-        "challenge_id": reg_start.challenge_id,
-        "credential_id": cred_id,
-        "public_key": pub_key,
-    })
-    .to_string();
-
-    // First finish succeeds
-    let finish_req1 = Request::builder()
-        .method("POST")
-        .uri("/v1/auth/webauthn/register/finish")
-        .header("content-type", "application/json")
-        .body(Body::from(finish_payload.clone()))
-        .unwrap();
-    let resp1 = app.clone().oneshot(finish_req1).await.unwrap();
-    assert_eq!(resp1.status(), StatusCode::OK);
-
-    // Replay finish with exact same challenge fails closed (single-use challenge consumed)
-    let finish_req2 = Request::builder()
-        .method("POST")
-        .uri("/v1/auth/webauthn/register/finish")
-        .header("content-type", "application/json")
-        .body(Body::from(finish_payload))
-        .unwrap();
-    let resp2 = app.clone().oneshot(finish_req2).await.unwrap();
-    assert_eq!(resp2.status(), StatusCode::BAD_REQUEST);
-
-    let body_bytes = axum::body::to_bytes(resp2.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let err: ErrorResponse = serde_json::from_slice(&body_bytes).unwrap();
-    assert_eq!(err.code, ERROR_WEBAUTHN_CHALLENGE_NOT_FOUND);
+fn registration(start: &Value, key: &SigningKey, credential: &[u8]) -> Value {
+    let point = key.verifying_key().to_encoded_point(false);
+    let mut data = Sha256::digest(b"localhost").to_vec();
+    data.push(0x45);
+    data.extend([0; 4]);
+    data.extend([0; 16]);
+    data.extend((credential.len() as u16).to_be_bytes());
+    data.extend(credential);
+    data.extend(cbor(Cbor::Map(vec![
+        (n(1), n(2)),
+        (n(3), n(-7)),
+        (n(-1), n(1)),
+        (n(-2), Cbor::Bytes(point.x().unwrap().to_vec())),
+        (n(-3), Cbor::Bytes(point.y().unwrap().to_vec())),
+    ])));
+    let att = cbor(Cbor::Map(vec![
+        (Cbor::Text("fmt".into()), Cbor::Text("none".into())),
+        (Cbor::Text("attStmt".into()), Cbor::Map(vec![])),
+        (Cbor::Text("authData".into()), Cbor::Bytes(data)),
+    ]));
+    json!({"challenge_id":start["challenge_id"],"credential_id":b64(credential),"public_key":"ignored", "attestation_object":b64(&att),"client_data_json":b64(json!({"type":"webauthn.create","challenge":start["challenge_b64"],"origin":"http://localhost:5173","crossOrigin":false}).to_string().as_bytes())})
 }
-
+fn assertion(
+    start: &Value,
+    key: &SigningKey,
+    credential: &[u8],
+    count: u32,
+    origin: &str,
+) -> Value {
+    let client=json!({"type":"webauthn.get","challenge":start["challenge_b64"],"origin":origin,"crossOrigin":false}).to_string();
+    let mut data = Sha256::digest(b"localhost").to_vec();
+    data.push(5);
+    data.extend(count.to_be_bytes());
+    let mut signed = data.clone();
+    signed.extend(Sha256::digest(client.as_bytes()));
+    let sig: Signature = key.sign(&signed);
+    json!({"challenge_id":start["challenge_id"],"credential_id":b64(credential),"signature":b64(sig.to_der().as_bytes()),"authenticator_data":b64(&data),"client_data_json":b64(client.as_bytes())})
+}
 #[tokio::test]
-async fn test_webauthn_unknown_credential_rejected() {
-    let app = setup_test_app();
-
-    // Start login
-    let login_start_req = Request::builder()
-        .method("POST")
-        .uri("/v1/auth/webauthn/login/start")
-        .header("content-type", "application/json")
-        .body(Body::from(json!({}).to_string()))
-        .unwrap();
-    let resp = app.clone().oneshot(login_start_req).await.unwrap();
-    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+async fn signed_registration_login_replay_and_revocation() {
+    let state = AppState::new_in_memory(ServerConfig::default()).unwrap();
+    let app = create_app(state.clone());
+    let key = SigningKey::from_bytes((&[7u8; 32]).into()).unwrap();
+    let credential = b"test-credential";
+    let (status, start) = post(&app, "/v1/auth/webauthn/register/start", json!({}), None).await;
+    assert_eq!(status, 200);
+    let request = registration(&start, &key, credential);
+    let (status, registered) = post(
+        &app,
+        "/v1/auth/webauthn/register/finish",
+        request.clone(),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(registered["session"]["account_id"], start["user"]["id"]);
+    assert_eq!(
+        post(&app, "/v1/auth/webauthn/register/finish", request, None)
+            .await
+            .0,
+        400
+    );
+    for (count, origin, expected) in [
+        (1, "http://localhost:5173", 200),
+        (1, "http://localhost:5173", 400),
+        (2, "https://evil.example", 400),
+    ] {
+        let (_, start) = post(&app, "/v1/auth/webauthn/login/start", json!({}), None).await;
+        let request = assertion(&start, &key, credential, count, origin);
+        let (status, result) = post(
+            &app,
+            "/v1/auth/webauthn/login/finish",
+            request.clone(),
+            None,
+        )
+        .await;
+        assert_eq!(status, expected, "{result}");
+        assert_eq!(
+            post(&app, "/v1/auth/webauthn/login/finish", request, None)
+                .await
+                .0,
+            400
+        );
+    }
+    let (_, start) = post(&app, "/v1/auth/webauthn/login/start", json!({}), None).await;
+    let bad_key = SigningKey::from_bytes((&[8u8; 32]).into()).unwrap();
+    assert_eq!(
+        post(
+            &app,
+            "/v1/auth/webauthn/login/finish",
+            assertion(&start, &bad_key, credential, 3, "http://localhost:5173"),
+            None
+        )
         .await
-        .unwrap();
-    let login_start: WebAuthnLoginStartResponse = serde_json::from_slice(&body_bytes).unwrap();
-
-    // Attempt finish with unknown credential ID
-    let unknown_cred_id = Base64UrlUnpadded::encode_string(b"non-existent-credential-id");
-    let sig = Base64UrlUnpadded::encode_string(b"mock-sig");
-
-    let login_finish_req = Request::builder()
-        .method("POST")
-        .uri("/v1/auth/webauthn/login/finish")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            json!({
-                "challenge_id": login_start.challenge_id,
-                "credential_id": unknown_cred_id,
-                "signature": sig,
-            })
-            .to_string(),
-        ))
-        .unwrap();
-
-    let resp = app.clone().oneshot(login_finish_req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-
-    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let err: ErrorResponse = serde_json::from_slice(&body_bytes).unwrap();
-    assert_eq!(err.code, ERROR_WEBAUTHN_CREDENTIAL_NOT_FOUND);
+        .0,
+        400
+    );
+    let auth = format!(
+        "Bearer {}",
+        registered["session"]["token"].as_str().unwrap()
+    );
+    assert_eq!(
+        post(&app, "/v1/auth/session/revoke", json!({}), Some(&auth))
+            .await
+            .0,
+        200
+    );
+    assert_eq!(
+        post(&app, "/v1/auth/session/revoke", json!({}), Some(&auth))
+            .await
+            .0,
+        401
+    );
+}
+#[tokio::test]
+async fn enrollment_requires_account_ownership_and_proofs() {
+    let state = AppState::new_in_memory(ServerConfig::default()).unwrap();
+    let app = create_app(state.clone());
+    let account = Uuid::new_v4();
+    let auth = common::bearer(&state, account).await;
+    let other = common::bearer(&state, Uuid::new_v4()).await;
+    for path in [
+        "/v1/auth/webauthn/register/start",
+        "/v1/auth/device/authorize",
+        "/v1/auth/cli/login",
+    ] {
+        let body = json!({"account_id":account,"device_id":Uuid::new_v4()});
+        assert_eq!(post(&app, path, body.clone(), None).await.0, 401);
+        assert_eq!(
+            post(&app, path, body.clone(), Some(&format!("Bearer {account}")))
+                .await
+                .0,
+            401
+        );
+        assert_eq!(post(&app, path, body.clone(), Some(&other)).await.0, 403);
+        assert_eq!(post(&app, path, body, Some(&auth)).await.0, 200);
+    }
+    let (_, start) = post(&app, "/v1/auth/webauthn/register/start", json!({}), None).await;
+    let bad = json!({"challenge_id":start["challenge_id"],"credential_id":b64(b"cred"),"public_key":b64(b"not-a-key")});
+    assert_eq!(
+        post(&app, "/v1/auth/webauthn/register/finish", bad, None)
+            .await
+            .0,
+        400
+    );
+    for path in [
+        "/v1/auth/webauthn/register/finish",
+        "/v1/auth/webauthn/login/finish",
+    ] {
+        assert_eq!(
+            post(&app, path, json!({"passphrase":"never-echo-this"}), None)
+                .await
+                .0,
+            400
+        );
+    }
 }

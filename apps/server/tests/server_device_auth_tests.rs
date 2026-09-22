@@ -28,7 +28,7 @@ fn setup_test_app() -> (axum::Router, AppState) {
 
 #[tokio::test]
 async fn test_device_authorize_flow_success() {
-    let (app, _state) = setup_test_app();
+    let (app, state) = setup_test_app();
     let account_id = Uuid::new_v4();
     let device_id = Uuid::new_v4();
 
@@ -36,6 +36,7 @@ async fn test_device_authorize_flow_success() {
     let auth_req = Request::builder()
         .method("POST")
         .uri("/v1/auth/device/authorize")
+        .header("authorization", common::bearer(&state, account_id).await)
         .header("content-type", "application/json")
         .body(Body::from(
             json!({
@@ -101,7 +102,7 @@ async fn test_device_authorize_flow_success() {
 
 #[tokio::test]
 async fn test_cli_login_alias_route() {
-    let (app, _state) = setup_test_app();
+    let (app, state) = setup_test_app();
     let account_id = Uuid::new_v4();
     let device_id = Uuid::new_v4();
 
@@ -109,6 +110,7 @@ async fn test_cli_login_alias_route() {
     let auth_req = Request::builder()
         .method("POST")
         .uri("/v1/auth/cli/login")
+        .header("authorization", common::bearer(&state, account_id).await)
         .header("content-type", "application/json")
         .body(Body::from(
             json!({
@@ -133,7 +135,7 @@ async fn test_cli_login_alias_route() {
 
 #[tokio::test]
 async fn test_device_authorize_forbids_passphrase_or_vault_key() {
-    let (app, _state) = setup_test_app();
+    let (app, state) = setup_test_app();
     let account_id = Uuid::new_v4();
     let device_id = Uuid::new_v4();
 
@@ -141,6 +143,7 @@ async fn test_device_authorize_forbids_passphrase_or_vault_key() {
     let forbidden_req1 = Request::builder()
         .method("POST")
         .uri("/v1/auth/device/authorize")
+        .header("authorization", common::bearer(&state, account_id).await)
         .header("content-type", "application/json")
         .body(Body::from(
             json!({
@@ -164,6 +167,7 @@ async fn test_device_authorize_forbids_passphrase_or_vault_key() {
     let forbidden_req2 = Request::builder()
         .method("POST")
         .uri("/v1/auth/device/authorize")
+        .header("authorization", common::bearer(&state, account_id).await)
         .header("content-type", "application/json")
         .body(Body::from(
             json!({
@@ -202,6 +206,7 @@ async fn test_device_authorize_revoked_device_rejected() {
     let req = Request::builder()
         .method("POST")
         .uri("/v1/auth/device/authorize")
+        .header("authorization", common::bearer(&state, account_id).await)
         .header("content-type", "application/json")
         .body(Body::from(
             json!({
@@ -225,7 +230,7 @@ async fn test_device_authorize_revoked_device_rejected() {
 
 #[tokio::test]
 async fn test_cli_logout_revokes_session() {
-    let (app, _state) = setup_test_app();
+    let (app, state) = setup_test_app();
     let account_id = Uuid::new_v4();
     let device_id = Uuid::new_v4();
 
@@ -233,6 +238,7 @@ async fn test_cli_logout_revokes_session() {
     let auth_req = Request::builder()
         .method("POST")
         .uri("/v1/auth/device/authorize")
+        .header("authorization", common::bearer(&state, account_id).await)
         .header("content-type", "application/json")
         .body(Body::from(
             json!({
@@ -301,6 +307,7 @@ async fn test_device_list_and_revocation_endpoints() {
     let auth1_req = Request::builder()
         .method("POST")
         .uri("/v1/auth/device/authorize")
+        .header("authorization", common::bearer(&state, account_id).await)
         .header("content-type", "application/json")
         .body(Body::from(
             json!({
@@ -325,6 +332,7 @@ async fn test_device_list_and_revocation_endpoints() {
     let auth2_req = Request::builder()
         .method("POST")
         .uri("/v1/auth/device/authorize")
+        .header("authorization", common::bearer(&state, account_id).await)
         .header("content-type", "application/json")
         .body(Body::from(
             json!({
@@ -444,6 +452,7 @@ async fn test_device_list_and_revocation_endpoints() {
     let auth_b_req = Request::builder()
         .method("POST")
         .uri("/v1/auth/device/authorize")
+        .header("authorization", common::bearer(&state, account_b).await)
         .header("content-type", "application/json")
         .body(Body::from(
             json!({
@@ -484,3 +493,5 @@ async fn test_device_list_and_revocation_endpoints() {
     // 9. Encrypted data model unchanged: raw database check
     let _ = state.db.list_devices(account_id).await.unwrap();
 }
+
+mod common;

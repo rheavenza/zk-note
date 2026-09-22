@@ -118,6 +118,7 @@ apps/cli                   crates/zk-wasm             apps/server
 | Subsystem | Location | Description | Manual |
 | :--- | :--- | :--- | :--- |
 | **`zk-server`** | [`apps/server/`](apps/server/) | High-performance sync server and ciphertext store. Manages revision sequencing, CAS validation, opaque blob chunks, and device authentication. | [Server Manual](apps/server/README.md) |
+| **`zk-cloudflare-worker`** | [`apps/cloudflare-worker/`](apps/cloudflare-worker/) | Optional Rust Worker backend using D1 metadata and private R2 ciphertext blobs while preserving the `/v1/*` contract. | [Cloudflare Deployment](docs/deployment-cloudflare.md) |
 | **`zk-note`** | [`apps/cli/`](apps/cli/) | Terminal interface with `$EDITOR` integration, RAM-backed tmpfs zeroization, in-memory search, and conflict resolution. | [CLI Manual](apps/cli/README.md) |
 | **`@zk-notes/web`** | [`apps/web/`](apps/web/) | React 18 browser client with Web Worker crypto isolation, IndexedDB offline persistence, live Markdown editor, and visual conflict resolver. | [Web Manual](apps/web/README.md) |
 | **`zk-crypto`** | [`crates/zk-crypto/`](crates/zk-crypto/) | Cryptographic primitives: Argon2id KDF, XChaCha20-Poly1305 AEAD, BLAKE2b hashing, and 288-bit typo-detecting recovery keys. | [Crypto ADR](docs/adr/0003-cryptographic-architecture.md) |
@@ -232,6 +233,10 @@ For full web setup and configuration, see [`apps/web/README.md`](apps/web/README
 ---
 
 ## 7. Production Deployment Manual
+
+Cloudflare Workers Free is an optional deployment target alongside the native
+VPS/systemd server. It uses local simulated D1/R2 for development and keeps the
+same protocol contract. See [Cloudflare deployment](docs/deployment-cloudflare.md).
 
 ### 7.1 Deploying `zk-server` (Backend)
 

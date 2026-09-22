@@ -171,11 +171,6 @@ pub async fn authenticate_bearer_token(
         Err(_) => return Err(AuthError::InvalidToken),
     }
 
-    // 2. Fallback: check if token is a valid UUID account identifier (direct account token compatibility)
-    if let Ok(account_id) = Uuid::parse_str(token) {
-        return Ok(AuthenticatedAccount::new(account_id));
-    }
-
     Err(AuthError::InvalidToken)
 }
 
@@ -255,38 +250,7 @@ where
             return Ok(*account);
         }
 
-        // Direct fallback (for unit tests calling extractor directly)
-        let auth_header = parts
-            .headers
-            .get(axum::http::header::AUTHORIZATION)
-            .ok_or(AuthError::MissingHeader)?
-            .to_str()
-            .map_err(|_| AuthError::InvalidToken)?;
-
-        let token = auth_header
-            .strip_prefix("Bearer ")
-            .or_else(|| auth_header.strip_prefix("bearer "))
-            .ok_or(AuthError::InvalidScheme)?
-            .trim();
-
-        if token.is_empty() {
-            return Err(AuthError::InvalidToken);
-        }
-
-        let account_id = Uuid::parse_str(token).map_err(|_| AuthError::InvalidToken)?;
-
-        // Enforce cross-account boundary if explicit target account header is supplied
-        if let Some(target_acc_header) = parts.headers.get("x-account-id") {
-            if let Ok(target_acc_str) = target_acc_header.to_str() {
-                if let Ok(target_acc_id) = Uuid::parse_str(target_acc_str.trim()) {
-                    if target_acc_id != account_id {
-                        return Err(AuthError::ForbiddenAccountAccess);
-                    }
-                }
-            }
-        }
-
-        Ok(AuthenticatedAccount::new(account_id))
+        Err(AuthError::MissingHeader)
     }
 }
 
@@ -298,72 +262,20 @@ mod tests {
     use axum::http::Request;
 
     #[tokio::test]
-    async fn test_auth_valid_bearer() {
-        let acc_id = Uuid::new_v4();
-        let req = Request::builder()
-            .header("Authorization", format!("Bearer {acc_id}"))
+    async fn account_id_is_not_a_credential() {
+        let db = ServerDb::new_in_memory().unwrap();
+        let account = Uuid::new_v4();
+        assert!(authenticate_bearer_token(&db, &account.to_string())
+            .await
+            .is_err());
+        let (mut parts, _) = Request::builder()
+            .header("Authorization", format!("Bearer {account}"))
             .body(())
-            .unwrap();
-
-        let (mut parts, _) = req.into_parts();
-        let auth = AuthenticatedAccount::from_request_parts(&mut parts, &())
+            .unwrap()
+            .into_parts();
+        assert!(AuthenticatedAccount::from_request_parts(&mut parts, &())
             .await
-            .unwrap();
-        assert_eq!(auth.account_id, acc_id);
-        assert_eq!(auth.device_id, None);
-        assert_eq!(auth.session_id, None);
-    }
-
-    #[tokio::test]
-    async fn test_auth_missing_header() {
-        let req = Request::builder().body(()).unwrap();
-        let (mut parts, _) = req.into_parts();
-        let err = AuthenticatedAccount::from_request_parts(&mut parts, &())
-            .await
-            .unwrap_err();
-        assert_eq!(err, AuthError::MissingHeader);
-    }
-
-    #[tokio::test]
-    async fn test_auth_invalid_scheme() {
-        let req = Request::builder()
-            .header("Authorization", "Basic dXNlcjpwYXNz")
-            .body(())
-            .unwrap();
-        let (mut parts, _) = req.into_parts();
-        let err = AuthenticatedAccount::from_request_parts(&mut parts, &())
-            .await
-            .unwrap_err();
-        assert_eq!(err, AuthError::InvalidScheme);
-    }
-
-    #[tokio::test]
-    async fn test_auth_invalid_token() {
-        let req = Request::builder()
-            .header("Authorization", "Bearer not-a-uuid")
-            .body(())
-            .unwrap();
-        let (mut parts, _) = req.into_parts();
-        let err = AuthenticatedAccount::from_request_parts(&mut parts, &())
-            .await
-            .unwrap_err();
-        assert_eq!(err, AuthError::InvalidToken);
-    }
-
-    #[tokio::test]
-    async fn test_auth_cross_account_forbidden() {
-        let acc_id = Uuid::new_v4();
-        let other_acc = Uuid::new_v4();
-        let req = Request::builder()
-            .header("Authorization", format!("Bearer {acc_id}"))
-            .header("x-account-id", other_acc.to_string())
-            .body(())
-            .unwrap();
-        let (mut parts, _) = req.into_parts();
-        let err = AuthenticatedAccount::from_request_parts(&mut parts, &())
-            .await
-            .unwrap_err();
-        assert_eq!(err, AuthError::ForbiddenAccountAccess);
+            .is_err());
     }
 
     #[tokio::test]

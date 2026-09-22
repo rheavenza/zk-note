@@ -31,6 +31,9 @@ impl FromStr for LogFormat {
 /// Server runtime configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerConfig {
+    /// Explicit WebAuthn relying party ID and browser origin; never inferred from request headers.
+    pub webauthn_rp_id: String,
+    pub webauthn_origin: String,
     /// Bind host / IP address (e.g. "127.0.0.1" or "0.0.0.0").
     pub host: String,
     /// Bind TCP port (e.g. 8080).
@@ -50,6 +53,8 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
+            webauthn_rp_id: "localhost".into(),
+            webauthn_origin: "http://localhost:5173".into(),
             host: "127.0.0.1".to_string(),
             port: 8080,
             log_level: "info".to_string(),
@@ -137,6 +142,9 @@ impl ServerConfig {
             .filter(|s| !s.is_empty());
 
         let config = Self {
+            webauthn_rp_id: lookup("ZK_WEBAUTHN_RP_ID").unwrap_or_else(|| "localhost".into()),
+            webauthn_origin: lookup("ZK_WEBAUTHN_ORIGIN")
+                .unwrap_or_else(|| "http://localhost:5173".into()),
             host,
             port,
             log_level,

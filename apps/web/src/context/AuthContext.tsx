@@ -96,7 +96,7 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({
       setIsLoading(true);
       setError(null);
       try {
-        const newSession = await registerPasskey(serverUrl, options);
+        const newSession = await registerPasskey(serverUrl, { ...options, token: session?.token });
         setSession(newSession);
         persistSession(newSession);
         return newSession;
@@ -108,7 +108,7 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({
         setIsLoading(false);
       }
     },
-    [serverUrl]
+    [serverUrl, session?.token]
   );
 
   const signIn = useCallback(

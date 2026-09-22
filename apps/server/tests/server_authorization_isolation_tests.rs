@@ -84,8 +84,8 @@ async fn test_auth_isolation_cannot_mutate_another_account_object() {
 
     let acc_a = Uuid::new_v4();
     let acc_b = Uuid::new_v4();
-    let auth_a = format!("Bearer {acc_a}");
-    let auth_b = format!("Bearer {acc_b}");
+    let auth_a = common::bearer(&state, acc_a).await;
+    let auth_b = common::bearer(&state, acc_b).await;
 
     let obj_b = Uuid::new_v4();
     let obj_b_str = obj_b.to_string();
@@ -154,8 +154,8 @@ async fn test_auth_isolation_cannot_delete_another_account_object() {
 
     let acc_a = Uuid::new_v4();
     let acc_b = Uuid::new_v4();
-    let auth_a = format!("Bearer {acc_a}");
-    let auth_b = format!("Bearer {acc_b}");
+    let auth_a = common::bearer(&state, acc_a).await;
+    let auth_b = common::bearer(&state, acc_b).await;
 
     let obj_b = Uuid::new_v4();
     let obj_b_str = obj_b.to_string();
@@ -211,8 +211,8 @@ async fn test_auth_isolation_guessed_object_id_does_not_bypass_ownership() {
 
     let acc_a = Uuid::new_v4();
     let acc_b = Uuid::new_v4();
-    let auth_a = format!("Bearer {acc_a}");
-    let auth_b = format!("Bearer {acc_b}");
+    let auth_a = common::bearer(&state, acc_a).await;
+    let auth_b = common::bearer(&state, acc_b).await;
 
     let shared_id = Uuid::new_v4();
     let shared_str = shared_id.to_string();
@@ -297,7 +297,7 @@ async fn test_auth_isolation_history_strictly_isolated() {
 
     let acc_a = Uuid::new_v4();
     let acc_b = Uuid::new_v4();
-    let auth_b = format!("Bearer {acc_b}");
+    let auth_b = common::bearer(&state, acc_b).await;
 
     let obj_id = Uuid::new_v4();
     let obj_str = obj_id.to_string();
@@ -341,7 +341,7 @@ async fn test_auth_isolation_history_strictly_isolated() {
 #[tokio::test]
 async fn test_auth_isolation_sync_pull_never_crosses_accounts() {
     let state = AppState::new_in_memory(ServerConfig::default()).unwrap();
-    let app = create_app(state);
+    let app = create_app(state.clone());
 
     let acc_a = Uuid::new_v4();
     let acc_b = Uuid::new_v4();
@@ -349,7 +349,7 @@ async fn test_auth_isolation_sync_pull_never_crosses_accounts() {
 
     // Accounts write independent objects
     for (acc, prefix, count) in [(&acc_a, "A", 3), (&acc_b, "B", 5), (&acc_c, "C", 2)] {
-        let auth = format!("Bearer {acc}");
+        let auth = common::bearer(&state, *acc).await;
         for i in 1..=count {
             let obj_id = Uuid::new_v4().to_string();
             let req =
@@ -378,7 +378,7 @@ async fn test_auth_isolation_sync_pull_never_crosses_accounts() {
             Request::builder()
                 .uri("/v1/sync/changes")
                 .method("GET")
-                .header("authorization", format!("Bearer {acc_a}"))
+                .header("authorization", common::bearer(&state, acc_a).await)
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -402,7 +402,7 @@ async fn test_auth_isolation_sync_pull_never_crosses_accounts() {
             Request::builder()
                 .uri("/v1/sync/changes")
                 .method("GET")
-                .header("authorization", format!("Bearer {acc_b}"))
+                .header("authorization", common::bearer(&state, acc_b).await)
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -423,7 +423,7 @@ async fn test_auth_isolation_sync_pull_never_crosses_accounts() {
             Request::builder()
                 .uri("/v1/sync/changes")
                 .method("GET")
-                .header("authorization", format!("Bearer {acc_c}"))
+                .header("authorization", common::bearer(&state, acc_c).await)
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -441,12 +441,12 @@ async fn test_auth_isolation_sync_pull_never_crosses_accounts() {
 #[tokio::test]
 async fn test_auth_isolation_vault_bootstrap_cross_account_forbidden() {
     let state = AppState::new_in_memory(ServerConfig::default()).unwrap();
-    let app = create_app(state);
+    let app = create_app(state.clone());
 
     let acc_a = Uuid::new_v4();
     let acc_b = Uuid::new_v4();
-    let auth_a = format!("Bearer {acc_a}");
-    let auth_b = format!("Bearer {acc_b}");
+    let auth_a = common::bearer(&state, acc_a).await;
+    let auth_b = common::bearer(&state, acc_b).await;
 
     // 1. Account B creates bootstrap
     let bootstrap = sample_bootstrap();
@@ -484,7 +484,7 @@ async fn test_auth_isolation_vault_bootstrap_cross_account_forbidden() {
 #[tokio::test]
 async fn test_auth_isolation_unauthenticated_requests_fail_closed() {
     let state = AppState::new_in_memory(ServerConfig::default()).unwrap();
-    let app = create_app(state);
+    let app = create_app(state.clone());
 
     // 1. Push without auth -> 401
     let req1 = helper_push_request(&Uuid::new_v4().to_string(), 0, b"unauthenticated", false);
@@ -550,3 +550,5 @@ async fn test_auth_isolation_unauthenticated_requests_fail_closed() {
         .unwrap();
     assert_eq!(resp4.status(), StatusCode::UNAUTHORIZED);
 }
+
+mod common;

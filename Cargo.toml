@@ -9,6 +9,8 @@ members = [
     "crates/zk-wasm",
     "apps/cli",
     "apps/server",
+    "crates/zk-server-auth",
+    "apps/cloudflare-worker",
 ]
 
 [workspace.package]

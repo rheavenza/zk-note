@@ -171,6 +171,7 @@ fn clean_server_url(server: &str) -> String {
 /// Authenticates a device directly with the server via `POST /v1/auth/device/authorize`.
 pub async fn api_device_authorize(
     server_url: &str,
+    authorizing_token: &str,
     account_id: Uuid,
     device_id: Uuid,
     device_name: Option<String>,
@@ -187,6 +188,7 @@ pub async fn api_device_authorize(
     let client = Client::new();
     let resp = client
         .post(&endpoint)
+        .bearer_auth(authorizing_token)
         .header(CONTENT_TYPE, "application/json")
         .json(&req_payload)
         .send()

@@ -7,3 +7,9 @@ node_modules/
 *.swp
 *~
 .DS_Store
+# Cloudflare local state, builds, credentials and deployment-specific resource IDs
+**/.wrangler/
+apps/cloudflare-worker/build/
+apps/cloudflare-worker/.dev.vars*
+apps/cloudflare-worker/wrangler.staging.toml
+**/.env*

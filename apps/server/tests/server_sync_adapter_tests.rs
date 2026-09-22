@@ -20,6 +20,7 @@ use zk_sync::adapter::{validate_no_plaintext_secrets, NativeHttpSyncAdapter, Syn
 use zk_sync::error::SyncNetworkError;
 
 struct TestServer {
+    state: AppState,
     base_url: String,
     shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
 }
@@ -35,7 +36,7 @@ impl Drop for TestServer {
 async fn start_test_server() -> TestServer {
     let config = ServerConfig::default();
     let state = AppState::new_in_memory(config).expect("init test app state");
-    let app = create_app(state);
+    let app = create_app(state.clone());
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -52,6 +53,7 @@ async fn start_test_server() -> TestServer {
     });
 
     TestServer {
+        state,
         base_url: format!("http://{}", local_addr),
         shutdown_tx: Some(shutdown_tx),
     }
@@ -116,8 +118,16 @@ async fn test_adapter_auth_token_abstraction_and_unauthorized() {
         "expected Unauthorized error on malformed token, got {malformed_err:?}"
     );
 
-    // 3. Valid UUID token succeeds and abstracts Authorization header
-    let account_token = Uuid::new_v4().to_string();
+    // 3. Valid session token succeeds and abstracts Authorization header
+    let account_token = server
+        .state
+        .db
+        .create_session(Uuid::new_v4(), None, None, Some(3600))
+        .await
+        .unwrap()
+        .1
+        .expose_secret()
+        .to_string();
     adapter.set_auth_token(Some(account_token));
     let bootstrap_opt = adapter
         .get_vault_bootstrap()
@@ -132,7 +142,15 @@ async fn test_adapter_auth_token_abstraction_and_unauthorized() {
 #[tokio::test]
 async fn test_adapter_vault_bootstrap_round_trip() {
     let server = start_test_server().await;
-    let account_token = Uuid::new_v4().to_string();
+    let account_token = server
+        .state
+        .db
+        .create_session(Uuid::new_v4(), None, None, Some(3600))
+        .await
+        .unwrap()
+        .1
+        .expose_secret()
+        .to_string();
     let adapter =
         NativeHttpSyncAdapter::new(&server.base_url, Some(account_token)).expect("init adapter");
 
@@ -166,7 +184,15 @@ async fn test_adapter_vault_bootstrap_round_trip() {
 #[tokio::test]
 async fn test_adapter_cas_push_and_typed_conflicts() {
     let server = start_test_server().await;
-    let account_token = Uuid::new_v4().to_string();
+    let account_token = server
+        .state
+        .db
+        .create_session(Uuid::new_v4(), None, None, Some(3600))
+        .await
+        .unwrap()
+        .1
+        .expose_secret()
+        .to_string();
     let adapter = NativeHttpSyncAdapter::new(&server.base_url, Some(account_token)).unwrap();
 
     let obj_id = Uuid::new_v4().to_string();
@@ -232,7 +258,15 @@ async fn test_adapter_cas_push_and_typed_conflicts() {
 #[tokio::test]
 async fn test_adapter_pull_changes_pagination_and_tombstones() {
     let server = start_test_server().await;
-    let account_token = Uuid::new_v4().to_string();
+    let account_token = server
+        .state
+        .db
+        .create_session(Uuid::new_v4(), None, None, Some(3600))
+        .await
+        .unwrap()
+        .1
+        .expose_secret()
+        .to_string();
     let adapter = NativeHttpSyncAdapter::new(&server.base_url, Some(account_token)).unwrap();
 
     let obj1 = Uuid::new_v4().to_string();

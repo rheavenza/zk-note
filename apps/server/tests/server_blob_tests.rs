@@ -35,12 +35,14 @@ fn setup_test_app(
 
 async fn authorize_account(
     app: &axum::Router,
+    state: &AppState,
     account_id: Uuid,
     device_id: Uuid,
 ) -> (String, DeviceAuthResponse) {
     let auth_req = Request::builder()
         .method("POST")
         .uri("/v1/auth/device/authorize")
+        .header("authorization", common::bearer(state, account_id).await)
         .header("content-type", "application/json")
         .body(Body::from(
             json!({
@@ -65,10 +67,10 @@ async fn authorize_account(
 
 #[tokio::test]
 async fn test_blob_put_get_delete_lifecycle_round_trip() {
-    let (app, _state) = setup_test_app(None, None);
+    let (app, state) = setup_test_app(None, None);
     let account_id = Uuid::new_v4();
     let device_id = Uuid::new_v4();
-    let (token, _) = authorize_account(&app, account_id, device_id).await;
+    let (token, _) = authorize_account(&app, &state, account_id, device_id).await;
 
     let blob_id = "test-opaque-blob-001";
     let ciphertext_data = vec![0x42u8; 1024];
@@ -143,15 +145,15 @@ async fn test_blob_put_get_delete_lifecycle_round_trip() {
 
 #[tokio::test]
 async fn test_cross_account_blob_isolation() {
-    let (app, _state) = setup_test_app(None, None);
+    let (app, state) = setup_test_app(None, None);
 
     let account_a = Uuid::new_v4();
     let device_a = Uuid::new_v4();
-    let (token_a, _) = authorize_account(&app, account_a, device_a).await;
+    let (token_a, _) = authorize_account(&app, &state, account_a, device_a).await;
 
     let account_b = Uuid::new_v4();
     let device_b = Uuid::new_v4();
-    let (token_b, _) = authorize_account(&app, account_b, device_b).await;
+    let (token_b, _) = authorize_account(&app, &state, account_b, device_b).await;
 
     let shared_blob_id = "shared-blob-id-uuid";
     let data_a = b"ciphertext-belonging-to-account-a".to_vec();
@@ -226,11 +228,11 @@ async fn test_cross_account_blob_isolation() {
 
 #[tokio::test]
 async fn test_unauthenticated_and_revoked_blob_access_denied() {
-    let (app, _state) = setup_test_app(None, None);
+    let (app, state) = setup_test_app(None, None);
 
     let account_id = Uuid::new_v4();
     let device_id = Uuid::new_v4();
-    let (token, _) = authorize_account(&app, account_id, device_id).await;
+    let (token, _) = authorize_account(&app, &state, account_id, device_id).await;
 
     // 1. Missing Authorization header fails with 401
     let unauth_req = Request::builder()
@@ -274,11 +276,11 @@ async fn test_unauthenticated_and_revoked_blob_access_denied() {
 #[tokio::test]
 async fn test_single_blob_size_limit_enforced() {
     // 512 bytes limit
-    let (app, _state) = setup_test_app(Some(512), None);
+    let (app, state) = setup_test_app(Some(512), None);
 
     let account_id = Uuid::new_v4();
     let device_id = Uuid::new_v4();
-    let (token, _) = authorize_account(&app, account_id, device_id).await;
+    let (token, _) = authorize_account(&app, &state, account_id, device_id).await;
 
     // Oversize blob: 513 bytes
     let oversize_data = vec![0xaa; 513];
@@ -314,11 +316,11 @@ async fn test_single_blob_size_limit_enforced() {
 #[tokio::test]
 async fn test_account_aggregate_storage_quota_enforced() {
     // 1000 bytes max per blob, 2000 bytes total account quota
-    let (app, _state) = setup_test_app(Some(1000), Some(2000));
+    let (app, state) = setup_test_app(Some(1000), Some(2000));
 
     let account_id = Uuid::new_v4();
     let device_id = Uuid::new_v4();
-    let (token, _) = authorize_account(&app, account_id, device_id).await;
+    let (token, _) = authorize_account(&app, &state, account_id, device_id).await;
 
     // 1. Upload first blob: 900 bytes (usage: 900)
     let put_1 = Request::builder()
@@ -379,11 +381,11 @@ async fn test_account_aggregate_storage_quota_enforced() {
 
 #[tokio::test]
 async fn test_forbidden_plaintext_metadata_headers_rejected() {
-    let (app, _state) = setup_test_app(None, None);
+    let (app, state) = setup_test_app(None, None);
 
     let account_id = Uuid::new_v4();
     let device_id = Uuid::new_v4();
-    let (token, _) = authorize_account(&app, account_id, device_id).await;
+    let (token, _) = authorize_account(&app, &state, account_id, device_id).await;
 
     // Forbidden header: x-filename
     let bad_hdr_req = Request::builder()
@@ -418,11 +420,11 @@ async fn test_forbidden_plaintext_metadata_headers_rejected() {
 
 #[tokio::test]
 async fn test_invalid_blob_id_format_rejected() {
-    let (app, _state) = setup_test_app(None, None);
+    let (app, state) = setup_test_app(None, None);
 
     let account_id = Uuid::new_v4();
     let device_id = Uuid::new_v4();
-    let (token, _) = authorize_account(&app, account_id, device_id).await;
+    let (token, _) = authorize_account(&app, &state, account_id, device_id).await;
 
     // Blob ID with spaces or illegal characters
     let bad_id_req = Request::builder()
@@ -435,3 +437,5 @@ async fn test_invalid_blob_id_format_rejected() {
     let resp = app.clone().oneshot(bad_id_req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
+
+mod common;

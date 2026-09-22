@@ -57,7 +57,7 @@ async fn test_tombstone_delete_is_revisioned_and_history_preserved() {
     let app = create_app(state.clone());
 
     let account_id = Uuid::new_v4();
-    let auth_header = format!("Bearer {account_id}");
+    let auth_header = common::bearer(&state, account_id).await;
     let object_id = Uuid::new_v4();
     let obj_str = object_id.to_string();
 
@@ -138,7 +138,7 @@ async fn test_tombstone_stale_edit_and_duplicate_create_conflict() {
     let app = create_app(state.clone());
 
     let account_id = Uuid::new_v4();
-    let auth_header = format!("Bearer {account_id}");
+    let auth_header = common::bearer(&state, account_id).await;
     let object_id = Uuid::new_v4();
     let obj_str = object_id.to_string();
 
@@ -238,10 +238,10 @@ async fn test_tombstone_stale_edit_and_duplicate_create_conflict() {
 #[tokio::test]
 async fn test_tombstone_remains_sync_visible() {
     let state = AppState::new_in_memory(ServerConfig::default()).unwrap();
-    let app = create_app(state);
+    let app = create_app(state.clone());
 
     let account_id = Uuid::new_v4();
-    let auth_header = format!("Bearer {account_id}");
+    let auth_header = common::bearer(&state, account_id).await;
 
     let obj1 = Uuid::new_v4().to_string();
     let obj2 = Uuid::new_v4().to_string();
@@ -349,7 +349,7 @@ async fn test_tombstone_explicit_resurrection_lifecycle() {
     let app = create_app(state.clone());
 
     let account_id = Uuid::new_v4();
-    let auth_header = format!("Bearer {account_id}");
+    let auth_header = common::bearer(&state, account_id).await;
     let object_id = Uuid::new_v4();
     let obj_str = object_id.to_string();
 
@@ -434,3 +434,5 @@ async fn test_tombstone_explicit_resurrection_lifecycle() {
         "tombstone state preserved in history"
     );
 }
+
+mod common;

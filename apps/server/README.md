@@ -36,6 +36,8 @@ The server **NEVER** performs:
 | `ZK_SERVER_LOG_FORMAT` | `LOG_FORMAT` | `json` | Log output format: `json` (production structured) or `text` (human-readable). |
 | `ZK_SERVER_MAX_BLOB_SIZE` | `MAX_BLOB_SIZE` | `104857600` (100 MiB) | Maximum allowed size of a single encrypted attachment chunk. |
 | `ZK_SERVER_ACCOUNT_BLOB_QUOTA` | `ACCOUNT_BLOB_QUOTA` | `1073741824` (1 GiB) | Aggregate encrypted blob storage quota per account. |
+| `ZK_WEBAUTHN_RP_ID` | none | `localhost` | WebAuthn relying-party ID; set this to the API hostname in production. |
+| `ZK_WEBAUTHN_ORIGIN` | none | `http://localhost:5173` | Exact browser origin accepted in WebAuthn client data. |
 
 ---
 

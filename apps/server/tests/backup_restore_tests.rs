@@ -77,7 +77,7 @@ async fn test_full_server_backup_restore_and_client_decryption_lifecycle() {
     let restored_db_path = temp_dir.join(format!("zk-restored-{run_id}.sqlite"));
 
     let account_id = Uuid::new_v4();
-    let auth_header = format!("Bearer {account_id}");
+    let auth_header;
 
     let attachment_key = AttachmentKey::generate();
     let note_id_1 = Uuid::new_v4().to_string();
@@ -93,7 +93,8 @@ async fn test_full_server_backup_restore_and_client_decryption_lifecycle() {
             config: ServerConfig::default(),
             db: server_db,
         };
-        let app = create_app(state);
+        auth_header = common::bearer(&state, account_id).await;
+        let app = create_app(state.clone());
 
         // 1.1 Client-side Key Derivation & Vault Bootstrap
         let vault_key = VaultKey::generate();
@@ -541,3 +542,5 @@ async fn test_full_server_backup_restore_and_client_decryption_lifecycle() {
     let _ = fs::remove_file(backup_db_path);
     let _ = fs::remove_file(restored_db_path);
 }
+
+mod common;

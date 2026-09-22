@@ -140,10 +140,10 @@ async fn test_audit_server_db_logs_and_api_captures() {
         config: ServerConfig::default(),
         db: server_db.clone(),
     };
-    let app = create_app(state);
+    let app = create_app(state.clone());
 
     let account_id = Uuid::new_v4();
-    let auth_header = format!("Bearer {account_id}");
+    let auth_header = common::bearer(&state, account_id).await;
 
     // Client-side key derivation (simulated)
     let vault_key = VaultKey::generate();
@@ -475,7 +475,7 @@ async fn test_audit_crash_and_error_messages_do_not_leak_plaintext() {
     let app = create_app(state.clone());
 
     let account_id = Uuid::new_v4();
-    let auth_header = format!("Bearer {account_id}");
+    let auth_header = common::bearer(&state, account_id).await;
     let object_id = Uuid::new_v4().to_string();
 
     let vault_key = VaultKey::generate();
@@ -602,3 +602,5 @@ async fn test_audit_crash_and_error_messages_do_not_leak_plaintext() {
         .unwrap();
     assert_no_plaintext_in_binary(&missing_blob_body, "HTTP 404 Missing Blob Error Body");
 }
+
+mod common;

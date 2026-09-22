@@ -59,7 +59,7 @@ async fn test_mutation_idempotency_same_create_request_returns_original_result()
     let app = create_app(state.clone());
 
     let account_id = Uuid::new_v4();
-    let auth_header = format!("Bearer {account_id}");
+    let auth_header = common::bearer(&state, account_id).await;
     let object_id = Uuid::new_v4();
     let obj_str = object_id.to_string();
     let mutation_id = Uuid::new_v4().to_string();
@@ -132,7 +132,7 @@ async fn test_mutation_idempotency_same_update_request_returns_original_result()
     let app = create_app(state.clone());
 
     let account_id = Uuid::new_v4();
-    let auth_header = format!("Bearer {account_id}");
+    let auth_header = common::bearer(&state, account_id).await;
     let object_id = Uuid::new_v4();
     let obj_str = object_id.to_string();
 
@@ -234,7 +234,7 @@ async fn test_mutation_idempotency_replay_mismatch_object_id() {
     let app = create_app(state.clone());
 
     let account_id = Uuid::new_v4();
-    let auth_header = format!("Bearer {account_id}");
+    let auth_header = common::bearer(&state, account_id).await;
     let obj1 = Uuid::new_v4().to_string();
     let obj2 = Uuid::new_v4().to_string();
     let mutation_id = Uuid::new_v4().to_string();
@@ -283,7 +283,7 @@ async fn test_mutation_idempotency_replay_mismatch_expected_revision() {
     let app = create_app(state.clone());
 
     let account_id = Uuid::new_v4();
-    let auth_header = format!("Bearer {account_id}");
+    let auth_header = common::bearer(&state, account_id).await;
     let obj = Uuid::new_v4().to_string();
     let mutation_id = Uuid::new_v4().to_string();
 
@@ -332,7 +332,7 @@ async fn test_mutation_idempotency_replay_mismatch_payload_tampered() {
     let app = create_app(state.clone());
 
     let account_id = Uuid::new_v4();
-    let auth_header = format!("Bearer {account_id}");
+    let auth_header = common::bearer(&state, account_id).await;
     let obj = Uuid::new_v4().to_string();
     let mutation_id = Uuid::new_v4().to_string();
 
@@ -377,7 +377,7 @@ async fn test_mutation_idempotency_replay_mismatch_is_deleted_flag() {
     let app = create_app(state.clone());
 
     let account_id = Uuid::new_v4();
-    let auth_header = format!("Bearer {account_id}");
+    let auth_header = common::bearer(&state, account_id).await;
     let obj = Uuid::new_v4().to_string();
     let mutation_id = Uuid::new_v4().to_string();
 
@@ -424,7 +424,7 @@ async fn test_mutation_idempotency_concurrency_duplicate_simultaneous_retries() 
     let app = create_app(state.clone());
 
     let account_id = Uuid::new_v4();
-    let auth_header = format!("Bearer {account_id}");
+    let auth_header = common::bearer(&state, account_id).await;
     let object_id = Uuid::new_v4();
     let obj_str = object_id.to_string();
     let mutation_id = Uuid::new_v4().to_string();
@@ -500,7 +500,7 @@ async fn test_mutation_idempotency_concurrency_update_simultaneous_retries() {
     let app = create_app(state.clone());
 
     let account_id = Uuid::new_v4();
-    let auth_header = format!("Bearer {account_id}");
+    let auth_header = common::bearer(&state, account_id).await;
     let object_id = Uuid::new_v4();
     let obj_str = object_id.to_string();
 
@@ -584,3 +584,5 @@ async fn test_mutation_idempotency_concurrency_update_simultaneous_retries() {
     assert_eq!(history.len(), 1);
     assert_eq!(history[0].revision, 1);
 }
+
+mod common;

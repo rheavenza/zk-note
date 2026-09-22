@@ -61,7 +61,7 @@ async fn test_cas_push_create_revision_zero_and_update_lifecycle() {
     let app = create_app(state.clone());
 
     let account_id = Uuid::new_v4();
-    let auth_header = format!("Bearer {account_id}");
+    let auth_header = common::bearer(&state, account_id).await;
     let object_id = Uuid::new_v4();
     let obj_str = object_id.to_string();
 
@@ -182,7 +182,7 @@ async fn test_cas_push_stale_update_rejected_with_conflict() {
     let app = create_app(state.clone());
 
     let account_id = Uuid::new_v4();
-    let auth_header = format!("Bearer {account_id}");
+    let auth_header = common::bearer(&state, account_id).await;
     let object_id = Uuid::new_v4();
     let obj_str = object_id.to_string();
 
@@ -253,7 +253,7 @@ async fn test_cas_push_update_nonexistent_object_returns_not_found() {
     let app = create_app(state.clone());
 
     let account_id = Uuid::new_v4();
-    let auth_header = format!("Bearer {account_id}");
+    let auth_header = common::bearer(&state, account_id).await;
     let non_existent_id = Uuid::new_v4().to_string();
 
     let req = helper_push_request(&non_existent_id, 1, b"update non-existent");
@@ -281,7 +281,7 @@ async fn test_cas_push_strict_security_rejection_sec_001_and_sec_002() {
     let app = create_app(state.clone());
 
     let account_id = Uuid::new_v4();
-    let auth_header = format!("Bearer {account_id}");
+    let auth_header = common::bearer(&state, account_id).await;
     let obj_id = Uuid::new_v4().to_string();
 
     // 1. Passphrase in payload is strictly rejected
@@ -349,8 +349,8 @@ async fn test_cas_push_cross_account_isolation() {
 
     let account_a = Uuid::new_v4();
     let account_b = Uuid::new_v4();
-    let auth_a = format!("Bearer {account_a}");
-    let auth_b = format!("Bearer {account_b}");
+    let auth_a = common::bearer(&state, account_a).await;
+    let auth_b = common::bearer(&state, account_b).await;
 
     let object_id = Uuid::new_v4();
     let obj_str = object_id.to_string();
@@ -416,3 +416,5 @@ async fn test_cas_push_cross_account_isolation() {
     assert_eq!(obj_b.revision, 1);
     assert_eq!(obj_b.server_seq, 1);
 }
+
+mod common;

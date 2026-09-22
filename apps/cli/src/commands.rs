@@ -1950,48 +1950,36 @@ pub async fn cmd_login(
 
     let device_id = get_or_create_device_id(&data_dir, explicit_dev_id)?;
 
-    let auth_session = if let Some(token_str) = token_opt {
-        println!("Verifying authentication token with {server_url}...");
-        api_verify_token(&server_url, &token_str, device_id).await?
-    } else {
-        let acc_id_str = if let Some(a) = account_id_opt {
-            a
-        } else if io::stdin().is_terminal() {
-            print!("Enter Account ID (or press Enter to provide Bearer Token): ");
-            let _ = io::stdout().flush();
-            let mut line = String::new();
-            let _ = io::stdin().read_line(&mut line);
-            line.trim().to_string()
-        } else {
-            return Err(CliError::AuthError(
-                "Missing required argument: --account-id or --token. Run 'zk-note login --help' for details.".to_string(),
-            ));
-        };
-
-        if acc_id_str.is_empty() {
-            let tok_str = rpassword::prompt_password("Enter Bearer Token: ")
-                .map_err(|e| CliError::Io(format!("failed to read token: {e}")))?;
-            if tok_str.trim().is_empty() {
-                return Err(CliError::AuthError(
-                    "Either Account ID or Bearer Token is required".to_string(),
-                ));
-            }
-            println!("Verifying authentication token with {server_url}...");
-            api_verify_token(&server_url, tok_str.trim(), device_id).await?
-        } else {
-            let account_id = Uuid::parse_str(&acc_id_str)
-                .map_err(|e| CliError::AuthError(format!("invalid account-id UUID: {e}")))?;
-
-            let dev_name = device_name_opt.or_else(|| {
-                std::env::var("HOSTNAME")
-                    .or_else(|_| std::env::var("USER").map(|u| format!("{u}-cli")))
-                    .ok()
-            });
-
-            println!("Authorizing device with {server_url}...");
-            api_device_authorize(&server_url, account_id, device_id, dev_name).await?
+    let token = zk_protocol::auth::AuthToken::new(match token_opt {
+        Some(token) => token,
+        None if io::stdin().is_terminal() => {
+            rpassword::prompt_password("Existing session token to authorize this device: ")
+                .map_err(|e| CliError::Io(e.to_string()))?
         }
-    };
+        None => {
+            return Err(CliError::AuthError(
+                "An existing session token is required; use --token or interactive login".into(),
+            ))
+        }
+    });
+    let verified = api_verify_token(&server_url, token.expose_secret(), device_id).await?;
+    if let Some(account) = account_id_opt {
+        let account = Uuid::parse_str(&account)
+            .map_err(|_| CliError::AuthError("Invalid account ID".into()))?;
+        if account != verified.account_id {
+            return Err(CliError::AuthError(
+                "Session does not authorize the requested account".into(),
+            ));
+        }
+    }
+    let auth_session = api_device_authorize(
+        &server_url,
+        token.expose_secret(),
+        verified.account_id,
+        device_id,
+        device_name_opt,
+    )
+    .await?;
 
     let auth_path = auth_session_file(&data_dir);
     save_auth_session(&auth_path, &auth_session)?;

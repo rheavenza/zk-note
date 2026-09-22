@@ -49,6 +49,41 @@ Every task must satisfy:
 
 # M0 — Repository and architecture foundation
 
+## ZK-100 — Parallel Cloudflare deployment backend
+Status: DONE
+Priority: P0
+Dependencies: authentication compatibility decision approved by user
+
+Acceptance criteria (user-requested deployment):
+- Preserve native `apps/server`; add a protocol-only Rust workers-rs backend.
+- Preserve `/v1/*` sync, bootstrap, authentication, devices, sessions, and WebAuthn contracts and security invariants.
+- Store server metadata in independently migrated D1; store private account-scoped ciphertext blobs in R2 behind authenticated routes.
+- Prove atomic CAS, payload-bound idempotency, monotonic account sequences, history, tombstones, indexed cursor reads, and account isolation through integration/concurrency tests.
+- Reconcile D1/R2 partial failures without permanently corrupting quota accounting.
+- Provide local Wrangler configuration, pinned dependencies, migrations, smoke tests, and shared native/Worker contract fixtures.
+- Pass applicable repository gates and local D1/R2 tests before remote staging deployment.
+- If authenticated, create D1/private R2 resources, migrate, deploy to workers.dev, and smoke-test staging; do not change production DNS/client configuration.
+- Document setup, rollback, backup/export, troubleshooting, limits and Free-tier CPU/D1 costs in `docs/deployment-cloudflare.md`; link from README and retain VPS/systemd documentation.
+
+Completion notes:
+- Added `apps/cloudflare-worker`, a parallel workers-rs backend that depends only on `zk-protocol`, `zk-server-auth`, and server-safe utility crates. The native Axum/SQLite server remains available and covered by its existing tests.
+- Added append-only D1 migrations for accounts, vault bootstrap data, encrypted objects and history, mutation idempotency, account sequences, devices, sessions, WebAuthn state, and blob quota metadata. D1 constraints, triggers, and batched statements preserve CAS, replay, sequence, history, tombstone, and account-isolation semantics.
+- Added private, account-scoped R2 blob storage behind authenticated API routes. Reservation, publication, garbage, and scheduled reconciliation state prevents failed R2 operations from permanently consuming or releasing quota incorrectly.
+- Hardened both servers with verified ES256 WebAuthn ceremonies, single-use challenges, authenticated existing-account enrollment/device authorization, and rejection of UUID bearer tokens. Updated the CLI and browser adapters for the verified ceremony and recorded the decision in ADR 0006.
+- Added a shared HTTP contract suite for the native server and Worker, including authentication, account/session isolation, sync CAS and concurrent replay, cursors, tombstones, and blob lifecycle. Added Miniflare/D1/R2 fault tests for storage compensation and query plans, plus an isolated Wrangler local smoke runner.
+- Added pinned Wrangler/Miniflare tooling, local bindings and scripts, CI checks, ignore rules, and `docs/deployment-cloudflare.md`. Local D1 and R2 are simulated by default.
+- Created remote D1 database `zk-note-staging-db` (`c1c16c84-bb64-474b-8ef7-a0c2d645d6f8`) in APAC and applied migration `0001_server.sql`.
+
+Remote staging note:
+- Cloudflare rejected R2 bucket creation with API code 10042 because R2 is not enabled for the account. The Worker was therefore not deployed and no staging URL exists. After account-level R2 activation, create `zk-note-ciphertext-staging`, deploy, and run the same contract script against the workers.dev URL. No DNS or client endpoint was changed.
+
+Validation:
+- Shared native/Worker contract: 84 protocol checks plus CAS/replay concurrency passed for each backend.
+- Local Worker D1/R2 fault and reconciliation suite passed.
+- The complete `scripts/ci.sh` gate passed, including formatting, Clippy with warnings denied, locked workspace checks/tests, native/WASM compatibility, browser tests, npm audit, cargo audit, and forbidden-dependency checks. The local Wrangler smoke and Worker D1/R2 failure suite also passed.
+
+---
+
 Goal: establish a stable workspace before security-sensitive implementation.
 
 ## ZK-001 — Initialize Rust workspace

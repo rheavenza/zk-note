@@ -43,6 +43,7 @@ use zk_sync::orchestrator::{SyncCycleOptions, SyncCycleReport, SyncEngine};
 
 /// Test server instance running in background with graceful shutdown.
 struct TestServer {
+    state: AppState,
     base_url: String,
     _db_file: Option<PathBuf>,
     shutdown_tx: Option<oneshot::Sender<()>>,
@@ -62,7 +63,7 @@ impl Drop for TestServer {
 async fn start_test_server() -> TestServer {
     let config = ServerConfig::default();
     let state = AppState::new_in_memory(config).expect("init server app state");
-    let app = create_app(state);
+    let app = create_app(state.clone());
 
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -79,6 +80,7 @@ async fn start_test_server() -> TestServer {
     });
 
     TestServer {
+        state,
         base_url: format!("http://{}", addr),
         _db_file: None,
         shutdown_tx: Some(shutdown_tx),
@@ -91,7 +93,7 @@ async fn start_test_server_with_file(db_path: PathBuf) -> TestServer {
     let db = ServerDb::from_connection(conn);
     let config = ServerConfig::default();
     let state = AppState { config, db };
-    let app = create_app(state);
+    let app = create_app(state.clone());
 
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -108,6 +110,7 @@ async fn start_test_server_with_file(db_path: PathBuf) -> TestServer {
     });
 
     TestServer {
+        state,
         base_url: format!("http://{}", addr),
         _db_file: Some(db_path),
         shutdown_tx: Some(shutdown_tx),
@@ -125,11 +128,24 @@ struct ClientDevice {
 }
 
 impl ClientDevice {
-    fn new(base_url: &str, account_id: Uuid, vault_key: VaultKey, prefix: &str) -> Self {
+    async fn new(server: &TestServer, account_id: Uuid, vault_key: VaultKey, prefix: &str) -> Self {
         let db_path = std::env::temp_dir().join(format!("zk_mat_{prefix}_{}.db", Uuid::new_v4()));
         let storage = Arc::new(SqliteStorage::open(&db_path).expect("open client sqlite"));
-        let adapter = NativeHttpSyncAdapter::new(base_url, Some(account_id.to_string()))
-            .expect("init sync adapter");
+        let adapter = NativeHttpSyncAdapter::new(
+            &server.base_url,
+            Some(
+                server
+                    .state
+                    .db
+                    .create_session(account_id, None, None, Some(3600))
+                    .await
+                    .unwrap()
+                    .1
+                    .expose_secret()
+                    .to_string(),
+            ),
+        )
+        .expect("init sync adapter");
         let engine = SyncEngine::new(adapter, storage.clone());
         let session = VaultSession::from_key(vault_key.clone());
 
@@ -234,18 +250,10 @@ async fn test_matrix_body_vs_body() {
     let account_id = Uuid::new_v4();
     let shared_vault_key = VaultKey::generate();
 
-    let mut client_a = ClientDevice::new(
-        &server.base_url,
-        account_id,
-        shared_vault_key.clone(),
-        "b_a",
-    );
-    let mut client_b = ClientDevice::new(
-        &server.base_url,
-        account_id,
-        shared_vault_key.clone(),
-        "b_b",
-    );
+    let mut client_a =
+        ClientDevice::new(&server, account_id, shared_vault_key.clone(), "b_a").await;
+    let mut client_b =
+        ClientDevice::new(&server, account_id, shared_vault_key.clone(), "b_b").await;
 
     let note_id = Uuid::new_v4().to_string();
 
@@ -404,18 +412,10 @@ async fn test_matrix_title_vs_body() {
     let account_id = Uuid::new_v4();
     let shared_vault_key = VaultKey::generate();
 
-    let mut client_a = ClientDevice::new(
-        &server.base_url,
-        account_id,
-        shared_vault_key.clone(),
-        "tb_a",
-    );
-    let mut client_b = ClientDevice::new(
-        &server.base_url,
-        account_id,
-        shared_vault_key.clone(),
-        "tb_b",
-    );
+    let mut client_a =
+        ClientDevice::new(&server, account_id, shared_vault_key.clone(), "tb_a").await;
+    let mut client_b =
+        ClientDevice::new(&server, account_id, shared_vault_key.clone(), "tb_b").await;
 
     let note_id = Uuid::new_v4().to_string();
 
@@ -481,18 +481,10 @@ async fn test_matrix_tag_vs_body() {
     let account_id = Uuid::new_v4();
     let shared_vault_key = VaultKey::generate();
 
-    let mut client_a = ClientDevice::new(
-        &server.base_url,
-        account_id,
-        shared_vault_key.clone(),
-        "tag_a",
-    );
-    let mut client_b = ClientDevice::new(
-        &server.base_url,
-        account_id,
-        shared_vault_key.clone(),
-        "tag_b",
-    );
+    let mut client_a =
+        ClientDevice::new(&server, account_id, shared_vault_key.clone(), "tag_a").await;
+    let mut client_b =
+        ClientDevice::new(&server, account_id, shared_vault_key.clone(), "tag_b").await;
 
     let note_id = Uuid::new_v4().to_string();
 
@@ -556,18 +548,10 @@ async fn test_matrix_same_edit_vs_same_edit() {
     let account_id = Uuid::new_v4();
     let shared_vault_key = VaultKey::generate();
 
-    let mut client_a = ClientDevice::new(
-        &server.base_url,
-        account_id,
-        shared_vault_key.clone(),
-        "same_a",
-    );
-    let mut client_b = ClientDevice::new(
-        &server.base_url,
-        account_id,
-        shared_vault_key.clone(),
-        "same_b",
-    );
+    let mut client_a =
+        ClientDevice::new(&server, account_id, shared_vault_key.clone(), "same_a").await;
+    let mut client_b =
+        ClientDevice::new(&server, account_id, shared_vault_key.clone(), "same_b").await;
 
     let note_id = Uuid::new_v4().to_string();
 
@@ -625,18 +609,10 @@ async fn test_matrix_delete_vs_edit() {
     let account_id = Uuid::new_v4();
     let shared_vault_key = VaultKey::generate();
 
-    let mut client_a = ClientDevice::new(
-        &server.base_url,
-        account_id,
-        shared_vault_key.clone(),
-        "del_a",
-    );
-    let mut client_b = ClientDevice::new(
-        &server.base_url,
-        account_id,
-        shared_vault_key.clone(),
-        "del_b",
-    );
+    let mut client_a =
+        ClientDevice::new(&server, account_id, shared_vault_key.clone(), "del_a").await;
+    let mut client_b =
+        ClientDevice::new(&server, account_id, shared_vault_key.clone(), "del_b").await;
 
     // Scenario 5A: Accept remote deletion (KeepRemote)
     let note1_id = Uuid::new_v4().to_string();
@@ -756,8 +732,21 @@ async fn test_matrix_lost_response() {
     let account_id = Uuid::new_v4();
     let shared_vault_key = VaultKey::generate();
 
-    let adapter = NativeHttpSyncAdapter::new(&server.base_url, Some(account_id.to_string()))
-        .expect("init sync adapter");
+    let adapter = NativeHttpSyncAdapter::new(
+        &server.base_url,
+        Some(
+            server
+                .state
+                .db
+                .create_session(account_id, None, None, Some(3600))
+                .await
+                .unwrap()
+                .1
+                .expose_secret()
+                .to_string(),
+        ),
+    )
+    .expect("init sync adapter");
 
     let note_id = Uuid::new_v4().to_string();
     let note = PlaintextNote::new("Lost Response Note", "Important Content");
@@ -804,24 +793,12 @@ async fn test_matrix_repeated_conflict_retry() {
     let account_id = Uuid::new_v4();
     let shared_vault_key = VaultKey::generate();
 
-    let mut client_a = ClientDevice::new(
-        &server.base_url,
-        account_id,
-        shared_vault_key.clone(),
-        "rc_a",
-    );
-    let mut client_b = ClientDevice::new(
-        &server.base_url,
-        account_id,
-        shared_vault_key.clone(),
-        "rc_b",
-    );
-    let mut client_c = ClientDevice::new(
-        &server.base_url,
-        account_id,
-        shared_vault_key.clone(),
-        "rc_c",
-    );
+    let mut client_a =
+        ClientDevice::new(&server, account_id, shared_vault_key.clone(), "rc_a").await;
+    let mut client_b =
+        ClientDevice::new(&server, account_id, shared_vault_key.clone(), "rc_b").await;
+    let mut client_c =
+        ClientDevice::new(&server, account_id, shared_vault_key.clone(), "rc_c").await;
 
     let note_id = Uuid::new_v4().to_string();
 
@@ -897,18 +874,10 @@ async fn test_m5_gate_offline_concurrent_edits_full_lifecycle() {
     let account_id = Uuid::new_v4();
     let shared_vault_key = VaultKey::generate();
 
-    let mut client_a = ClientDevice::new(
-        &server.base_url,
-        account_id,
-        shared_vault_key.clone(),
-        "m5_a",
-    );
-    let mut client_b = ClientDevice::new(
-        &server.base_url,
-        account_id,
-        shared_vault_key.clone(),
-        "m5_b",
-    );
+    let mut client_a =
+        ClientDevice::new(&server, account_id, shared_vault_key.clone(), "m5_a").await;
+    let mut client_b =
+        ClientDevice::new(&server, account_id, shared_vault_key.clone(), "m5_b").await;
 
     let note_id = Uuid::new_v4().to_string();
 

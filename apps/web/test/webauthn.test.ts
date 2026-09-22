@@ -92,12 +92,16 @@ test("finishRegistration sends credential and receives session token", async () 
       challengeId: "550e8400-e29b-41d4-a716-446655440000",
       credentialId: "cred-id-abc",
       publicKey: "pubkey-def",
+      attestationObject: "attestation-bytes",
+      clientDataJSON: "client-data-bytes",
       displayName: "MacBook TouchID",
     });
 
     assert.equal(capturedBody.challenge_id, "550e8400-e29b-41d4-a716-446655440000");
     assert.equal(capturedBody.credential_id, "cred-id-abc");
     assert.equal(capturedBody.public_key, "pubkey-def");
+    assert.equal(capturedBody.attestation_object, "attestation-bytes");
+    assert.equal(capturedBody.client_data_json, "client-data-bytes");
     assert.equal(session.token, "zk_sess_token_mock_12345");
     assert.equal(session.accountId, "770e8400-e29b-41d4-a716-446655440002");
   } finally {
@@ -146,6 +150,8 @@ test("startLogin and finishLogin execute full authentication flow", async () => 
       challengeId: start.challenge_id,
       credentialId: "cred-id-abc",
       signature: "sig-xyz",
+      authenticatorData: "authenticator-bytes",
+      clientDataJSON: "client-data-bytes",
     });
 
     assert.equal(session.token, "zk_sess_logged_in_token");

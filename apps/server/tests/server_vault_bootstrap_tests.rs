@@ -54,7 +54,7 @@ async fn test_vault_bootstrap_get_and_post_round_trip() {
     let get_req_before = Request::builder()
         .uri("/v1/vault/bootstrap")
         .method("GET")
-        .header("Authorization", format!("Bearer {acc_id}"))
+        .header("Authorization", common::bearer(&state, acc_id).await)
         .body(Body::empty())
         .expect("build request");
 
@@ -71,7 +71,7 @@ async fn test_vault_bootstrap_get_and_post_round_trip() {
     let post_req = Request::builder()
         .uri("/v1/vault/bootstrap")
         .method("POST")
-        .header("Authorization", format!("Bearer {acc_id}"))
+        .header("Authorization", common::bearer(&state, acc_id).await)
         .header("Content-Type", "application/json")
         .body(Body::from(
             serde_json::to_vec(&original).expect("serialize"),
@@ -91,7 +91,7 @@ async fn test_vault_bootstrap_get_and_post_round_trip() {
     let get_req_after = Request::builder()
         .uri("/v1/vault/bootstrap")
         .method("GET")
-        .header("Authorization", format!("Bearer {acc_id}"))
+        .header("Authorization", common::bearer(&state, acc_id).await)
         .body(Body::empty())
         .expect("build request");
 
@@ -108,7 +108,7 @@ async fn test_vault_bootstrap_get_and_post_round_trip() {
     let dup_req = Request::builder()
         .uri("/v1/vault/bootstrap")
         .method("POST")
-        .header("Authorization", format!("Bearer {acc_id}"))
+        .header("Authorization", common::bearer(&state, acc_id).await)
         .header("Content-Type", "application/json")
         .body(Body::from(
             serde_json::to_vec(&original).expect("serialize"),
@@ -136,7 +136,7 @@ async fn test_server_stores_only_kdf_params_and_wrapped_keys_no_passphrase() {
     let post_req = Request::builder()
         .uri("/v1/vault/bootstrap")
         .method("POST")
-        .header("Authorization", format!("Bearer {acc_id}"))
+        .header("Authorization", common::bearer(&state, acc_id).await)
         .header("Content-Type", "application/json")
         .body(Body::from(
             serde_json::to_vec(&original).expect("serialize"),
@@ -169,7 +169,7 @@ async fn test_server_stores_only_kdf_params_and_wrapped_keys_no_passphrase() {
 async fn test_rejection_of_passphrase_fields_sec_001() {
     let config = ServerConfig::default();
     let state = AppState::new_in_memory(config).expect("init state");
-    let app = create_app(state);
+    let app = create_app(state.clone());
 
     let acc_id = Uuid::new_v4();
 
@@ -199,7 +199,7 @@ async fn test_rejection_of_passphrase_fields_sec_001() {
     let req = Request::builder()
         .uri("/v1/vault/bootstrap")
         .method("POST")
-        .header("Authorization", format!("Bearer {acc_id}"))
+        .header("Authorization", common::bearer(&state, acc_id).await)
         .header("Content-Type", "application/json")
         .body(Body::from(
             serde_json::to_vec(&malicious_payload).expect("serialize"),
@@ -242,7 +242,7 @@ async fn test_rejection_of_passphrase_fields_sec_001() {
     let req2 = Request::builder()
         .uri("/v1/vault/bootstrap")
         .method("POST")
-        .header("Authorization", format!("Bearer {acc_id}"))
+        .header("Authorization", common::bearer(&state, acc_id).await)
         .header("Content-Type", "application/json")
         .body(Body::from(
             serde_json::to_vec(&nested_password).expect("serialize"),
@@ -257,7 +257,7 @@ async fn test_rejection_of_passphrase_fields_sec_001() {
 async fn test_authentication_enforcement_sec_003() {
     let config = ServerConfig::default();
     let state = AppState::new_in_memory(config).expect("init state");
-    let app = create_app(state);
+    let app = create_app(state.clone());
 
     // 1. Missing Authorization header -> 401 AUTH_REQUIRED
     let req_no_auth = Request::builder()
@@ -311,7 +311,7 @@ async fn test_cross_account_access_denied() {
     let post_a = Request::builder()
         .uri("/v1/vault/bootstrap")
         .method("POST")
-        .header("Authorization", format!("Bearer {acc_a}"))
+        .header("Authorization", common::bearer(&state, acc_a).await)
         .header("Content-Type", "application/json")
         .body(Body::from(
             serde_json::to_vec(&bootstrap_a).expect("serialize"),
@@ -325,7 +325,7 @@ async fn test_cross_account_access_denied() {
     let get_b = Request::builder()
         .uri("/v1/vault/bootstrap")
         .method("GET")
-        .header("Authorization", format!("Bearer {acc_b}"))
+        .header("Authorization", common::bearer(&state, acc_b).await)
         .body(Body::empty())
         .expect("build request");
 
@@ -336,7 +336,7 @@ async fn test_cross_account_access_denied() {
     let cross_acc_req = Request::builder()
         .uri("/v1/vault/bootstrap")
         .method("GET")
-        .header("Authorization", format!("Bearer {acc_b}"))
+        .header("Authorization", common::bearer(&state, acc_b).await)
         .header("x-account-id", acc_a.to_string())
         .body(Body::empty())
         .expect("build request");
@@ -353,7 +353,7 @@ async fn test_cross_account_access_denied() {
     let cross_post = Request::builder()
         .uri("/v1/vault/bootstrap")
         .method("POST")
-        .header("Authorization", format!("Bearer {acc_b}"))
+        .header("Authorization", common::bearer(&state, acc_b).await)
         .header("x-account-id", acc_a.to_string())
         .header("Content-Type", "application/json")
         .body(Body::from(
@@ -371,7 +371,7 @@ async fn test_cross_account_access_denied() {
     let post_b = Request::builder()
         .uri("/v1/vault/bootstrap")
         .method("POST")
-        .header("Authorization", format!("Bearer {acc_b}"))
+        .header("Authorization", common::bearer(&state, acc_b).await)
         .header("Content-Type", "application/json")
         .body(Body::from(
             serde_json::to_vec(&bootstrap_b).expect("serialize"),
@@ -385,7 +385,7 @@ async fn test_cross_account_access_denied() {
     let get_a_final = Request::builder()
         .uri("/v1/vault/bootstrap")
         .method("GET")
-        .header("Authorization", format!("Bearer {acc_a}"))
+        .header("Authorization", common::bearer(&state, acc_a).await)
         .body(Body::empty())
         .expect("build request");
     let resp_a_final = app.clone().oneshot(get_a_final).await.expect("execute");
@@ -400,7 +400,7 @@ async fn test_cross_account_access_denied() {
     let get_b_final = Request::builder()
         .uri("/v1/vault/bootstrap")
         .method("GET")
-        .header("Authorization", format!("Bearer {acc_b}"))
+        .header("Authorization", common::bearer(&state, acc_b).await)
         .body(Body::empty())
         .expect("build request");
     let resp_b_final = app.oneshot(get_b_final).await.expect("execute");
@@ -417,7 +417,7 @@ async fn test_cross_account_access_denied() {
 async fn test_validation_crypto_version_and_kdf_params() {
     let config = ServerConfig::default();
     let state = AppState::new_in_memory(config).expect("init state");
-    let app = create_app(state);
+    let app = create_app(state.clone());
     let acc_id = Uuid::new_v4();
 
     // 1. Unsupported crypto version
@@ -427,7 +427,7 @@ async fn test_validation_crypto_version_and_kdf_params() {
     let req = Request::builder()
         .uri("/v1/vault/bootstrap")
         .method("POST")
-        .header("Authorization", format!("Bearer {acc_id}"))
+        .header("Authorization", common::bearer(&state, acc_id).await)
         .header("Content-Type", "application/json")
         .body(Body::from(
             serde_json::to_vec(&bad_version).expect("serialize"),
@@ -449,7 +449,7 @@ async fn test_validation_crypto_version_and_kdf_params() {
     let req2 = Request::builder()
         .uri("/v1/vault/bootstrap")
         .method("POST")
-        .header("Authorization", format!("Bearer {acc_id}"))
+        .header("Authorization", common::bearer(&state, acc_id).await)
         .header("Content-Type", "application/json")
         .body(Body::from(
             serde_json::to_vec(&bad_salt).expect("serialize"),
@@ -466,7 +466,7 @@ async fn test_validation_crypto_version_and_kdf_params() {
     let req3 = Request::builder()
         .uri("/v1/vault/bootstrap")
         .method("POST")
-        .header("Authorization", format!("Bearer {acc_id}"))
+        .header("Authorization", common::bearer(&state, acc_id).await)
         .header("Content-Type", "application/json")
         .body(Body::from(
             serde_json::to_vec(&zero_mem).expect("serialize"),
@@ -476,3 +476,5 @@ async fn test_validation_crypto_version_and_kdf_params() {
     let resp3 = app.oneshot(req3).await.expect("execute");
     assert_eq!(resp3.status(), StatusCode::BAD_REQUEST);
 }
+
+mod common;

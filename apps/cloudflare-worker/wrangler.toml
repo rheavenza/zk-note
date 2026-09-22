@@ -1,0 +1,29 @@
+name = "zk-note-staging"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-09-01"
+workers_dev = true
+
+[build]
+command = "worker-build --release"
+
+[vars]
+WEBAUTHN_RP_ID = "localhost"
+WEBAUTHN_ORIGIN = "http://localhost:5173"
+MAX_BLOB_SIZE = "1048576"
+ACCOUNT_BLOB_QUOTA = "1073741824"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "zk-note-staging-db"
+database_id = "c1c16c84-bb64-474b-8ef7-a0c2d645d6f8"
+migrations_dir = "migrations"
+
+[[r2_buckets]]
+binding = "BLOBS"
+bucket_name = "zk-note-ciphertext-staging"
+
+[triggers]
+crons = ["0 * * * *"]
+
+[observability]
+enabled = false

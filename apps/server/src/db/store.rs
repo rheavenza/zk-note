@@ -815,6 +815,8 @@ impl ServerDb {
 
         // If device_id is provided, ensure device is registered and not revoked
         if let Some(dev_id) = device_id {
+            self.register_device(account_id, dev_id, display_name.as_deref())
+                .await?;
             if self.is_device_revoked(account_id, dev_id).await? {
                 return Err(DbError::SchemaVerificationFailed(
                     "cannot create session for a revoked device".to_string(),
@@ -1170,12 +1172,12 @@ impl ServerDb {
         let conn = self.conn.lock().await;
         let id_str = challenge_id.to_string();
 
-        let query = "SELECT challenge, account_id, purpose, created_at, expires_at,
-                            (expires_at <= CURRENT_TIMESTAMP) AS is_expired
-                     FROM webauthn_challenges WHERE challenge_id = ?1";
+        let query = "DELETE FROM webauthn_challenges WHERE challenge_id = ?1 AND purpose = ?2
+                     RETURNING challenge, account_id, purpose, created_at, expires_at,
+                               (expires_at <= CURRENT_TIMESTAMP) AS is_expired";
 
         let mut stmt = conn.prepare(query)?;
-        let mut rows = stmt.query([&id_str])?;
+        let mut rows = stmt.query([id_str.as_str(), expected_purpose])?;
 
         if let Some(row) = rows.next()? {
             let challenge: Vec<u8> = row.get(0)?;
@@ -1186,23 +1188,12 @@ impl ServerDb {
             let is_expired: bool = row.get(5)?;
 
             if is_expired {
-                // Clean up expired challenge
-                conn.execute(
-                    "DELETE FROM webauthn_challenges WHERE challenge_id = ?1",
-                    [&id_str],
-                )?;
                 return Err(DbError::ChallengeExpired);
             }
 
             if purpose != expected_purpose {
                 return Err(DbError::ChallengeNotFound);
             }
-
-            // Challenge is valid; delete it so it cannot be replayed (single-use)
-            conn.execute(
-                "DELETE FROM webauthn_challenges WHERE challenge_id = ?1",
-                [&id_str],
-            )?;
 
             let account_id = match account_id_str {
                 Some(s) => {
@@ -1306,6 +1297,17 @@ impl ServerDb {
         } else {
             Ok(None)
         }
+    }
+
+    /// Atomically rejects concurrent stale signature counters; zero counters remain valid for synced passkeys.
+    pub async fn advance_webauthn_counter(
+        &self,
+        credential_id: &[u8],
+        old: u64,
+        new: u32,
+    ) -> Result<bool, DbError> {
+        let conn = self.conn.lock().await;
+        Ok(conn.execute("UPDATE webauthn_credentials SET sign_count = ?1, last_used_at = CURRENT_TIMESTAMP WHERE credential_id = ?2 AND sign_count = ?3", rusqlite::params![new, credential_id, old])? == 1)
     }
 
     /// Updates the usage timestamp and signature counter for a WebAuthn credential.
