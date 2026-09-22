@@ -11,9 +11,10 @@ use crate::client::notes::{
 };
 use crate::client::sync::{get_initial_sync_status, SyncStatus};
 use crate::client::vault::{
-    check_and_touch_session, get_active_vault_key, get_vault_status, lock_vault, unlock_vault,
-    VaultState,
+    get_active_vault_key, get_vault_status, is_session_expired, lock_vault, touch_session_activity,
+    unlock_vault, VaultState,
 };
+use crate::error::CliError;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -279,9 +280,11 @@ impl App {
     }
 
     /// Immediately zeroizes and clears all decrypted in-memory buffers and locks the vault.
-    pub fn lock_and_clear(&mut self) {
-        let _ = lock_vault(self.data_dir.as_deref());
-
+    ///
+    /// Persisted session cleanup is attempted. If persistent cleanup fails, returns the typed
+    /// error and sets a truthful error message instead of displaying a false success message.
+    /// In-memory buffers are fail-closed zeroized regardless of persistent cleanup outcome.
+    pub fn lock_and_clear(&mut self) -> Result<(), CliError> {
         self.vault_key = None;
         self.passphrase_input.zeroize();
         self.passphrase_input.clear();
@@ -309,19 +312,44 @@ impl App {
 
         self.mode = AppMode::Locked;
         self.previous_mode = None;
-        self.status_message = Some("Vault locked.".to_string());
+
+        match lock_vault(self.data_dir.as_deref()) {
+            Ok(()) => {
+                self.status_message = Some("Vault locked.".to_string());
+                self.error_message = None;
+                Ok(())
+            }
+            Err(e) => {
+                self.status_message = None;
+                self.error_message = Some(format!("Failed to invalidate session: {e}"));
+                Err(e)
+            }
+        }
     }
 
-    /// Periodic tick handler: verifies idle auto-lock policy and refreshes state.
+    /// Records genuine user activity, refreshing the idle session timer (ZK-076, AC-04).
+    pub fn record_user_activity(&mut self) {
+        if self.mode != AppMode::Locked && self.vault_key.is_some() {
+            let _ = touch_session_activity(self.data_dir.as_deref());
+        }
+    }
+
+    /// Periodic tick handler: verifies idle auto-lock policy without refreshing activity timer.
     pub fn tick(&mut self) {
         if self.mode != AppMode::Locked && self.vault_key.is_some() {
-            match check_and_touch_session(self.data_dir.as_deref()) {
-                Ok(_) => {}
-                Err(_) => {
+            match is_session_expired(self.data_dir.as_deref()) {
+                Ok(true) => {
                     // Auto-lock idle timer expired!
-                    self.lock_and_clear();
-                    self.status_message =
-                        Some("Vault locked due to inactivity auto-lock policy.".to_string());
+                    let lock_res = self.lock_and_clear();
+                    if lock_res.is_ok() {
+                        self.status_message =
+                            Some("Vault locked due to inactivity auto-lock policy.".to_string());
+                    }
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    let _ = self.lock_and_clear();
+                    self.error_message = Some(format!("Auto-lock session check failed: {e}"));
                 }
             }
         }
@@ -364,7 +392,7 @@ impl App {
                 }
             }
             Action::LockVault => {
-                self.lock_and_clear();
+                let _ = self.lock_and_clear();
             }
             Action::UnlockChar(c) => {
                 if self.mode == AppMode::Locked {
@@ -682,17 +710,28 @@ impl App {
     fn perform_incremental_search(&mut self) {
         if self.search_query.trim().is_empty() {
             self.search_results = self.notes.clone();
+        } else if let Some(key) = &self.vault_key {
+            match crate::client::notes::search_notes(
+                self.data_dir.as_deref(),
+                key,
+                &self.search_query,
+            ) {
+                Ok(results) => {
+                    let mut matched = Vec::new();
+                    for r in results {
+                        if let Some(note) = self.notes.iter().find(|n| n.id == r.id) {
+                            matched.push(note.clone());
+                        }
+                    }
+                    self.search_results = matched;
+                }
+                Err(e) => {
+                    self.error_message = Some(format!("Search failed: {e}"));
+                    self.search_results.clear();
+                }
+            }
         } else {
-            let query = self.search_query.to_lowercase();
-            self.search_results = self
-                .notes
-                .iter()
-                .filter(|n| {
-                    n.title.to_lowercase().contains(&query)
-                        || n.tags.iter().any(|t| t.to_lowercase().contains(&query))
-                })
-                .cloned()
-                .collect();
+            self.search_results.clear();
         }
         self.selected_index = if self.search_results.is_empty() {
             None
@@ -788,6 +827,10 @@ impl App {
     pub fn handle_key(&mut self, key: KeyEvent) {
         // Clear transient error messages on any keypress
         self.error_message = None;
+
+        if self.mode != AppMode::Locked && self.mode != AppMode::TerminalTooSmall {
+            self.record_user_activity();
+        }
 
         match self.mode {
             AppMode::TerminalTooSmall => {

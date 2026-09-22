@@ -147,11 +147,26 @@ pub fn get_active_vault_key(custom_data_dir: Option<&Path>) -> Result<VaultKey, 
     load_session_key(&sess_path)
 }
 
-/// Checks the auto-lock timeout and touches the session if active.
+/// Checks whether the active session has expired without refreshing its `last_active_at` timestamp.
 ///
-/// Returns the current [`VaultKey`] if valid, or `Err(CliError::VaultLocked)` if expired.
-pub fn check_and_touch_session(custom_data_dir: Option<&Path>) -> Result<VaultKey, CliError> {
+/// Returns `Ok(false)` if the session is still active and valid.
+/// Returns `Ok(true)` if the session has expired due to idle timeout.
+pub fn is_session_expired(custom_data_dir: Option<&Path>) -> Result<bool, CliError> {
     let data_dir = resolve_data_dir(custom_data_dir);
     let sess_path = session_file(&data_dir);
-    load_session_key_and_touch(&sess_path, true)
+    if !sess_path.exists() {
+        return Ok(true);
+    }
+    match load_session_key_and_touch(&sess_path, false) {
+        Ok(_) => Ok(false),
+        Err(CliError::VaultLocked) => Ok(true),
+        Err(e) => Err(e),
+    }
+}
+
+/// Refreshes the last active timestamp for genuine user interactions through the shared session path.
+pub fn touch_session_activity(custom_data_dir: Option<&Path>) -> Result<(), CliError> {
+    let data_dir = resolve_data_dir(custom_data_dir);
+    let sess_path = session_file(&data_dir);
+    crate::session::touch_session(&sess_path)
 }

@@ -9,6 +9,9 @@ use crate::client::notes::create_note;
 use crate::client::sync::SyncStatus;
 use crate::client::vault::unlock_vault;
 use crate::commands::cmd_init;
+use crate::config::session_file;
+use crate::session::{get_session_info, update_session_timeout};
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 use std::path::{Path, PathBuf};
@@ -168,6 +171,7 @@ fn test_render_conflict_screen() {
     app.conflicts = vec![ClientConflictSummary {
         conflict_id: "conf-123".to_string(),
         object_id: "note-abc".to_string(),
+        object_kind: 1,
         base_revision: 1,
         remote_revision: 2,
         resolved: false,
@@ -413,7 +417,7 @@ fn test_security_locking_and_autolock_clears_all_decrypted_buffers() {
     assert!(unlocked_output.contains(&title_canary));
 
     // Explicit lock!
-    app.lock_and_clear();
+    assert!(app.lock_and_clear().is_ok());
 
     // 1. Verify in-memory buffers are completely zeroized/cleared
     assert!(app.vault_key.is_none());
@@ -436,4 +440,232 @@ fn test_security_locking_and_autolock_clears_all_decrypted_buffers() {
     assert!(!locked_output.contains("search-secret"));
     assert!(!locked_output.contains("draft-secret"));
     assert!(!locked_output.contains("draft-body"));
+}
+
+#[test]
+fn test_idle_autolock_ticks_do_not_extend_session_and_expiry_locks_ui() {
+    let (temp_dir, mut app) = setup_test_vault();
+    let sess_path = session_file(temp_dir.path());
+
+    // Set 2-second idle timeout
+    let _ = update_session_timeout(&sess_path, Some(2)).expect("update timeout");
+
+    let info_before = get_session_info(&sess_path).expect("session info").unwrap();
+    let last_active_before = info_before.last_active_at;
+
+    // Simulate repeated 250ms ticks without user input
+    for _ in 0..10 {
+        app.update(Action::Tick);
+    }
+
+    // Prove repeated ticks did NOT extend the session (last_active_at is unchanged)
+    let info_after_ticks = get_session_info(&sess_path).expect("session info").unwrap();
+    assert_eq!(info_after_ticks.last_active_at, last_active_before);
+    assert_eq!(app.mode, AppMode::Normal);
+
+    // Now artificially age the session past the 2-second timeout
+    let bytes = std::fs::read(&sess_path).unwrap();
+    let mut envelope: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    envelope["last_active_at"] = serde_json::json!(last_active_before - 10);
+    let aged_json = serde_json::to_string(&envelope).unwrap();
+    std::fs::write(&sess_path, aged_json.as_bytes()).unwrap();
+
+    // Verify tick now detects expiry and locks the UI
+    app.update(Action::Tick);
+
+    assert_eq!(app.mode, AppMode::Locked);
+    assert!(app.vault_key.is_none());
+    assert!(app.notes.is_empty());
+    assert!(app.preview.is_none());
+    assert!(app.search_query.is_empty());
+    assert!(app.search_results.is_empty());
+    assert!(app
+        .status_message
+        .as_deref()
+        .unwrap()
+        .contains("inactivity auto-lock policy"));
+}
+
+#[test]
+fn test_idle_autolock_real_input_refreshes_session() {
+    let (temp_dir, mut app) = setup_test_vault();
+    let sess_path = session_file(temp_dir.path());
+
+    let _ = update_session_timeout(&sess_path, Some(300)).expect("update timeout");
+
+    let info_before = get_session_info(&sess_path).expect("session info").unwrap();
+
+    // Artificially set last_active_at in the past
+    let bytes = std::fs::read(&sess_path).unwrap();
+    let mut envelope: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    envelope["last_active_at"] = serde_json::json!(info_before.last_active_at - 100);
+    let past_json = serde_json::to_string(&envelope).unwrap();
+    std::fs::write(&sess_path, past_json.as_bytes()).unwrap();
+
+    let info_past = get_session_info(&sess_path).expect("session info").unwrap();
+    assert_eq!(info_past.last_active_at, info_before.last_active_at - 100);
+
+    // Real user key input
+    app.handle_key(KeyEvent::from(KeyCode::Char('j')));
+
+    // Session activity timestamp must be refreshed to now
+    let info_refreshed = get_session_info(&sess_path).expect("session info").unwrap();
+    assert!(info_refreshed.last_active_at > info_past.last_active_at);
+}
+
+#[test]
+fn test_honest_lock_failure_when_persistent_cleanup_fails() {
+    let (temp_dir, mut app) = setup_test_vault();
+    let sess_path = session_file(temp_dir.path());
+    assert!(sess_path.exists());
+
+    // Inject persistent failure: make directory read-only so .session cannot be removed
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let orig_perms = std::fs::metadata(temp_dir.path()).unwrap().permissions();
+        std::fs::set_permissions(temp_dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let lock_result = app.lock_and_clear();
+
+        // Restore permissions immediately so drop / cleanup can proceed
+        std::fs::set_permissions(temp_dir.path(), orig_perms).unwrap();
+
+        // Must return Err
+        assert!(lock_result.is_err());
+
+        // NO false success message
+        assert_ne!(app.status_message.as_deref(), Some("Vault locked."));
+        assert!(app.status_message.is_none());
+
+        // Truthful error message recorded
+        assert!(app.error_message.is_some());
+        assert!(app
+            .error_message
+            .as_deref()
+            .unwrap()
+            .contains("Failed to invalidate session"));
+
+        // Fail-closed in memory: decrypted state must still be zeroized/cleared
+        assert!(app.vault_key.is_none());
+        assert!(app.notes.is_empty());
+        assert!(app.preview.is_none());
+        assert!(app.search_query.is_empty());
+        assert_eq!(app.mode, AppMode::Locked);
+
+        // Rendering shows the truthful error message
+        let rendered = render_to_string(&app, 100, 30);
+        assert!(rendered.contains("Failed to invalidate session"));
+        assert!(!rendered.contains("Vault locked."));
+    }
+}
+
+#[test]
+fn test_fulltext_search_title_tag_body_no_match_clear_lock() {
+    let temp_dir = TestDir::new("search_fulltext");
+    cmd_init(
+        Some(temp_dir.path()),
+        Some("test-password-123".to_string()),
+        true,
+    )
+    .expect("init vault");
+
+    let key = unlock_vault(Some(temp_dir.path()), "test-password-123", None).expect("unlock vault");
+
+    create_note(
+        Some(temp_dir.path()),
+        &key,
+        "Cooking Recipes",
+        "Secret pasta sauce ingredient is basil leaves.",
+        vec!["food".to_string()],
+    )
+    .expect("create note 1");
+
+    create_note(
+        Some(temp_dir.path()),
+        &key,
+        "Rust Guidelines",
+        "Always write thorough unit tests and check error cases.",
+        vec!["programming".to_string()],
+    )
+    .expect("create note 2");
+
+    create_note(
+        Some(temp_dir.path()),
+        &key,
+        "Travel Plans",
+        "Book train tickets to Kyoto and pack warm clothes.",
+        vec!["vacation".to_string()],
+    )
+    .expect("create note 3");
+
+    let mut app = App::new(Some(temp_dir.path()), 100, 30);
+    assert_eq!(app.notes.len(), 3);
+
+    // 1. Title-only match: "Cooking"
+    app.update(Action::EnterSearch);
+    for c in "Cooking".chars() {
+        app.update(Action::SearchChar(c));
+    }
+    assert_eq!(app.displayed_notes().len(), 1);
+    assert_eq!(app.displayed_notes()[0].title, "Cooking Recipes");
+
+    // 2. Tag-only match: "programming"
+    app.update(Action::ExitSearch);
+    app.update(Action::EnterSearch);
+    for c in "programming".chars() {
+        app.update(Action::SearchChar(c));
+    }
+    assert_eq!(app.displayed_notes().len(), 1);
+    assert_eq!(app.displayed_notes()[0].title, "Rust Guidelines");
+
+    // 3. Body-only match: "Kyoto" (does NOT appear in title or tags!)
+    app.update(Action::ExitSearch);
+    app.update(Action::EnterSearch);
+    for c in "Kyoto".chars() {
+        app.update(Action::SearchChar(c));
+    }
+    assert_eq!(app.displayed_notes().len(), 1);
+    assert_eq!(app.displayed_notes()[0].title, "Travel Plans");
+
+    // 4. Body-only match: "basil" (does NOT appear in title or tags!)
+    app.update(Action::ExitSearch);
+    app.update(Action::EnterSearch);
+    for c in "basil".chars() {
+        app.update(Action::SearchChar(c));
+    }
+    assert_eq!(app.displayed_notes().len(), 1);
+    assert_eq!(app.displayed_notes()[0].title, "Cooking Recipes");
+
+    // 5. No-match query: "nonexistentxyz"
+    app.update(Action::ExitSearch);
+    app.update(Action::EnterSearch);
+    for c in "nonexistentxyz".chars() {
+        app.update(Action::SearchChar(c));
+    }
+    assert_eq!(app.displayed_notes().len(), 0);
+    assert!(app.selected_index.is_none());
+    assert!(app.preview.is_none());
+
+    // 6. Clear search (ExitSearch) restores full note list
+    app.update(Action::ExitSearch);
+    assert_eq!(app.mode, AppMode::Normal);
+    assert_eq!(app.search_query, "");
+    assert_eq!(app.displayed_notes().len(), 3);
+    assert_eq!(app.selected_index, Some(0));
+    assert!(app.preview.is_some());
+
+    // 7. Lock clears search query and results
+    app.update(Action::EnterSearch);
+    for c in "basil".chars() {
+        app.update(Action::SearchChar(c));
+    }
+    assert_eq!(app.displayed_notes().len(), 1);
+    assert_eq!(app.search_query, "basil");
+    assert!(!app.search_results.is_empty());
+
+    assert!(app.lock_and_clear().is_ok());
+    assert_eq!(app.mode, AppMode::Locked);
+    assert!(app.search_query.is_empty());
+    assert!(app.search_results.is_empty());
 }

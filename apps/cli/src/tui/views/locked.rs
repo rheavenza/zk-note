@@ -71,6 +71,12 @@ pub fn render_locked_screen(f: &mut Frame<'_>, app: &App, area: Rect) {
     if let Some(err) = &app.unlock_error {
         let err_para = Paragraph::new(err.as_str()).style(Style::default().fg(Color::LightRed));
         f.render_widget(err_para, chunks[2]);
+    } else if let Some(err) = &app.error_message {
+        let err_para = Paragraph::new(err.as_str()).style(Style::default().fg(Color::LightRed));
+        f.render_widget(err_para, chunks[2]);
+    } else if let Some(status) = &app.status_message {
+        let status_para = Paragraph::new(status.as_str()).style(Style::default().fg(Color::Yellow));
+        f.render_widget(status_para, chunks[2]);
     } else {
         let hint_para = Paragraph::new("All local notes remain encrypted on disk.")
             .style(Style::default().fg(Color::DarkGray));

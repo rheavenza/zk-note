@@ -243,6 +243,11 @@ pub fn update_session_timeout(
         .ok_or_else(|| CliError::Io("failed to read updated session info".to_string()))
 }
 
+/// Refreshes the last active timestamp of an active session to now (ZK-076).
+pub fn touch_session(session_path: &Path) -> Result<(), CliError> {
+    load_session_key_and_touch(session_path, true).map(|_| ())
+}
+
 /// Returns `true` if a valid session file exists.
 #[must_use]
 pub fn has_active_session(session_path: &Path) -> bool {

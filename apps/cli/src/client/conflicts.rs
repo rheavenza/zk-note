@@ -17,20 +17,35 @@ use zk_sync::{
 
 /// High-level conflict summary for listing and status display.
 ///
+use serde::Serialize;
+
+/// High-level conflict summary for listing and status display.
+///
 /// Plaintext note titles are redacted in `Debug` output (SEC-003).
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct ClientConflictSummary {
     pub conflict_id: String,
     pub object_id: String,
+    pub object_kind: u16,
     pub base_revision: u64,
     pub remote_revision: u64,
     pub resolved: bool,
     pub remote_is_deleted: bool,
     pub local_is_deleted: bool,
     pub conflict_type: String,
-    pub title: String,
     pub created_at: String,
     pub resolved_at: Option<String>,
+    pub title: String,
+}
+
+impl ClientConflictSummary {
+    pub fn is_delete_vs_edit(&self) -> bool {
+        self.remote_is_deleted && !self.local_is_deleted
+    }
+
+    pub fn is_edit_vs_delete(&self) -> bool {
+        self.local_is_deleted && !self.remote_is_deleted
+    }
 }
 
 impl fmt::Debug for ClientConflictSummary {
@@ -38,6 +53,7 @@ impl fmt::Debug for ClientConflictSummary {
         f.debug_struct("ClientConflictSummary")
             .field("conflict_id", &self.conflict_id)
             .field("object_id", &self.object_id)
+            .field("object_kind", &self.object_kind)
             .field("base_revision", &self.base_revision)
             .field("remote_revision", &self.remote_revision)
             .field("resolved", &self.resolved)
@@ -164,15 +180,16 @@ pub fn list_conflicts(
         items.push(ClientConflictSummary {
             conflict_id: c.conflict_id,
             object_id: c.object_id,
+            object_kind: c.object_kind,
             base_revision: c.base_revision,
             remote_revision: c.remote_revision,
             resolved: c.resolved,
             remote_is_deleted: c.remote_is_deleted,
             local_is_deleted: c.local_is_deleted,
             conflict_type,
-            title,
             created_at: c.created_at,
             resolved_at: c.resolved_at,
+            title,
         });
     }
 

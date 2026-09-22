@@ -18,15 +18,18 @@ use zk_storage::{
     StoredEncryptedObject,
 };
 
+use serde::Serialize;
+
 /// High-level note summary for listings and views.
 ///
 /// Plaintext note titles and tags are redacted in `Debug` output to prevent secret leakage (SEC-003).
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct ClientNoteSummary {
     pub id: String,
     pub title: String,
     pub tags: Vec<String>,
     pub updated_at: String,
+    pub created_at: String,
     pub revision: u64,
     pub is_deleted: bool,
 }
@@ -38,6 +41,7 @@ impl fmt::Debug for ClientNoteSummary {
             .field("title", &"[REDACTED]")
             .field("tags", &"[REDACTED]")
             .field("updated_at", &self.updated_at)
+            .field("created_at", &self.created_at)
             .field("revision", &self.revision)
             .field("is_deleted", &self.is_deleted)
             .finish()
@@ -171,6 +175,7 @@ pub fn list_notes(
                     title: note.title,
                     tags: note.tags,
                     updated_at: note.updated_at,
+                    created_at: note.created_at,
                     revision: obj.revision,
                     is_deleted: obj.is_deleted,
                 });
@@ -181,6 +186,7 @@ pub fn list_notes(
                     title: "[Decryption failed: corrupted envelope or wrong key]".to_string(),
                     tags: vec![],
                     updated_at: String::new(),
+                    created_at: String::new(),
                     revision: obj.revision,
                     is_deleted: obj.is_deleted,
                 });
@@ -194,12 +200,12 @@ pub fn list_notes(
     Ok(summaries)
 }
 
-/// Retrieves and decrypts a specific note by full UUID or unique prefix.
-pub fn get_note(
+/// Retrieves and decrypts a specific note, returning both the stored object metadata and plaintext note.
+pub fn get_plaintext_note(
     custom_data_dir: Option<&Path>,
     vault_key: &VaultKey,
     id_or_prefix: &str,
-) -> Result<ClientNoteDetail, CliError> {
+) -> Result<(StoredEncryptedObject, PlaintextNote), CliError> {
     let data_dir = resolve_data_dir(custom_data_dir);
     let vault_path = vault_file(&data_dir);
     let db_path = db_file(&data_dir);
@@ -211,6 +217,17 @@ pub fn get_note(
     let storage = SqliteStorage::open(&db_path)?;
     let obj = find_note_object(&storage, id_or_prefix, false)?;
     let note = PlaintextNote::decrypt(&obj.envelope, vault_key)?;
+
+    Ok((obj, note))
+}
+
+/// Retrieves and decrypts a specific note by full UUID or unique prefix.
+pub fn get_note(
+    custom_data_dir: Option<&Path>,
+    vault_key: &VaultKey,
+    id_or_prefix: &str,
+) -> Result<ClientNoteDetail, CliError> {
+    let (obj, note) = get_plaintext_note(custom_data_dir, vault_key, id_or_prefix)?;
 
     Ok(ClientNoteDetail {
         id: obj.object_id,
@@ -347,7 +364,7 @@ pub fn delete_note(
     custom_data_dir: Option<&Path>,
     id_or_prefix: &str,
     purge: bool,
-) -> Result<(), CliError> {
+) -> Result<(String, u64), CliError> {
     let data_dir = resolve_data_dir(custom_data_dir);
     let vault_path = vault_file(&data_dir);
     let db_path = db_file(&data_dir);
@@ -362,7 +379,7 @@ pub fn delete_note(
     if purge {
         storage.purge_object(&stored.object_id)?;
         storage.clear_base_versions(&stored.object_id)?;
-        return Ok(());
+        return Ok((stored.object_id, stored.revision));
     }
 
     let prior_revision = stored.revision;
@@ -380,7 +397,7 @@ pub fn delete_note(
 
     let mutation = PendingMutation {
         mutation_id: Uuid::new_v4().to_string(),
-        object_id: stored.object_id,
+        object_id: stored.object_id.clone(),
         object_kind: OBJECT_KIND_NOTE,
         mutation_type: MutationType::Delete,
         expected_revision: prior_revision,
@@ -391,7 +408,7 @@ pub fn delete_note(
     };
     storage.enqueue_mutation(&mutation)?;
 
-    Ok(())
+    Ok((stored.object_id, tombstone_revision))
 }
 
 /// Searches local notes using an in-memory index built on the fly while unlocked.

@@ -19,6 +19,6 @@ pub use notes::{
 };
 pub use sync::{get_initial_sync_status, perform_sync, SyncStatus};
 pub use vault::{
-    check_and_touch_session, get_active_vault_key, get_vault_status, lock_vault, unlock_vault,
-    unlock_with_recovery_key, VaultState,
+    get_active_vault_key, get_vault_status, is_session_expired, lock_vault, touch_session_activity,
+    unlock_vault, unlock_with_recovery_key, VaultState,
 };
