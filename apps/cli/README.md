@@ -241,6 +241,73 @@ zk-note resolve <conflict-id> --remote     # Discard local edits, accept remote 
 zk-note resolve <conflict-id> --duplicate  # Accept remote and fork local changes into a new note
 ```
 
+### 3.6 Interactive Terminal UI (`zk-note tui`)
+
+Launch the lazygit-style interactive terminal UI:
+```bash
+zk-note tui
+```
+or with a custom data directory:
+```bash
+zk-note --data-dir /path/to/data tui
+```
+
+#### Responsive Constraints
+- **Minimum Terminal Size**: `80 x 24` columns and rows.
+- If the terminal is resized below 80x24, the TUI safely suspends the multi-pane display and renders a dedicated `Terminal Too Small` view showing current and required dimensions without panicking or leaking decrypted content.
+
+#### Locked / Unlocked Lifecycle
+- **Locked State**: If the vault is locked or has no active session upon launch, the TUI displays a centered masked unlock modal.
+- **Passphrase Entry**: Passphrase characters are masked (`*`), and the input buffer is zeroized in memory on unlock or cancel.
+- **Explicit Lock (`l`)**: Pressing `l` immediately locks the vault session, zeroizes all decrypted note contents, search terms, conflict records, and edit buffers, and returns to the locked modal.
+- **Idle Auto-Lock**: The TUI runs an internal tick handler that checks the existing session timeout. If the session expires due to inactivity, it triggers the exact same zeroizing lock path.
+
+#### External Editor Workflow (`E`)
+- Pressing `E` on any note temporarily suspends raw terminal mode and the alternate screen via `TerminalGuard::suspend`.
+- The note is opened in `$VISUAL` or `$EDITOR` (falling back to `nano`/`vi`) using the existing secure `TempFileGuard` mechanism in a RAM-backed tmpfs (`/dev/shm`, `$XDG_RUNTIME_DIR`) with `0600` permissions.
+- When the editor exits, the temporary file is zeroized before unlinking, the updated note is encrypted and saved, and the TUI resumes seamlessly.
+
+#### Keybinding Cheat Sheet
+
+| Mode / View | Key | Action |
+| :--- | :--- | :--- |
+| **Global / Navigation** | `j` / `Down` | Move down in notes or conflict list |
+| | `k` / `Up` | Move up in notes or conflict list |
+| | `g` | Jump to first item |
+| | `G` | Jump to last item |
+| | `Enter` | Open selected note into preview / focus pane |
+| | `Tab` | Cycle focus forward (Notes -> Preview -> Metadata) |
+| | `Shift+Tab` / `BackTab` | Cycle focus backward |
+| | `Esc` | Return focus to Notes list / close modals |
+| | `?` | Toggle Help overlay modal |
+| | `q` | Quit TUI |
+| | `l` | Explicitly lock vault and purge decrypted buffers |
+| **Note Operations** | `n` | Create new note (inline editor) |
+| | `e` | Inline edit current note (title, tags, body) |
+| | `E` | External edit current note via `$EDITOR` (`TempFileGuard`) |
+| | `d` | Delete current note (confirmation gated) |
+| | `/` | Incremental in-memory search across notes |
+| | `s` | Trigger manual guarded sync |
+| | `c` | Open Conflicts overlay view |
+| **Search Mode (`/`)** | `Enter` / `Esc` | Finish search and keep filter / navigate results |
+| | `Backspace` | Erase character from search query |
+| | Any text | Filter note list dynamically in memory |
+| **Inline Editor (`n` / `e`)** | `Tab` | Cycle field (Title -> Tags -> Body) |
+| | `Ctrl+S` | Save note and return to normal mode |
+| | `Esc` | Cancel editing (discards unsaved draft) |
+| **Delete Confirmation (`d`)** | `y` / `Y` / `Enter` | Confirm deletion (creates revisioned tombstone) |
+| | `n` / `N` / `Esc` | Cancel deletion |
+| **Conflicts View (`c`)** | `j` / `k` | Navigate conflict list |
+| | `k` / `l` / `1` | Keep Local revision |
+| | `r` / `2` | Accept Remote revision |
+| | `m` / `3` | 3-way Merge candidate |
+| | `d` / `4` | Duplicate (fork local into new note) |
+| | `u` / `5` | Restore / Keep Local (for tombstone conflict) |
+| | `Esc` / `q` / `c` | Close conflicts view |
+| **Locked Screen** | `Enter` | Submit passphrase to unlock |
+| | `Backspace` | Delete masked character |
+| | `Esc` / `q` | Quit application |
+
 ---
 
 ## 4. Security Guarantees & Threat Boundaries

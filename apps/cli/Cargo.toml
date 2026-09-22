@@ -26,6 +26,9 @@ zk-sync = { workspace = true }
 uuid = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+zeroize = { workspace = true }
 
 [dev-dependencies]
 rusqlite = { workspace = true }
