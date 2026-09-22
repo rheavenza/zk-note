@@ -47,6 +47,19 @@ Every task must satisfy:
 
 ---
 
+## ZK-101 — Add lazygit-style interactive terminal UI
+Status: READY
+Priority: P1
+Dependencies: ZK-027, ZK-040 through ZK-046, ZK-050 through ZK-057, ZK-072, ZK-076
+
+Implement the GitHub-requested full-screen Ratatui/Crossterm interface in the
+existing `zk-note` binary while preserving non-interactive CLI compatibility and
+all zero-knowledge/security boundaries. The complete READY contract, acceptance
+criteria, verification procedure, artifact requirements, and fallback are in
+[`docs/tickets/ZK-101.md`](docs/tickets/ZK-101.md).
+
+---
+
 # M0 — Repository and architecture foundation
 
 ## ZK-100 — Parallel Cloudflare deployment backend
