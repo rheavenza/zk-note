@@ -47,6 +47,29 @@ Every task must satisfy:
 
 ---
 
+## ZK-101 — Add lazygit-style interactive terminal UI
+Status: READY
+Priority: P1
+Dependencies: ZK-027, ZK-040 through ZK-046, ZK-050 through ZK-057, ZK-072, ZK-076
+
+Implement the GitHub-requested full-screen Ratatui/Crossterm interface in the
+existing `zk-note` binary while preserving non-interactive CLI compatibility and
+all zero-knowledge/security boundaries. The complete READY contract, acceptance
+criteria, verification procedure, artifact requirements, and fallback are in
+[`docs/tickets/ZK-101.md`](docs/tickets/ZK-101.md).
+
+Implementation notes:
+- Implemented full-screen keyboard-first TUI via Ratatui 0.29 and Crossterm 0.28 under `apps/cli/src/tui`.
+- Extracted reusable, non-printing native client services under `apps/cli/src/client/{conflicts,editor,notes,sync,vault}`. Refactored Clap CLI handlers in `apps/cli/src/commands.rs` to delegate domain logic to shared services.
+- Addressed blocking review repairs:
+  1. Idle auto-lock semantics: 250ms tick inspects expiry via `is_session_expired()` without touching activity. Real user input refreshes activity via explicit `touch_session_activity()`. Deterministic tests verify ticks do not extend session and expiry locks and scrubs all decrypted buffers.
+  2. Honest lock failures: `lock_and_clear()` records typed failure and displays truthful error state when persisted session invalidation fails; fail-closed memory scrubbing executes regardless.
+  3. AC-05 full-text search: `perform_incremental_search` delegates to shared `search_notes` over `InMemorySearchIndex` to match title, tag, and body content without disk persistence or network leakage.
+  4. Service extraction: unifies note, conflict, and vault models across CLI and TUI. All CLI commands, options, and JSON outputs preserved.
+  5. Terminal restoration: `TerminalGuard` uses granular tracking of raw mode, alternate screen, and cursor visibility with drop-safe retry and ordered cleanup.
+
+---
+
 # M0 — Repository and architecture foundation
 
 ## ZK-100 — Parallel Cloudflare deployment backend
