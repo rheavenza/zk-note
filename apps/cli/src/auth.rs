@@ -327,8 +327,21 @@ pub async fn api_revoke_session(session: &StoredAuthSession) -> Result<(), CliEr
         })?;
 
     let status = resp.status();
-    let _ = status;
-    Ok(())
+    if status.is_success() || status.as_u16() == 401 || status.as_u16() == 404 {
+        Ok(())
+    } else {
+        let body_bytes = resp.bytes().await.unwrap_or_default();
+        if let Ok(err_val) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+            let msg = err_val
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("Server revocation error");
+            return Err(CliError::AuthError(format!("Revocation failed: {msg}")));
+        }
+        Err(CliError::AuthError(format!(
+            "Server returned HTTP {status} during revocation"
+        )))
+    }
 }
 
 /// Queries active session status from the server via `GET /v1/auth/session/status`.

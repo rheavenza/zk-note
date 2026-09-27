@@ -201,10 +201,30 @@ zk-note detach <note-id> <attachment-id>
 
 ### 3.4 Multi-Device Synchronization & Server Authentication
 
-#### Connect to Sync Server
+`zk-note` synchronizes opaque encrypted note envelopes with a zero-knowledge sync server.
+
+#### Prerequisites: Session Token Provisioning
+In accordance with ADR 0006, device authorization requires an existing valid account session token (e.g. provisioned via web client passkey login or personal access token). The terminal client does not invent unauthenticated token endpoints or display/copy browser session storage.
+
+#### Server URL Validation & Security Rules
+- **HTTPS Required for Remote**: Insecure HTTP is prohibited for remote servers to prevent bearer token interception.
+- **Local Development Loopback**: Plain HTTP is permitted strictly for loopback hosts (`localhost`, `127.0.0.1`, `[::1]`).
+- **Canonical Origins**: URLs must not contain credentials, query parameters, URL fragments, or arbitrary paths.
+
+#### Connect & Authorize Device
 ```bash
 zk-note login --server http://127.0.0.1:8080 --account-id <uuid> --token <auth-token>
 ```
+Credentials are saved to `~/.local/share/zk-notes/session_auth.json` with strict POSIX `0600` permissions.
+
+#### Sign-Out & Server Revocation Behavior
+```bash
+zk-note logout
+```
+Signing out revokes the session on the sync server before deleting local credentials. If the server is offline or unreachable, local credentials are intentionally preserved with a truthful warning so the user can retry revocation when connectivity is restored.
+
+#### Authentication vs. Vault Linking / Sync
+> **Important**: Signing in authorizes this terminal device with the server account. It does **not** link, upload, replace, or restore your vault. Vault synchronization is a separate, guarded operation (`zk-note sync` or `s` in the TUI) that uses compare-and-swap (CAS) revision checks to prevent silent overwrites.
 
 #### Check Sync & Device Identity
 ```bash
@@ -220,6 +240,7 @@ zk-note device list
 # Revoke a lost or compromised device
 zk-note device revoke <device-id>
 ```
+
 
 ---
 
@@ -282,6 +303,7 @@ zk-note --data-dir /path/to/data tui
 | | `?` | Toggle Help overlay modal |
 | | `q` | Quit TUI |
 | | `l` | Explicitly lock vault and purge decrypted buffers |
+| | `a` | Open server connection & account authentication modal |
 | **Note Operations** | `n` | Create new note (inline editor) |
 | | `e` | Inline edit current note (title, tags, body) |
 | | `E` | External edit current note via `$EDITOR` (`TempFileGuard`) |
@@ -289,6 +311,12 @@ zk-note --data-dir /path/to/data tui
 | | `/` | Incremental in-memory search across notes |
 | | `s` | Trigger manual guarded sync |
 | | `c` | Open Conflicts overlay view |
+| **Server / Account (`a`)** | `Tab` / `Down` | Cycle fields (Server URL -> Token -> Connect -> Sign Out) |
+| | `Shift+Tab` / `Up` | Cycle fields backward |
+| | `Enter` | Submit / execute focused action |
+| | `Ctrl+X` | Trigger Sign Out & remote session revocation |
+| | `Ctrl+R` | Refresh server connection status |
+| | `Esc` | Close modal and zeroize token buffer |
 | **Search Mode (`/`)** | `Enter` / `Esc` | Finish search and keep filter / navigate results |
 | | `Backspace` | Erase character from search query |
 | | Any text | Filter note list dynamically in memory |
@@ -324,3 +352,14 @@ zk-note --data-dir /path/to/data tui
 3. **Plaintext Isolation (`SEC-001`, `SEC-002`)**:
    - Plaintext exists only in volatile process memory while unlocked.
    - Persistent SQLite databases contain exclusively encrypted envelopes.
+   - The server never receives Vault Keys, Note Keys, passphrases, note plaintext, or search queries.
+
+4. **Secret Hygiene & Token Protection (`SEC-003`)**:
+   - Session tokens and passphrases are entered with masked feedback (`*`), never echoed in terminal history.
+   - Bearer tokens are redacted in all `Debug` representations, error messages, and logs.
+   - In-memory token buffers are aggressively scrubbed using `Zeroize` upon submission, cancellation, vault lock, application quit, and drop.
+
+5. **Server Isolation & Honest Status**:
+   - Failed or offline authorization attempts never overwrite or invalidate existing valid local sessions.
+   - Sign-out attempts server revocation before deleting local credentials; if offline, credentials are preserved with an actionable warning to allow retry.
+   - Signing in never automatically uploads, links, replaces, or replaces a local vault.

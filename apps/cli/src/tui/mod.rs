@@ -22,6 +22,7 @@ use std::io;
 use std::path::Path;
 use std::time::Duration;
 use terminal::{CrosstermAdapter, TerminalGuard};
+use zeroize::Zeroize;
 
 /// Launches and runs the full-screen interactive terminal interface.
 pub async fn run_tui(data_dir: Option<&Path>) -> Result<(), CliError> {
@@ -90,6 +91,95 @@ pub async fn run_tui(data_dir: Option<&Path>) -> Result<(), CliError> {
                 }
                 Err(e) => {
                     app.sync_status = SyncStatus::Error(e.to_string());
+                }
+            }
+        }
+
+        // Handle async account authentication operations (ZK-101 Addendum)
+        if let Some(action) = app.account_pending_action.take() {
+            match action {
+                app::AccountPendingAction::Connect {
+                    server_url,
+                    mut token,
+                } => {
+                    let auth_res = crate::client::auth::authorize_terminal_device(
+                        app.data_dir.as_deref(),
+                        &server_url,
+                        &token,
+                        None,
+                        Some("zk-note-tui".to_string()),
+                        None,
+                    )
+                    .await;
+                    token.zeroize();
+                    drop(token);
+                    match auth_res {
+                        Ok(session) => {
+                            app.account_state =
+                                crate::client::auth::ClientAuthState::Authenticated {
+                                    server_url: session.server_url.clone(),
+                                    account_id: session.account_id,
+                                    device_id: session.device_id,
+                                    session_id: session.session_id,
+                                    expires_at: session.expires_at,
+                                };
+                            app.account_server_input = session.server_url;
+                            app.status_message =
+                                Some("Terminal device authorized successfully.".to_string());
+                            app.error_message = None;
+                            app.mode = app.previous_mode.take().unwrap_or(app::AppMode::Normal);
+                        }
+                        Err(e) => {
+                            app.error_message = Some(format!("Authentication failed: {e}"));
+                            app.status_message = None;
+                            if let Ok(st) = crate::client::auth::check_auth_state_online(
+                                app.data_dir.as_deref(),
+                            )
+                            .await
+                            {
+                                app.account_state = st;
+                            }
+                        }
+                    }
+                }
+                app::AccountPendingAction::SignOut => {
+                    let sign_out_res = crate::client::auth::sign_out(app.data_dir.as_deref()).await;
+                    match sign_out_res {
+                        Ok(()) => {
+                            app.account_state = crate::client::auth::ClientAuthState::LocalOnly;
+                            app.status_message =
+                                Some("Session revoked. Signed out successfully.".to_string());
+                            app.error_message = None;
+                            app.mode = app.previous_mode.take().unwrap_or(app::AppMode::Normal);
+                        }
+                        Err(e) => {
+                            app.error_message = Some(format!("Sign out failed: {e}"));
+                            app.status_message = Some(
+                                "Credentials retained so you can retry when online.".to_string(),
+                            );
+                            if let Ok(st) = crate::client::auth::check_auth_state_online(
+                                app.data_dir.as_deref(),
+                            )
+                            .await
+                            {
+                                app.account_state = st;
+                            }
+                        }
+                    }
+                }
+                app::AccountPendingAction::RefreshStatus => {
+                    match crate::client::auth::check_auth_state_online(app.data_dir.as_deref())
+                        .await
+                    {
+                        Ok(st) => {
+                            app.account_state = st;
+                            app.status_message = Some("Server status updated.".to_string());
+                            app.error_message = None;
+                        }
+                        Err(e) => {
+                            app.error_message = Some(format!("Failed to refresh status: {e}"));
+                        }
+                    }
                 }
             }
         }

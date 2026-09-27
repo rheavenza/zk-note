@@ -73,6 +73,7 @@ pub fn render_help_overlay(f: &mut Frame<'_>, area: Rect) {
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         )]),
+        Line::from("  a             Server connection & account authentication"),
         Line::from("  s             Guarded sync cycle (pull-before-push)"),
         Line::from("  c             View and resolve sync conflicts"),
         Line::from("  l             Lock vault and scrub memory"),

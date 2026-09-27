@@ -2,11 +2,13 @@
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 use super::action::Action;
-use super::app::{App, AppMode, Focus};
+use super::app::{AccountField, AccountPendingAction, App, AppMode, Focus};
 use super::ui::render;
+use crate::client::auth::ClientAuthState;
 use crate::client::conflicts::ClientConflictSummary;
 use crate::client::notes::create_note;
 use crate::client::sync::SyncStatus;
+
 use crate::client::vault::unlock_vault;
 use crate::commands::cmd_init;
 use crate::config::session_file;
@@ -668,4 +670,184 @@ fn test_fulltext_search_title_tag_body_no_match_clear_lock() {
     assert_eq!(app.mode, AppMode::Locked);
     assert!(app.search_query.is_empty());
     assert!(app.search_results.is_empty());
+}
+
+#[test]
+fn test_render_account_modal() {
+    let (_dir, mut app) = setup_test_vault();
+    app.update(Action::OpenAccount);
+    assert_eq!(app.mode, AppMode::Account);
+
+    let output = render_to_string(&app, 80, 24);
+    assert!(output.contains("Server Connection & Account Authentication"));
+    assert!(output.contains("Server Address"));
+    assert!(output.contains("Session Token"));
+    assert!(output.contains("Connect & Authorize Device"));
+    assert!(output.contains("Sign Out & Revoke Session"));
+    assert!(output.contains("Active Connection Status"));
+    assert!(output.contains("Signing in does NOT link, upload, replace, or restore your vault."));
+}
+
+#[test]
+fn test_account_masked_input_and_zeroization() {
+    let (_dir, mut app) = setup_test_vault();
+    app.update(Action::OpenAccount);
+    assert_eq!(app.mode, AppMode::Account);
+
+    // Switch focus to token field if not already
+    app.account_focus_field = AccountField::Token;
+
+    // Type a secret token
+    for c in "super_secret_token_123".chars() {
+        app.update(Action::AccountTokenChar(c));
+    }
+    assert_eq!(app.account_token_input, "super_secret_token_123");
+
+    // Render output must mask with asterisks and NEVER leak the plaintext token
+    let output = render_to_string(&app, 80, 24);
+    assert!(output.contains("**********************")); // 22 asterisks
+    assert!(!output.contains("super_secret_token_123"));
+
+    // Debug representation of App must also redact the token (SEC-003, AC-03)
+    let debug_str = format!("{app:?}");
+    assert!(!debug_str.contains("super_secret_token_123"));
+    assert!(debug_str.contains("[REDACTED]"));
+
+    // Closing account view must zeroize and clear the token buffer
+    app.update(Action::CloseAccount);
+    assert_eq!(app.mode, AppMode::Normal);
+    assert!(app.account_token_input.is_empty());
+
+    // Re-open and test zeroization on vault lock
+    app.update(Action::OpenAccount);
+    app.account_focus_field = AccountField::Token;
+    for c in "another_secret".chars() {
+        app.update(Action::AccountTokenChar(c));
+    }
+    assert_eq!(app.account_token_input, "another_secret");
+
+    assert!(app.lock_and_clear().is_ok());
+    assert_eq!(app.mode, AppMode::Locked);
+    assert!(app.account_token_input.is_empty());
+}
+
+#[test]
+fn test_account_field_navigation_and_actions() {
+    let (_dir, mut app) = setup_test_vault();
+    app.update(Action::OpenAccount);
+
+    // Initial state
+    app.account_focus_field = AccountField::ServerUrl;
+
+    // NextField cycling: ServerUrl -> Token -> ConnectButton -> SignOutButton -> ServerUrl
+    app.update(Action::AccountNextField);
+    assert_eq!(app.account_focus_field, AccountField::Token);
+    app.update(Action::AccountNextField);
+    assert_eq!(app.account_focus_field, AccountField::ConnectButton);
+    app.update(Action::AccountNextField);
+    assert_eq!(app.account_focus_field, AccountField::SignOutButton);
+    app.update(Action::AccountNextField);
+    assert_eq!(app.account_focus_field, AccountField::ServerUrl);
+
+    // PrevField cycling
+    app.update(Action::AccountPrevField);
+    assert_eq!(app.account_focus_field, AccountField::SignOutButton);
+
+    // Edit server URL
+    app.account_focus_field = AccountField::ServerUrl;
+    app.account_server_input.clear();
+    for c in "http://127.0.0.1:9090".chars() {
+        app.update(Action::AccountServerChar(c));
+    }
+    assert_eq!(app.account_server_input, "http://127.0.0.1:9090");
+    app.update(Action::AccountServerBackspace);
+    assert_eq!(app.account_server_input, "http://127.0.0.1:909");
+
+    // Submit with empty token produces error
+    app.account_token_input.clear();
+    app.update(Action::AccountSubmit);
+    assert!(app.error_message.is_some());
+    assert!(app.account_pending_action.is_none());
+
+    // Submit with token sets AccountPendingAction::Connect and zeroes in-app token buffer
+    for c in "auth_token_xyz".chars() {
+        app.update(Action::AccountTokenChar(c));
+    }
+    app.update(Action::AccountSubmit);
+    assert!(app.account_token_input.is_empty());
+    match app.account_pending_action.take() {
+        Some(AccountPendingAction::Connect { server_url, token }) => {
+            assert_eq!(server_url, "http://127.0.0.1:909");
+            assert_eq!(token, "auth_token_xyz");
+        }
+        other => panic!("expected Connect pending action, got {other:?}"),
+    }
+
+    // SignOut action sets AccountPendingAction::SignOut
+    app.update(Action::AccountSignOut);
+    assert_eq!(
+        app.account_pending_action.take(),
+        Some(AccountPendingAction::SignOut)
+    );
+
+    // Refresh action sets AccountPendingAction::RefreshStatus
+    app.update(Action::AccountRefresh);
+    assert_eq!(
+        app.account_pending_action.take(),
+        Some(AccountPendingAction::RefreshStatus)
+    );
+}
+
+#[test]
+fn test_account_status_bar_badges() {
+    let (_dir, mut app) = setup_test_vault();
+
+    // 1. Local-only
+    app.account_state = ClientAuthState::LocalOnly;
+    let out = render_to_string(&app, 80, 24);
+    assert!(out.contains("[Local-only]"));
+
+    // 2. Authenticated
+    let account_id = uuid::Uuid::new_v4();
+    let short_id = &account_id.to_string()[..8];
+    app.account_state = ClientAuthState::Authenticated {
+        server_url: "http://127.0.0.1:8080".to_string(),
+        account_id,
+        device_id: uuid::Uuid::new_v4(),
+        session_id: Some(uuid::Uuid::new_v4()),
+        expires_at: None,
+    };
+    let out = render_to_string(&app, 80, 24);
+    assert!(out.contains(&format!("[Auth: {short_id}]")));
+
+    // 3. Offline
+    app.account_state = ClientAuthState::Offline {
+        server_url: "http://127.0.0.1:8080".to_string(),
+        account_id,
+        device_id: uuid::Uuid::new_v4(),
+        session_id: None,
+        error: "connection refused".to_string(),
+    };
+    let out = render_to_string(&app, 80, 24);
+    assert!(out.contains("[Server: Offline]"));
+
+    // 4. Expired
+    app.account_state = ClientAuthState::Expired {
+        server_url: "http://127.0.0.1:8080".to_string(),
+        account_id,
+        device_id: uuid::Uuid::new_v4(),
+        session_id: None,
+    };
+    let out = render_to_string(&app, 80, 24);
+    assert!(out.contains("[Server: Expired]"));
+
+    // 5. Revoked
+    app.account_state = ClientAuthState::Revoked {
+        server_url: "http://127.0.0.1:8080".to_string(),
+        account_id,
+        device_id: uuid::Uuid::new_v4(),
+        session_id: None,
+    };
+    let out = render_to_string(&app, 80, 24);
+    assert!(out.contains("[Server: Revoked]"));
 }

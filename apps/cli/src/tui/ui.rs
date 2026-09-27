@@ -2,10 +2,10 @@
 
 use super::app::{App, AppMode, MIN_COLS, MIN_ROWS};
 use super::views::{
-    conflict::render_conflict_screen, delete_confirm::render_delete_confirm_modal,
-    help::render_help_overlay, locked::render_locked_screen, metadata::render_metadata_pane,
-    note::render_note_pane, notes::render_notes_pane, status::render_status_bar,
-    too_small::render_too_small_screen,
+    account::render_account_modal, conflict::render_conflict_screen,
+    delete_confirm::render_delete_confirm_modal, help::render_help_overlay,
+    locked::render_locked_screen, metadata::render_metadata_pane, note::render_note_pane,
+    notes::render_notes_pane, status::render_status_bar, too_small::render_too_small_screen,
 };
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::Frame;
@@ -52,6 +52,9 @@ pub fn render(f: &mut Frame<'_>, app: &App) {
 
     // Render active modal / overlay if present
     match app.mode {
+        AppMode::Account => {
+            render_account_modal(f, app, area);
+        }
         AppMode::Conflict => {
             render_conflict_screen(f, app, area);
         }

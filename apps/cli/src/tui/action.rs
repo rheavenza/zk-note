@@ -57,6 +57,19 @@ pub enum Action {
     // Sync
     TriggerSync,
 
+    // Server Connection & Account Authentication (ZK-101 Addendum)
+    OpenAccount,
+    CloseAccount,
+    AccountServerChar(char),
+    AccountServerBackspace,
+    AccountTokenChar(char),
+    AccountTokenBackspace,
+    AccountNextField,
+    AccountPrevField,
+    AccountSubmit,
+    AccountSignOut,
+    AccountRefresh,
+
     // Overlays & Lifecycle
     ToggleHelp,
     CloseOverlay,
@@ -67,13 +80,16 @@ pub enum Action {
 
 impl fmt::Debug for Action {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Ensure character inputs for unlock or search are not printed directly
+        // Ensure character inputs for unlock, search, or token are not printed directly
         match self {
             Action::UnlockChar(_) => write!(f, "Action::UnlockChar([REDACTED])"),
             Action::UnlockBackspace => write!(f, "Action::UnlockBackspace"),
             Action::SubmitUnlock => write!(f, "Action::SubmitUnlock"),
             Action::SearchChar(_) => write!(f, "Action::SearchChar([REDACTED])"),
             Action::EditChar(_) => write!(f, "Action::EditChar([REDACTED])"),
+            Action::AccountTokenChar(_) => write!(f, "Action::AccountTokenChar([REDACTED])"),
+            Action::AccountTokenBackspace => write!(f, "Action::AccountTokenBackspace"),
+            Action::AccountSubmit => write!(f, "Action::AccountSubmit"),
             other => write!(f, "Action::{other:?}"),
         }
     }

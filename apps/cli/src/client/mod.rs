@@ -2,12 +2,17 @@
 //!
 //! Separates business and domain logic from Clap CLI printing and TUI rendering.
 
+pub mod auth;
 pub mod conflicts;
 pub mod editor;
 pub mod notes;
 pub mod sync;
 pub mod vault;
 
+pub use auth::{
+    authorize_terminal_device, check_auth_state_online, force_clear_session, get_local_auth_state,
+    sign_out, validate_and_normalize_server_url, ClientAuthState,
+};
 pub use conflicts::{
     find_conflict_record, get_conflict_detail, list_conflicts, resolve_conflict_item,
     ClientConflictDetail, ClientConflictSummary,

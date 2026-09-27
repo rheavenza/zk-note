@@ -2,10 +2,9 @@
 //! `new`, `edit`, `show`, `search`, `delete`, `history`, and `list`.
 
 use crate::auth::{
-    api_device_authorize, api_list_devices, api_query_status, api_revoke_device,
-    api_revoke_session, api_verify_token, clear_auth_session, get_or_create_device_id,
-    has_auth_session, load_auth_session, save_auth_session,
+    api_list_devices, api_revoke_device, clear_auth_session, has_auth_session, load_auth_session,
 };
+
 use crate::config::{auth_session_file, db_file, resolve_data_dir, session_file, vault_file};
 use crate::edit::{note_to_edit_buffer, parse_edit_buffer, run_editor, TempFileGuard};
 use crate::error::CliError;
@@ -1555,10 +1554,7 @@ pub async fn cmd_login(
     device_id_opt: Option<String>,
     token_opt: Option<String>,
 ) -> Result<(), CliError> {
-    let data_dir = resolve_data_dir(custom_data_dir);
-    std::fs::create_dir_all(&data_dir).map_err(|e| CliError::Io(e.to_string()))?;
-
-    let server_url = if let Some(s) = server_opt {
+    let server_raw = if let Some(s) = server_opt {
         s
     } else if let Ok(env_s) = std::env::var("ZK_SERVER_URL") {
         env_s
@@ -1577,6 +1573,8 @@ pub async fn cmd_login(
         "http://127.0.0.1:8080".to_string()
     };
 
+    let server_url = crate::client::auth::validate_and_normalize_server_url(&server_raw)?;
+
     let explicit_dev_id = if let Some(d_str) = device_id_opt {
         Some(
             Uuid::parse_str(&d_str)
@@ -1586,9 +1584,16 @@ pub async fn cmd_login(
         None
     };
 
-    let device_id = get_or_create_device_id(&data_dir, explicit_dev_id)?;
+    let parsed_account_id = if let Some(account) = account_id_opt {
+        Some(
+            Uuid::parse_str(&account)
+                .map_err(|_| CliError::AuthError("Invalid account ID".into()))?,
+        )
+    } else {
+        None
+    };
 
-    let token = zk_protocol::auth::AuthToken::new(match token_opt {
+    let token_raw = match token_opt {
         Some(token) => token,
         None if io::stdin().is_terminal() => {
             rpassword::prompt_password("Existing session token to authorize this device: ")
@@ -1599,28 +1604,17 @@ pub async fn cmd_login(
                 "An existing session token is required; use --token or interactive login".into(),
             ))
         }
-    });
-    let verified = api_verify_token(&server_url, token.expose_secret(), device_id).await?;
-    if let Some(account) = account_id_opt {
-        let account = Uuid::parse_str(&account)
-            .map_err(|_| CliError::AuthError("Invalid account ID".into()))?;
-        if account != verified.account_id {
-            return Err(CliError::AuthError(
-                "Session does not authorize the requested account".into(),
-            ));
-        }
-    }
-    let auth_session = api_device_authorize(
+    };
+
+    let auth_session = crate::client::auth::authorize_terminal_device(
+        custom_data_dir,
         &server_url,
-        token.expose_secret(),
-        verified.account_id,
-        device_id,
+        &token_raw,
+        parsed_account_id,
         device_name_opt,
+        explicit_dev_id,
     )
     .await?;
-
-    let auth_path = auth_session_file(&data_dir);
-    save_auth_session(&auth_path, &auth_session)?;
 
     println!("Successfully authenticated!");
     println!("Server:     {}", auth_session.server_url);
@@ -1646,10 +1640,9 @@ pub async fn cmd_logout(custom_data_dir: Option<&Path>) -> Result<(), CliError> 
 
     if let Ok(session) = load_auth_session(&auth_path) {
         println!("Revoking session with {}...", session.server_url);
-        let _ = api_revoke_session(&session).await;
     }
 
-    clear_auth_session(&auth_path)?;
+    crate::client::auth::sign_out(custom_data_dir).await?;
     println!("Logged out successfully. Local credentials cleared.");
     Ok(())
 }
@@ -1668,56 +1661,163 @@ pub async fn cmd_whoami(custom_data_dir: Option<&Path>, json_output: bool) -> Re
         return Ok(());
     }
 
-    let session = load_auth_session(&auth_path)?;
-
-    // Verify active status with server
-    let status_res = api_query_status(&session).await;
+    let auth_state = crate::client::auth::check_auth_state_online(custom_data_dir).await?;
 
     if json_output {
-        match status_res {
-            Ok(status) => {
+        match auth_state {
+            crate::client::auth::ClientAuthState::Authenticated {
+                server_url,
+                account_id,
+                device_id,
+                session_id,
+                ..
+            } => {
                 println!(
                     "{}",
                     serde_json::json!({
                         "authenticated": true,
-                        "server_url": session.server_url,
-                        "account_id": status.account_id,
-                        "device_id": status.device_id.unwrap_or(session.device_id),
-                        "session_id": status.session_id.or(session.session_id),
-                        "status": status.status,
+                        "server_url": server_url,
+                        "account_id": account_id,
+                        "device_id": device_id,
+                        "session_id": session_id,
+                        "status": "active",
                     })
                 );
             }
-            Err(e) => {
+            crate::client::auth::ClientAuthState::Offline {
+                server_url,
+                account_id,
+                device_id,
+                session_id: _,
+                error,
+            } => {
                 println!(
                     "{}",
                     serde_json::json!({
                         "authenticated": false,
-                        "server_url": session.server_url,
-                        "account_id": session.account_id,
-                        "device_id": session.device_id,
-                        "error": e.to_string(),
+                        "server_url": server_url,
+                        "account_id": account_id,
+                        "device_id": device_id,
+                        "error": error,
                     })
                 );
             }
+            crate::client::auth::ClientAuthState::Revoked {
+                server_url,
+                account_id,
+                device_id,
+                ..
+            } => {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "authenticated": false,
+                        "server_url": server_url,
+                        "account_id": account_id,
+                        "device_id": device_id,
+                        "error": "SessionRevoked",
+                    })
+                );
+            }
+            crate::client::auth::ClientAuthState::Expired {
+                server_url,
+                account_id,
+                device_id,
+                ..
+            } => {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "authenticated": false,
+                        "server_url": server_url,
+                        "account_id": account_id,
+                        "device_id": device_id,
+                        "error": "SessionExpired",
+                    })
+                );
+            }
+            crate::client::auth::ClientAuthState::Error { server_url, error } => {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "authenticated": false,
+                        "server_url": server_url,
+                        "error": error,
+                    })
+                );
+            }
+            crate::client::auth::ClientAuthState::LocalOnly => {
+                println!("{}", serde_json::json!({ "authenticated": false }));
+            }
         }
     } else {
-        println!("Server:     {}", session.server_url);
-        println!("Account ID: {}", session.account_id);
-        println!("Device ID:  {}", session.device_id);
-        if let Some(sid) = session.session_id {
-            println!("Session ID: {}", sid);
-        }
-        match status_res {
-            Ok(status) => {
-                println!("Status:     Active ({})", status.status);
+        match auth_state {
+            crate::client::auth::ClientAuthState::Authenticated {
+                server_url,
+                account_id,
+                device_id,
+                session_id,
+                ..
+            } => {
+                println!("Server:     {}", server_url);
+                println!("Account ID: {}", account_id);
+                println!("Device ID:  {}", device_id);
+                if let Some(sid) = session_id {
+                    println!("Session ID: {}", sid);
+                }
+                println!("Status:     Active (active)");
             }
-            Err(CliError::SessionRevoked) => {
+            crate::client::auth::ClientAuthState::Revoked {
+                server_url,
+                account_id,
+                device_id,
+                session_id,
+            } => {
+                println!("Server:     {}", server_url);
+                println!("Account ID: {}", account_id);
+                println!("Device ID:  {}", device_id);
+                if let Some(sid) = session_id {
+                    println!("Session ID: {}", sid);
+                }
                 println!("Status:     REVOKED (session or device revoked on server)");
                 println!("Run 'zk-note login' to re-authenticate.");
             }
-            Err(e) => {
-                println!("Status:     UNREACHABLE / ERROR ({e})");
+            crate::client::auth::ClientAuthState::Expired {
+                server_url,
+                account_id,
+                device_id,
+                session_id,
+            } => {
+                println!("Server:     {}", server_url);
+                println!("Account ID: {}", account_id);
+                println!("Device ID:  {}", device_id);
+                if let Some(sid) = session_id {
+                    println!("Session ID: {}", sid);
+                }
+                println!("Status:     EXPIRED (session token expired)");
+                println!("Run 'zk-note login' to re-authenticate.");
+            }
+            crate::client::auth::ClientAuthState::Offline {
+                server_url,
+                account_id,
+                device_id,
+                session_id,
+                error,
+            } => {
+                println!("Server:     {}", server_url);
+                println!("Account ID: {}", account_id);
+                println!("Device ID:  {}", device_id);
+                if let Some(sid) = session_id {
+                    println!("Session ID: {}", sid);
+                }
+                println!("Status:     UNREACHABLE / ERROR ({error})");
+            }
+            crate::client::auth::ClientAuthState::Error { server_url, error } => {
+                println!("Server:     {}", server_url);
+                println!("Status:     UNREACHABLE / ERROR ({error})");
+            }
+            crate::client::auth::ClientAuthState::LocalOnly => {
+                println!("Not logged in. Run 'zk-note login' to authenticate.");
             }
         }
     }

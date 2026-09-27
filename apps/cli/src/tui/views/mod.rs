@@ -1,5 +1,6 @@
 //! Ratatui UI view components for each screen and pane (ZK-101).
 
+pub mod account;
 pub mod conflict;
 pub mod delete_confirm;
 pub mod help;

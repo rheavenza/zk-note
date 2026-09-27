@@ -1,6 +1,7 @@
 //! State machine and core state for the interactive terminal UI (ZK-101).
 
 use super::action::Action;
+use crate::client::auth::{get_local_auth_state, ClientAuthState};
 use crate::client::conflicts::{
     get_conflict_detail, list_conflicts, resolve_conflict_item, ClientConflictDetail,
     ClientConflictSummary,
@@ -35,6 +36,7 @@ pub enum AppMode {
     InlineEdit,
     DeleteConfirm,
     Conflict,
+    Account,
     Help,
     Locked,
     TerminalTooSmall,
@@ -53,6 +55,37 @@ pub enum EditField {
     Title,
     Tags,
     Body,
+}
+
+/// Field or interactive control in the Server Connection / Account modal (ZK-101 Addendum).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountField {
+    ServerUrl,
+    Token,
+    ConnectButton,
+    SignOutButton,
+}
+
+/// Pending asynchronous authentication action dispatched to the TUI event loop.
+#[derive(Clone, PartialEq, Eq)]
+pub enum AccountPendingAction {
+    Connect { server_url: String, token: String },
+    SignOut,
+    RefreshStatus,
+}
+
+impl fmt::Debug for AccountPendingAction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AccountPendingAction::Connect { server_url, .. } => f
+                .debug_struct("Connect")
+                .field("server_url", server_url)
+                .field("token", &"[REDACTED]")
+                .finish(),
+            AccountPendingAction::SignOut => write!(f, "AccountPendingAction::SignOut"),
+            AccountPendingAction::RefreshStatus => write!(f, "AccountPendingAction::RefreshStatus"),
+        }
+    }
 }
 
 /// Main application state for the interactive terminal UI.
@@ -88,6 +121,13 @@ pub struct App {
     pub passphrase_input: String,
     pub unlock_error: Option<String>,
 
+    // Server & Account Authentication state (ZK-101 Addendum)
+    pub account_state: ClientAuthState,
+    pub account_server_input: String,
+    pub account_token_input: String,
+    pub account_focus_field: AccountField,
+    pub account_pending_action: Option<AccountPendingAction>,
+
     // Status & Feedback
     pub sync_status: SyncStatus,
     pub status_message: Option<String>,
@@ -108,6 +148,10 @@ impl fmt::Debug for App {
             .field("notes_count", &self.notes.len())
             .field("selected_index", &self.selected_index)
             .field("sync_status", &self.sync_status)
+            .field("account_state", &self.account_state)
+            .field("account_server_input", &self.account_server_input)
+            .field("account_token_input", &"[REDACTED]")
+            .field("account_focus_field", &self.account_focus_field)
             .field(
                 "terminal_size",
                 &(self.terminal_width, self.terminal_height),
@@ -125,6 +169,11 @@ impl App {
     /// Constructs and initializes a new [`App`] state machine.
     pub fn new(data_dir: Option<&Path>, width: u16, height: u16) -> Self {
         let initial_sync = get_initial_sync_status(data_dir);
+        let initial_auth = get_local_auth_state(data_dir).unwrap_or(ClientAuthState::LocalOnly);
+        let default_server = initial_auth
+            .server_url()
+            .unwrap_or("http://127.0.0.1:8080")
+            .to_string();
         let vault_status = get_vault_status(data_dir).unwrap_or(VaultState::Locked);
 
         let (initial_mode, vault_key) = match vault_status {
@@ -169,6 +218,11 @@ impl App {
             edit_field: EditField::Title,
             passphrase_input: String::new(),
             unlock_error: None,
+            account_state: initial_auth,
+            account_server_input: default_server,
+            account_token_input: String::new(),
+            account_focus_field: AccountField::ServerUrl,
+            account_pending_action: None,
             sync_status: initial_sync,
             status_message: None,
             error_message: None,
@@ -310,6 +364,9 @@ impl App {
         self.edit_body.zeroize();
         self.edit_body.clear();
 
+        self.account_token_input.zeroize();
+        self.account_token_input.clear();
+
         self.mode = AppMode::Locked;
         self.previous_mode = None;
 
@@ -387,10 +444,15 @@ impl App {
             Action::CloseOverlay => {
                 if self.mode == AppMode::Help || self.mode == AppMode::Conflict {
                     self.mode = self.previous_mode.take().unwrap_or(AppMode::Normal);
+                } else if self.mode == AppMode::Account {
+                    self.account_token_input.zeroize();
+                    self.account_token_input.clear();
+                    self.mode = self.previous_mode.take().unwrap_or(AppMode::Normal);
                 } else if self.mode == AppMode::DeleteConfirm {
                     self.mode = AppMode::Normal;
                 }
             }
+
             Action::LockVault => {
                 let _ = self.lock_and_clear();
             }
@@ -703,6 +765,96 @@ impl App {
                 self.status_message = Some("Sync triggered...".to_string());
                 self.sync_status = SyncStatus::Syncing;
             }
+            Action::OpenAccount => {
+                if self.mode != AppMode::TerminalTooSmall {
+                    self.previous_mode = Some(self.mode);
+                    self.mode = AppMode::Account;
+                    self.account_focus_field = if self.account_server_input.is_empty() {
+                        AccountField::ServerUrl
+                    } else {
+                        AccountField::Token
+                    };
+                }
+            }
+            Action::CloseAccount => {
+                if self.mode == AppMode::Account {
+                    self.account_token_input.zeroize();
+                    self.account_token_input.clear();
+                    self.mode = self.previous_mode.take().unwrap_or(AppMode::Normal);
+                }
+            }
+            Action::AccountServerChar(c) => {
+                if self.mode == AppMode::Account {
+                    self.account_server_input.push(c);
+                }
+            }
+            Action::AccountServerBackspace => {
+                if self.mode == AppMode::Account {
+                    self.account_server_input.pop();
+                }
+            }
+            Action::AccountTokenChar(c) => {
+                if self.mode == AppMode::Account {
+                    self.account_token_input.push(c);
+                }
+            }
+            Action::AccountTokenBackspace => {
+                if self.mode == AppMode::Account {
+                    self.account_token_input.pop();
+                }
+            }
+            Action::AccountNextField => {
+                if self.mode == AppMode::Account {
+                    self.account_focus_field = match self.account_focus_field {
+                        AccountField::ServerUrl => AccountField::Token,
+                        AccountField::Token => AccountField::ConnectButton,
+                        AccountField::ConnectButton => AccountField::SignOutButton,
+                        AccountField::SignOutButton => AccountField::ServerUrl,
+                    };
+                }
+            }
+            Action::AccountPrevField => {
+                if self.mode == AppMode::Account {
+                    self.account_focus_field = match self.account_focus_field {
+                        AccountField::ServerUrl => AccountField::SignOutButton,
+                        AccountField::Token => AccountField::ServerUrl,
+                        AccountField::ConnectButton => AccountField::Token,
+                        AccountField::SignOutButton => AccountField::ConnectButton,
+                    };
+                }
+            }
+            Action::AccountSubmit => {
+                if self.mode == AppMode::Account {
+                    let url = self.account_server_input.trim().to_string();
+                    let tok = self.account_token_input.trim().to_string();
+                    if tok.is_empty() {
+                        self.error_message = Some("Session token cannot be empty.".to_string());
+                    } else {
+                        self.account_pending_action = Some(AccountPendingAction::Connect {
+                            server_url: url,
+                            token: tok,
+                        });
+                        self.account_token_input.zeroize();
+                        self.account_token_input.clear();
+                        self.status_message = Some("Authorizing device with server...".to_string());
+                        self.error_message = None;
+                    }
+                }
+            }
+            Action::AccountSignOut => {
+                if self.mode == AppMode::Account {
+                    self.account_pending_action = Some(AccountPendingAction::SignOut);
+                    self.status_message = Some("Revoking session with server...".to_string());
+                    self.error_message = None;
+                }
+            }
+            Action::AccountRefresh => {
+                if self.mode == AppMode::Account {
+                    self.account_pending_action = Some(AccountPendingAction::RefreshStatus);
+                    self.status_message = Some("Checking server status...".to_string());
+                    self.error_message = None;
+                }
+            }
         }
     }
 
@@ -895,6 +1047,47 @@ impl App {
                 }
                 _ => {}
             },
+            AppMode::Account => match key.code {
+                KeyCode::Esc => {
+                    self.update(Action::CloseAccount);
+                }
+                KeyCode::Tab | KeyCode::Down => {
+                    self.update(Action::AccountNextField);
+                }
+                KeyCode::BackTab | KeyCode::Up => {
+                    self.update(Action::AccountPrevField);
+                }
+                KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.update(Action::AccountSignOut);
+                }
+                KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.update(Action::AccountRefresh);
+                }
+                KeyCode::Enter => match self.account_focus_field {
+                    AccountField::ServerUrl => self.update(Action::AccountNextField),
+                    AccountField::Token | AccountField::ConnectButton => {
+                        self.update(Action::AccountSubmit)
+                    }
+                    AccountField::SignOutButton => self.update(Action::AccountSignOut),
+                },
+                KeyCode::Backspace => match self.account_focus_field {
+                    AccountField::ServerUrl => self.update(Action::AccountServerBackspace),
+                    AccountField::Token => self.update(Action::AccountTokenBackspace),
+                    _ => {}
+                },
+                KeyCode::Char(c) => match self.account_focus_field {
+                    AccountField::ServerUrl => self.update(Action::AccountServerChar(c)),
+                    AccountField::Token => self.update(Action::AccountTokenChar(c)),
+                    AccountField::ConnectButton if c == 'c' || c == ' ' => {
+                        self.update(Action::AccountSubmit)
+                    }
+                    AccountField::SignOutButton if c == 'x' || c == ' ' => {
+                        self.update(Action::AccountSignOut)
+                    }
+                    _ => {}
+                },
+                _ => {}
+            },
             AppMode::Search => match key.code {
                 KeyCode::Esc => {
                     self.update(Action::ExitSearch);
@@ -954,6 +1147,9 @@ impl App {
                 KeyCode::Char('l') => {
                     self.update(Action::LockVault);
                 }
+                KeyCode::Char('a') => {
+                    self.update(Action::OpenAccount);
+                }
                 KeyCode::Char('/') => {
                     self.update(Action::EnterSearch);
                 }
@@ -1011,5 +1207,16 @@ impl App {
                 _ => {}
             },
         }
+    }
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        self.passphrase_input.zeroize();
+        self.account_token_input.zeroize();
+        self.edit_title.zeroize();
+        self.edit_tags.zeroize();
+        self.edit_body.zeroize();
+        self.search_query.zeroize();
     }
 }

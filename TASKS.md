@@ -67,6 +67,15 @@ Implementation notes:
   3. AC-05 full-text search: `perform_incremental_search` delegates to shared `search_notes` over `InMemorySearchIndex` to match title, tag, and body content without disk persistence or network leakage.
   4. Service extraction: unifies note, conflict, and vault models across CLI and TUI. All CLI commands, options, and JSON outputs preserved.
   5. Terminal restoration: `TerminalGuard` uses granular tracking of raw mode, alternate screen, and cursor visibility with drop-safe retry and ordered cleanup.
+- Addendum implementation:
+  - Extracted shared non-printing client authentication service `apps/cli/src/client/auth.rs` reused across CLI `commands.rs` (`cmd_login`, `cmd_logout`, `cmd_whoami`) and TUI without shelling out.
+  - Implemented full-screen modal server connection & native device authentication dialog (`AppMode::Account`, accessible via `a` shortcut or help view) with server URL input, masked authorization token entry (`*`), connection/authorization execution, live status checking, and sign-out.
+  - Strict server URL validation: requires HTTPS for remote endpoints, allows HTTP strictly for loopback (`localhost`, `127.0.0.1`, `[::1]`), and strictly rejects paths, query strings, fragments, and credentials. Failed authorization preserves prior valid session.
+  - Secret hygiene (`SEC-003`): masked input rendering, token inputs zeroized on cancel/lock/exit/submit/drop, token redacted in `Debug` and error representations.
+  - Truthful sign-out revocation: invokes server session revocation (`api_revoke_session`) and preserves local credentials on network/offline failure so sign-out can be retried without false success.
+  - Truthful status bar badges: added dynamic account badge (`[Local-only]`, `[Auth: <short-id>]`, `[Server: Offline]`, `[Server: Expired]`, `[Server: Revoked]`, `[Server: Error]`).
+  - Preserved independent guarded sync semantics (`s`) and all existing CLI command flags, schemas, and exit behaviors.
+
 
 ---
 
