@@ -8,7 +8,7 @@
  */
 
 import React, { createContext, useContext, useState, useCallback, useEffect, useRef } from "react";
-import { isSessionCurrent, normalizeServerOrigin, readServerOrigin, readSession, writeServerOrigin, writeSession } from "../auth/session.js";
+import { isSessionCurrent, normalizeServerOrigin, readServerOrigin, readSessionState, revokeBeforeSignOut, writeServerOrigin, writeSession } from "../auth/session.js";
 import {
   WebAuthnSession,
   DeviceInfo,
@@ -25,6 +25,7 @@ export interface AuthContextType {
   isAuthenticated: boolean;
   isLoading: boolean;
   isOffline: boolean;
+  isExpired: boolean;
   serverOrigin: string;
   setServerOrigin: (serverUrl: string) => void;
   error: string | null;
@@ -70,10 +71,11 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({
   });
   const currentOrigin = useRef(serverOrigin);
   currentOrigin.current = serverOrigin;
-  const [session, setSession] = useState<WebAuthnSession | null>(
-    () => initialSession !== undefined ? initialSession :
-      (typeof window !== "undefined" ? readSession(window.sessionStorage, serverOrigin) : null)
-  );
+  const [initialAuth] = useState(() => initialSession !== undefined
+    ? { session: initialSession && isSessionCurrent(initialSession) ? initialSession : null, expired: Boolean(initialSession && !isSessionCurrent(initialSession)) }
+    : typeof window !== "undefined" ? readSessionState(window.sessionStorage, serverOrigin) : { session: null, expired: false });
+  const [session, setSession] = useState<WebAuthnSession | null>(initialAuth.session);
+  const [isExpired, setIsExpired] = useState(initialAuth.expired);
   const [sessionOrigin, setSessionOrigin] = useState(serverOrigin);
   const activeSession = sessionOrigin === serverOrigin && session && isSessionCurrent(session) ? session : null;
   const [isOffline, setIsOffline] = useState(() => typeof navigator !== "undefined" && navigator.onLine === false);
@@ -88,6 +90,7 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({
     if (origin === serverOrigin) return;
     currentOrigin.current = origin;
     setSession(null);
+    setIsExpired(false);
     persistSession(serverOrigin, null);
     setError(null);
     updateServerOrigin(origin);
@@ -105,6 +108,7 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({
   useEffect(() => {
     if (sessionOrigin === serverOrigin) return;
     setSession(null);
+    setIsExpired(false);
     setSessionOrigin(serverOrigin);
     persistSession(serverOrigin, null);
     setError(null);
@@ -120,8 +124,8 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({
   useEffect(() => {
     if (!session?.expiresAt || sessionOrigin !== serverOrigin) return;
     const delay = Date.parse(session.expiresAt) - Date.now();
-    if (delay <= 0) { setSession(null); persistSession(serverOrigin, null); return; }
-    const timer = window.setTimeout(() => { setSession(null); persistSession(serverOrigin, null); }, delay);
+    if (delay <= 0) { setSession(null); setIsExpired(true); persistSession(serverOrigin, null); return; }
+    const timer = window.setTimeout(() => { setSession(null); setIsExpired(true); persistSession(serverOrigin, null); }, delay);
     return () => window.clearTimeout(timer);
   }, [session, sessionOrigin, serverOrigin]);
 
@@ -141,6 +145,7 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({
         const newSession = await registerPasskey(serverOrigin, { ...options, token: activeSession?.token });
         if (currentOrigin.current !== serverOrigin) throw new Error("Server origin changed during registration. Sign in again.");
         setSession(newSession);
+        setIsExpired(false);
         setSessionOrigin(serverOrigin);
         persistSession(serverOrigin, newSession);
         return newSession;
@@ -164,6 +169,7 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({
         const newSession = await signInWithPasskey(serverOrigin, options);
         if (currentOrigin.current !== serverOrigin) throw new Error("Server origin changed during sign-in. Sign in again.");
         setSession(newSession);
+        setIsExpired(false);
         setSessionOrigin(serverOrigin);
         persistSession(serverOrigin, newSession);
         return newSession;
@@ -182,12 +188,14 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({
     setIsLoading(true);
     setError(null);
     try {
-      if (activeSession?.token && !isOffline) {
-        await revokeSession(serverOrigin, activeSession.token, activeSession.sessionId).catch(() => {});
-      }
-    } finally {
+      await revokeBeforeSignOut(activeSession, isOffline, current => revokeSession(serverOrigin, current.token, current.sessionId));
       setSession(null);
+      setIsExpired(false);
       persistSession(serverOrigin, null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not revoke the server session. Please retry sign-out.");
+      throw err;
+    } finally {
       setIsLoading(false);
     }
   }, [serverOrigin, activeSession, isOffline]);
@@ -233,6 +241,7 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({
     isAuthenticated: Boolean(activeSession),
     isLoading,
     isOffline,
+    isExpired,
     serverOrigin,
     setServerOrigin,
     error,
@@ -255,6 +264,7 @@ export function useAuth(): AuthContextType {
       isAuthenticated: false,
       isLoading: false,
       isOffline: true,
+      isExpired: false,
       serverOrigin: "",
       setServerOrigin: () => {},
       error: null,

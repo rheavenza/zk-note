@@ -13,7 +13,8 @@ export const AuthControls: React.FC = () => {
   useEffect(() => { setServerInput(auth.serverOrigin); }, [auth.serverOrigin]);
 
   const state = auth.isOffline ? "Offline — local vault available" :
-    auth.isAuthenticated ? `Signed in (${auth.session?.accountId})` : "Local vault only — not signed in";
+    auth.isAuthenticated ? `Signed in (${auth.session?.accountId})` :
+      auth.isExpired ? "Session expired — sign in again" : "Local vault only — not signed in";
 
   return <div style={{ position: "relative", fontSize: 12 }}>
     <button type="button" onClick={() => setOpen(!open)} aria-label="Account and server authentication" aria-expanded={open}>
@@ -39,7 +40,7 @@ export const AuthControls: React.FC = () => {
         setServerInput(pageOrigin);
         setServerError(null);
       }}>Use this page’s server</button>}
-      {auth.isAuthenticated ? <button type="button" disabled={auth.isLoading} onClick={() => void auth.logout()}>Sign out</button> : <>
+      {auth.isAuthenticated ? <button type="button" disabled={auth.isLoading} onClick={() => void auth.logout().catch(() => {})}>Sign out</button> : <>
         <label>Account name <input value={username} onChange={event => setUsername(event.target.value)} autoComplete="username" /></label>
         <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
           <button type="button" disabled={auth.isLoading || auth.isOffline || !sameOrigin || !username.trim()} onClick={() => void auth.register({ username: username.trim(), displayName: username.trim() }).catch(() => {})}>Create account</button>

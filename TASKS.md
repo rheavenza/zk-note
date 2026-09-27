@@ -57,7 +57,7 @@ verify one coherent step. The deployed server's private address and hostname
 belong in operator configuration, not public ticket text.
 
 ## ZK-104 — Web authentication and compatible origin
-State: IN_REVIEW
+State: MERGED (live passkey verification pending before DONE)
 Priority: P1
 Dependencies: existing auth API and browser vault lifecycle
 Ticket: [docs/tickets/ZK-104.md](docs/tickets/ZK-104.md)
@@ -69,6 +69,8 @@ offline status, and local-only sync feedback are implemented on the ZK-104
 branch. Live RP-compatible browser smoke remains pending review.
 The server origin is editable in the browser. Same-origin Caddy hosting is
 deployed and passes public web/API checks; passkey ceremony verification is pending.
+Expired sessions now show an explicit state. Failed or offline server revocation
+keeps the session available for a sign-out retry. Web checks pass at merge.
 
 ## ZK-105 — Safely link and restore encrypted vault bootstrap
 State: BACKLOG

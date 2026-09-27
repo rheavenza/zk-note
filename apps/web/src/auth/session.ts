@@ -33,22 +33,38 @@ export function isSessionCurrent(session: WebAuthnSession, now = Date.now()): bo
     (!session.expiresAt || (Number.isFinite(Date.parse(session.expiresAt)) && Date.parse(session.expiresAt) > now));
 }
 
-export function readSession(storage: Pick<Storage, "getItem" | "removeItem">, origin: string): WebAuthnSession | null {
+export function readSessionState(storage: Pick<Storage, "getItem" | "removeItem">, origin: string): { session: WebAuthnSession | null; expired: boolean } {
   try {
     const raw = storage.getItem(SESSION_STORAGE_KEY);
-    if (!raw) return null;
+    if (!raw) return { session: null, expired: false };
     const saved: unknown = JSON.parse(raw);
-    if (!saved || typeof saved !== "object") return null;
+    if (!saved || typeof saved !== "object") return { session: null, expired: false };
     const record = saved as { origin?: unknown; session?: WebAuthnSession };
-    if (record.origin === origin && record.session && isSessionCurrent(record.session)) return record.session;
+    if (record.origin === origin && record.session && isSessionCurrent(record.session)) return { session: record.session, expired: false };
     storage.removeItem(SESSION_STORAGE_KEY);
+    const expiresAt = record.session?.expiresAt;
+    return { session: null, expired: record.origin === origin && typeof expiresAt === "string" && Number.isFinite(Date.parse(expiresAt)) && Date.parse(expiresAt) <= Date.now() };
   } catch { /* Invalid or inaccessible session storage is treated as signed out. */ }
-  return null;
+  return { session: null, expired: false };
+}
+
+export function readSession(storage: Pick<Storage, "getItem" | "removeItem">, origin: string): WebAuthnSession | null {
+  return readSessionState(storage, origin).session;
 }
 
 export function writeSession(storage: Pick<Storage, "setItem" | "removeItem">, origin: string, session: WebAuthnSession | null): void {
   if (session) storage.setItem(SESSION_STORAGE_KEY, JSON.stringify({ origin, session }));
   else storage.removeItem(SESSION_STORAGE_KEY);
+}
+
+export async function revokeBeforeSignOut(
+  session: WebAuthnSession | null,
+  isOffline: boolean,
+  revoke: (session: WebAuthnSession) => Promise<unknown>,
+): Promise<void> {
+  if (!session) return;
+  if (isOffline) throw new Error("Connect to the server to revoke this session before signing out.");
+  await revoke(session);
 }
 
 export function assertRpCompatible(rpId: string, browserUrl: string): void {

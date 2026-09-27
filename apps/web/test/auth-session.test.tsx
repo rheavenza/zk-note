@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { renderToString } from "react-dom/server";
-import { assertRpCompatible, isSessionCurrent, normalizeServerOrigin, readServerOrigin, readSession, SERVER_ORIGIN_STORAGE_KEY, SESSION_STORAGE_KEY, writeServerOrigin, writeSession } from "../src/auth/session.js";
+import { assertRpCompatible, isSessionCurrent, normalizeServerOrigin, readServerOrigin, readSession, readSessionState, revokeBeforeSignOut, SERVER_ORIGIN_STORAGE_KEY, SESSION_STORAGE_KEY, writeServerOrigin, writeSession } from "../src/auth/session.js";
 import { registerPasskey, signInWithPasskey, type WebAuthnSession } from "../src/auth/webauthn.js";
 import { AuthProvider } from "../src/context/AuthContext.js";
 import { AuthControls } from "../src/components/AuthControls.js";
@@ -29,6 +29,25 @@ test("expired and malformed sessions fail closed", () => {
   assert.equal(isSessionCurrent({ ...session, expiresAt: "invalid" }), false);
   const storage = { getItem: () => "{invalid", removeItem: () => {} };
   assert.equal(readSession(storage, "https://one.example"), null);
+  const values = new Map<string, string>();
+  const saved = {
+    getItem: (key: string) => values.get(key) ?? null,
+    setItem: (key: string, value: string) => { values.set(key, value); },
+    removeItem: (key: string) => { values.delete(key); },
+  };
+  writeSession(saved, "https://one.example", { ...session, expiresAt: "2020-01-01T00:00:00Z" });
+  assert.deepEqual(readSessionState(saved, "https://one.example"), { session: null, expired: true });
+  assert.equal(values.has(SESSION_STORAGE_KEY), false);
+});
+
+test("sign-out requires successful server revocation while a session is active", async () => {
+  let calls = 0;
+  await assert.rejects(revokeBeforeSignOut(session, true, async () => { calls++; }), /Connect to the server/);
+  assert.equal(calls, 0);
+  await assert.rejects(revokeBeforeSignOut(session, false, async () => { calls++; throw new Error("network failed"); }), /network failed/);
+  assert.equal(calls, 1);
+  await revokeBeforeSignOut(session, false, async () => { calls++; });
+  assert.equal(calls, 2);
 });
 
 test("server URL accepts only a plain origin", () => {
@@ -67,6 +86,8 @@ test("auth controls expose local-only and authenticated states without vault dat
   const signedIn = renderToString(<AuthProvider serverUrl="https://notes.example.com" initialSession={session}><AuthControls /></AuthProvider>);
   assert.match(signedIn, /Signed in/);
   assert.doesNotMatch(signedIn, /secret-token/);
+  const expired = renderToString(<AuthProvider serverUrl="https://notes.example.com" initialSession={{ ...session, expiresAt: "2020-01-01T00:00:00Z" }}><AuthControls /></AuthProvider>);
+  assert.match(expired, /Session expired/);
 });
 
 test("registration and login reject an incompatible RP before invoking credentials", async () => {
