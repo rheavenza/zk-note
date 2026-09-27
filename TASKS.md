@@ -47,6 +47,53 @@ Every task must satisfy:
 
 ---
 
+# Web vault synchronization follow-up
+
+Source: https://github.com/rheavenza/zk-note/issues/3
+
+The browser vault currently works locally, but the default app does not attach a
+server sync adapter. These implementation tickets are ordered so each review can
+verify one coherent step. The deployed server's private address and hostname
+belong in operator configuration, not public ticket text.
+
+## ZK-104 — Web authentication and compatible origin
+State: READY
+Priority: P1
+Dependencies: existing auth API and browser vault lifecycle
+Ticket: [docs/tickets/ZK-104.md](docs/tickets/ZK-104.md)
+Acceptance: browser registration/sign-in/session handling; RP-compatible origin;
+offline/local-only status remains honest.
+Verification: web gates and real browser WebAuthn smoke on compatible HTTPS.
+
+## ZK-105 — Safely link and restore encrypted vault bootstrap
+State: BACKLOG
+Priority: P1
+Dependencies: ZK-104
+Ticket: [docs/tickets/ZK-105.md](docs/tickets/ZK-105.md)
+Acceptance: encrypted bootstrap upload and second-device restore; mismatch,
+wrong account, and interrupted retry never overwrite a vault.
+Verification: web gates, protocol tests, and redacted two-browser evidence.
+
+## ZK-106 — Durable browser ciphertext synchronization
+State: BACKLOG
+Priority: P1
+Dependencies: ZK-105
+Ticket: [docs/tickets/ZK-106.md](docs/tickets/ZK-106.md)
+Acceptance: authenticated push/pull, stable mutation IDs, CAS conflicts,
+tombstones, durable cursor, locked ciphertext pull, and account isolation.
+Verification: web gates, Rust sync/server tests, crash/retry and conflict tests.
+
+## ZK-107 — Web sync flow and deployment acceptance
+State: BACKLOG
+Priority: P1
+Dependencies: ZK-104 through ZK-106
+Ticket: [docs/tickets/ZK-107.md](docs/tickets/ZK-107.md)
+Acceptance: truthful sync UI and complete two-browser link, restore, edit,
+delete, offline retry, and conflict flows.
+Verification: web/Rust gates and redacted browser-level end-to-end evidence.
+
+---
+
 # M0 — Repository and architecture foundation
 
 ## ZK-100 — Parallel Cloudflare deployment backend
