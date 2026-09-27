@@ -8,7 +8,7 @@
  */
 
 import React, { createContext, useContext, useState, useCallback, useEffect, useRef } from "react";
-import { isSessionCurrent, normalizeServerOrigin, readSession, writeSession } from "../auth/session.js";
+import { isSessionCurrent, normalizeServerOrigin, readServerOrigin, readSession, writeServerOrigin, writeSession } from "../auth/session.js";
 import {
   WebAuthnSession,
   DeviceInfo,
@@ -26,6 +26,7 @@ export interface AuthContextType {
   isLoading: boolean;
   isOffline: boolean;
   serverOrigin: string;
+  setServerOrigin: (serverUrl: string) => void;
   error: string | null;
   register: (options?: {
     username?: string;
@@ -60,10 +61,13 @@ export interface AuthProviderProps {
 
 export const AuthProvider: React.FC<AuthProviderProps> = ({
   children,
-  serverUrl = typeof window !== "undefined" ? window.location.origin : "http://localhost:8080",
+  serverUrl,
   initialSession,
 }) => {
-  const serverOrigin = normalizeServerOrigin(serverUrl);
+  const [serverOrigin, updateServerOrigin] = useState(() => {
+    const fallback = serverUrl ?? (typeof window !== "undefined" ? window.location.origin : "http://localhost:8080");
+    return typeof window !== "undefined" && !serverUrl ? readServerOrigin(window.localStorage, fallback) : normalizeServerOrigin(fallback);
+  });
   const currentOrigin = useRef(serverOrigin);
   currentOrigin.current = serverOrigin;
   const [session, setSession] = useState<WebAuthnSession | null>(
@@ -75,6 +79,28 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({
   const [isOffline, setIsOffline] = useState(() => typeof navigator !== "undefined" && navigator.onLine === false);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  const setServerOrigin = useCallback((input: string): void => {
+    const origin = normalizeServerOrigin(input.trim());
+    if (typeof window !== "undefined" && window.location.protocol === "https:" && origin.startsWith("http:")) {
+      throw new Error("An HTTPS web app requires an HTTPS server address.");
+    }
+    if (origin === serverOrigin) return;
+    currentOrigin.current = origin;
+    setSession(null);
+    persistSession(serverOrigin, null);
+    setError(null);
+    updateServerOrigin(origin);
+    try {
+      if (typeof window !== "undefined") writeServerOrigin(window.localStorage, origin);
+    } catch { /* The selected origin remains active for this tab. */ }
+  }, [serverOrigin]);
+
+  useEffect(() => {
+    if (!serverUrl) return;
+    const origin = normalizeServerOrigin(serverUrl);
+    if (origin !== serverOrigin) setServerOrigin(origin);
+  }, [serverUrl]);
 
   useEffect(() => {
     if (sessionOrigin === serverOrigin) return;
@@ -208,6 +234,7 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({
     isLoading,
     isOffline,
     serverOrigin,
+    setServerOrigin,
     error,
     register,
     signIn,
@@ -229,6 +256,7 @@ export function useAuth(): AuthContextType {
       isLoading: false,
       isOffline: true,
       serverOrigin: "",
+      setServerOrigin: () => {},
       error: null,
       register: async () => {
         throw new Error("useAuth must be used within an AuthProvider");

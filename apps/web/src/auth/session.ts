@@ -1,14 +1,31 @@
 import type { WebAuthnSession } from "./webauthn.js";
 
 export const SESSION_STORAGE_KEY = "zk_auth_session_v2";
+export const SERVER_ORIGIN_STORAGE_KEY = "zk_server_origin";
 
 export function normalizeServerOrigin(serverUrl: string): string {
-  const url = new URL(serverUrl);
+  const input = serverUrl.trim();
+  const bareHost = /^[a-zA-Z0-9.-]+(?::\d+)?$/.test(input);
+  const localHost = /^(localhost|\d{1,3}(?:\.\d{1,3}){3})(?::\d+)?$/i.test(input);
+  const url = new URL(bareHost ? `${localHost ? "http" : "https"}://${input}` : input);
   if (!(["https:", "http:"].includes(url.protocol))) throw new Error("Unsupported server URL");
   if (url.username || url.password || url.search || url.hash || url.pathname !== "/") {
     throw new Error("Server URL must be an origin without credentials or a path");
   }
   return url.origin;
+}
+
+export function readServerOrigin(storage: Pick<Storage, "getItem">, fallback: string): string {
+  try {
+    const saved = storage.getItem(SERVER_ORIGIN_STORAGE_KEY);
+    return saved ? normalizeServerOrigin(saved) : normalizeServerOrigin(fallback);
+  } catch {
+    return normalizeServerOrigin(fallback);
+  }
+}
+
+export function writeServerOrigin(storage: Pick<Storage, "setItem">, origin: string): void {
+  storage.setItem(SERVER_ORIGIN_STORAGE_KEY, normalizeServerOrigin(origin));
 }
 
 export function isSessionCurrent(session: WebAuthnSession, now = Date.now()): boolean {

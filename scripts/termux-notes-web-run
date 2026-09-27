@@ -1,0 +1,6 @@
+#!/data/data/com.termux/files/usr/bin/sh
+exec /data/data/com.termux/files/usr/bin/proot-distro login debian -- \
+  /usr/bin/env ZK_WEB_ROOT=/root/workspace/zk-notes-web/current \
+  /usr/bin/caddy run \
+  --config /data/data/com.termux/files/home/notes-web.Caddyfile \
+  --adapter caddyfile

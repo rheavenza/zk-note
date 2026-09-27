@@ -1,0 +1,3 @@
+#!/data/data/com.termux/files/usr/bin/sh
+exec /data/data/com.termux/files/usr/bin/svlogd -tt \
+  /data/data/com.termux/files/usr/var/log/zk-notes-web

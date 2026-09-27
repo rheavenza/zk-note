@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { renderToString } from "react-dom/server";
-import { assertRpCompatible, isSessionCurrent, normalizeServerOrigin, readSession, SESSION_STORAGE_KEY, writeSession } from "../src/auth/session.js";
+import { assertRpCompatible, isSessionCurrent, normalizeServerOrigin, readServerOrigin, readSession, SERVER_ORIGIN_STORAGE_KEY, SESSION_STORAGE_KEY, writeServerOrigin, writeSession } from "../src/auth/session.js";
 import { registerPasskey, signInWithPasskey, type WebAuthnSession } from "../src/auth/webauthn.js";
 import { AuthProvider } from "../src/context/AuthContext.js";
 import { AuthControls } from "../src/components/AuthControls.js";
@@ -33,8 +33,24 @@ test("expired and malformed sessions fail closed", () => {
 
 test("server URL accepts only a plain origin", () => {
   assert.equal(normalizeServerOrigin("https://one.example/"), "https://one.example");
+  assert.equal(normalizeServerOrigin("192.0.2.10:8090"), "http://192.0.2.10:8090");
+  assert.equal(normalizeServerOrigin("notes.example.com"), "https://notes.example.com");
   assert.throws(() => normalizeServerOrigin("https://one.example/path"));
   assert.throws(() => normalizeServerOrigin("https://user:pass@one.example"));
+});
+
+test("server address can be entered and restored without persisting credentials", () => {
+  const values = new Map<string, string>();
+  const storage = {
+    getItem: (key: string) => values.get(key) ?? null,
+    setItem: (key: string, value: string) => { values.set(key, value); },
+  };
+  assert.equal(readServerOrigin(storage, "https://default.example"), "https://default.example");
+  writeServerOrigin(storage, "http://192.0.2.10:8090/");
+  assert.equal(readServerOrigin(storage, "https://default.example"), "http://192.0.2.10:8090");
+  assert.equal(values.get(SERVER_ORIGIN_STORAGE_KEY), "http://192.0.2.10:8090");
+  values.set(SERVER_ORIGIN_STORAGE_KEY, "javascript:alert(1)");
+  assert.equal(readServerOrigin(storage, "https://default.example"), "https://default.example");
 });
 
 test("passkey RP must match browser domain and use a secure context", () => {

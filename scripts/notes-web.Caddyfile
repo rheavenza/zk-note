@@ -1,0 +1,24 @@
+{
+    admin off
+}
+
+# Tailscale Funnel terminates HTTPS and forwards to this loopback listener.
+http://127.0.0.1:8091 {
+    @api path /v1/* /health
+    handle @api {
+        reverse_proxy 127.0.0.1:8090
+    }
+
+    handle {
+        root * {$ZK_WEB_ROOT}
+        header {
+            Content-Security-Policy "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data: blob:; font-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; upgrade-insecure-requests;"
+            Cross-Origin-Opener-Policy "same-origin"
+            Cross-Origin-Embedder-Policy "require-corp"
+            Cross-Origin-Resource-Policy "same-origin"
+            X-Content-Type-Options "nosniff"
+            Referrer-Policy "no-referrer"
+        }
+        file_server
+    }
+}
