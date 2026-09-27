@@ -87,14 +87,14 @@ export class ConflictStore {
   private error: string | null = null;
   private listeners = new Set<() => void>();
 
+  private snapshot: ConflictSnapshot;
+
   constructor(
     public readonly client: VaultWorkerClient,
     public readonly storage: IndexedDbStorage,
     public readonly onConflictResolved?: () => Promise<void>
-  ) {}
-
-  public getSnapshot = (): ConflictSnapshot => {
-    return {
+  ) {
+    this.snapshot = {
       activeConflicts: this.activeConflicts,
       activeConflictCount: this.activeConflicts.length,
       selectedConflictId: this.selectedConflictId,
@@ -102,6 +102,25 @@ export class ConflictStore {
       isLoadingDetails: this.isLoadingDetails,
       error: this.error,
     };
+  }
+
+  private updateSnapshot(): void {
+    this.snapshot = {
+      activeConflicts: this.activeConflicts,
+      activeConflictCount: this.activeConflicts.length,
+      selectedConflictId: this.selectedConflictId,
+      isModalOpen: this.isModalOpen,
+      isLoadingDetails: this.isLoadingDetails,
+      error: this.error,
+    };
+  }
+
+  public getState(): ConflictSnapshot {
+    return this.snapshot;
+  }
+
+  public getSnapshot = (): ConflictSnapshot => {
+    return this.snapshot;
   };
 
   public subscribe = (listener: () => void): (() => void) => {
@@ -112,6 +131,7 @@ export class ConflictStore {
   };
 
   private notify(): void {
+    this.updateSnapshot();
     for (const listener of this.listeners) {
       listener();
     }
@@ -556,13 +576,28 @@ export const ConflictProvider: React.FC<ConflictProviderProps> = ({
     return undefined;
   }, [vaultState, store]);
 
-  useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
-
-  const snapshot = store.getSnapshot();
+  const snapshot = useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
 
   const value: ConflictContextType = useMemo(
     () => ({
-      ...snapshot,
+      get activeConflicts() {
+        return store.getState().activeConflicts;
+      },
+      get activeConflictCount() {
+        return store.getState().activeConflictCount;
+      },
+      get selectedConflictId() {
+        return store.getState().selectedConflictId;
+      },
+      get isModalOpen() {
+        return store.getState().isModalOpen;
+      },
+      get isLoadingDetails() {
+        return store.getState().isLoadingDetails;
+      },
+      get error() {
+        return store.getState().error;
+      },
       openModal: (id: string) => store.openModal(id),
       closeModal: () => store.closeModal(),
       refreshConflicts: () => store.refreshConflicts(),
@@ -575,7 +610,7 @@ export const ConflictProvider: React.FC<ConflictProviderProps> = ({
       clearError: () => store.clearError(),
       store,
     }),
-    [snapshot, store]
+    [store, snapshot]
   );
 
   return (

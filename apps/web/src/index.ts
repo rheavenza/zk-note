@@ -13,6 +13,8 @@ export * from "./context/SearchContext.js";
 export * from "./context/SyncContext.js";
 export * from "./context/AuthContext.js";
 export * from "./auth/webauthn.js";
+export * from "./auth/session.js";
+export * from "./components/AuthControls.js";
 export * from "./components/UnlockScreen.js";
 export * from "./components/MarkdownEditor.js";
 export * from "./components/NotesList.js";

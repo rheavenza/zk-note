@@ -75,6 +75,39 @@ npm run dev
 ```
 Open your browser to `http://localhost:5173/`.
 
+Vite now stops with a port-in-use error when 5173 is occupied, so the browser
+address cannot silently change. Stop the older dev server before restarting.
+
+Vite proxies `/v1` to `http://127.0.0.1:8080` by default. Set `VITE_API_URL`
+to another API address when starting Vite if needed; the browser still sends
+requests to its own origin. The server must be configured with
+`ZK_WEBAUTHN_RP_ID=localhost` and
+`ZK_WEBAUTHN_ORIGIN=http://localhost:5173` for local passkeys. WebAuthn
+registration and login reject an incompatible browser domain before opening
+the authenticator.
+
+For deployment, serve the web assets over HTTPS and reverse proxy `/v1` to the
+API on the same origin. Set the server's WebAuthn origin to that exact browser
+origin, including its port, and the RP ID to its domain (or a registrable parent
+domain). Do not point a browser on `localhost` at an API configured for a
+different RP domain; open the web app on a compatible origin instead. Keep the
+production CSP restricted to the app origin.
+
+The Account control in the workspace can create an account, sign in with a
+passkey, and sign out. Its **Server address** field accepts an HTTP or HTTPS
+origin and remembers it for this browser origin; changing it clears the current
+session. Passkey sign-in requires the web page and API on the same HTTPS origin,
+so enter the server's HTTPS web address and open the app there. An HTTP LAN API
+address can be stored, but a web page on `localhost` cannot use it for passkey
+sign-in with a server configured for another RP domain. It does not upload the
+local vault. Until the vault-link
+and sync tickets are implemented, the sync indicator says **local only** and
+the Sync action cannot record a successful server sync.
+
+See [same-origin Termux deployment](../../docs/deployment-web-termux.md) for a
+supervised Caddy setup that serves the web client and API behind one HTTPS
+hostname.
+
 ---
 
 ## 3. Web Application Features
