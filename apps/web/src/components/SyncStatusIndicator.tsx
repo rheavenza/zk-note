@@ -54,6 +54,10 @@ export const SyncStatusIndicator: React.FC<SyncStatusIndicatorProps> = ({
 
   const getStatusConfig = (s: SyncStatus) => {
     switch (s) {
+      case "local only":
+        return {
+          icon: "◯", label: "local only", bg: "#f3f4f6", text: "#4b5563", border: "#d1d5db",
+        };
       case "offline":
         return {
           icon: "☁️",
@@ -395,4 +399,3 @@ const resolveConflictPopoverButtonStyle: React.CSSProperties = {
   fontWeight: 600,
   cursor: "pointer",
 };
-

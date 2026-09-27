@@ -39,6 +39,8 @@ export class VaultHandler {
     }
     if (wasmModuleOrBytes) {
       zk.initSync({ module: wasmModuleOrBytes });
+    } else {
+      await zk.default();
     }
     zk.init_panic_hook();
     this.isWasmInitialized = true;

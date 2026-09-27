@@ -22,6 +22,7 @@ import "fake-indexeddb/auto";
 import {
   VaultProvider,
   SyncProvider,
+  SyncStore,
   useSync,
   SyncStatusIndicator,
   sanitizeSyncErrorMessage,
@@ -52,6 +53,19 @@ function createMockSyncWorkerClient() {
   return client as VaultWorkerClient;
 }
 
+const completeAdapter = { pushMutations: async () => {}, pullChanges: async () => {} };
+
+test("without a server adapter sync remains local and does not advance timestamp", async () => {
+  const storage = new IndexedDbStorage("test-sync-local-only");
+  const store = new SyncStore(storage);
+  assert.equal(store.getStatus(), "local only");
+  await store.syncNow();
+  assert.equal(store.getStatus(), "error");
+  assert.equal(store.getLastSyncAt(), null);
+  assert.equal((await storage.getSyncState())?.last_sync_at, null);
+  await storage.close();
+});
+
 // ----------------------------------------------------------------------------
 // 1. All 6 Sync States Verification
 // ----------------------------------------------------------------------------
@@ -68,7 +82,7 @@ test("Sync status displays 'synced' when online with 0 pending changes and 0 con
 
   const html = renderToString(
     <VaultProvider client={client} storage={storage} initialBootstrap={null}>
-      <SyncProvider>
+      <SyncProvider serverAdapter={completeAdapter}>
         <Consumer />
       </SyncProvider>
     </VaultProvider>
@@ -113,7 +127,7 @@ test("Sync status displays 'pending changes' when queued mutations exist", async
 
   renderToString(
     <VaultProvider client={client} storage={storage} initialBootstrap={null}>
-      <SyncProvider>
+      <SyncProvider serverAdapter={completeAdapter}>
         <Consumer />
       </SyncProvider>
     </VaultProvider>
@@ -246,6 +260,7 @@ test("Sync status displays 'syncing' during active synchronization", async () =>
         resolveSync = res;
       });
     },
+    pullChanges: async () => {},
   };
 
   let syncRef: ReturnType<typeof useSync> | null = null;
@@ -287,6 +302,7 @@ test("Sync status displays 'error' when synchronization fails", async () => {
     pushMutations: async () => {
       throw new Error("HTTP 503 Server Unavailable");
     },
+    pullChanges: async () => {},
   };
 
   let syncRef: ReturnType<typeof useSync> | null = null;

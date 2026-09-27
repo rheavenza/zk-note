@@ -124,6 +124,7 @@ export class VaultStore {
   private listeners = new Set<() => void>();
   private unsubscribeLock: () => void;
   private isDisposed = false;
+  private snapshot: VaultSnapshot;
 
   constructor(
     public readonly client: VaultWorkerClient,
@@ -152,6 +153,13 @@ export class VaultStore {
       this.bootstrap = null;
       this.state = "UNINITIALIZED";
     }
+
+    this.snapshot = {
+      vaultState: this.state,
+      bootstrap: this.bootstrap,
+      error: this.error,
+      autoLockTimeoutMinutes: this.autoLockTimeoutMinutes,
+    };
 
     // Subscribe to worker lock broadcasts
     this.unsubscribeLock = this.client.onLock(() => {
@@ -189,8 +197,8 @@ export class VaultStore {
     }
   }
 
-  public getState(): VaultSnapshot {
-    return {
+  private updateSnapshot(): void {
+    this.snapshot = {
       vaultState: this.state,
       bootstrap: this.bootstrap,
       error: this.error,
@@ -198,8 +206,12 @@ export class VaultStore {
     };
   }
 
+  public getState(): VaultSnapshot {
+    return this.snapshot;
+  }
+
   public getSnapshot = (): VaultSnapshot => {
-    return this.getState();
+    return this.snapshot;
   };
 
   public setAutoLockTimeout(minutes: number): void {
@@ -236,6 +248,7 @@ export class VaultStore {
   };
 
   private notify(): void {
+    this.updateSnapshot();
     for (const listener of this.listeners) {
       listener();
     }
@@ -478,7 +491,7 @@ export const VaultProvider: React.FC<VaultProviderProps> = ({
   }, [store]);
 
   // Hook into React external store lifecycle to re-render consumers
-  useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
+  const snapshot = useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
 
   const value: VaultContextType = useMemo(
     () => ({
@@ -508,7 +521,7 @@ export const VaultProvider: React.FC<VaultProviderProps> = ({
       storage: store.storage,
       store,
     }),
-    [store]
+    [store, snapshot]
   );
 
   return <VaultContext.Provider value={value}>{children}</VaultContext.Provider>;
