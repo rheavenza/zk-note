@@ -88,6 +88,7 @@ export class NotesStore {
   private isUnlocked = false;
   public readonly attachmentManager: AttachmentManager;
   private attachmentProgress: AttachmentProgress | null = null;
+  private snapshot: NotesSnapshot;
 
   constructor(
     public readonly client: VaultWorkerClient,
@@ -95,10 +96,7 @@ export class NotesStore {
     attachmentConfig?: { serverUrl?: string; authToken?: string }
   ) {
     this.attachmentManager = new AttachmentManager(client, storage, attachmentConfig);
-  }
-
-  public getSnapshot = (): NotesSnapshot => {
-    return {
+    this.snapshot = {
       notes: this.notes,
       selectedNoteId: this.selectedNoteId,
       isLoading: this.isLoading,
@@ -107,6 +105,26 @@ export class NotesStore {
       error: this.error,
       attachmentProgress: this.attachmentProgress,
     };
+  }
+
+  private updateSnapshot(): void {
+    this.snapshot = {
+      notes: this.notes,
+      selectedNoteId: this.selectedNoteId,
+      isLoading: this.isLoading,
+      saveStatus: this.saveStatus,
+      lastSavedAt: this.lastSavedAt,
+      error: this.error,
+      attachmentProgress: this.attachmentProgress,
+    };
+  }
+
+  public getState(): NotesSnapshot {
+    return this.snapshot;
+  }
+
+  public getSnapshot = (): NotesSnapshot => {
+    return this.snapshot;
   };
 
   public subscribe = (listener: () => void): (() => void) => {
@@ -117,6 +135,7 @@ export class NotesStore {
   };
 
   private notify(): void {
+    this.updateSnapshot();
     for (const listener of this.listeners) {
       listener();
     }
@@ -616,19 +635,36 @@ export const NotesProvider: React.FC<NotesProviderProps> = ({ children }) => {
     }
   }, [vaultState, store]);
 
-  useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
-
-  const snapshot = store.getSnapshot();
-
-  const selectedNote = useMemo(() => {
-    if (!snapshot.selectedNoteId) return null;
-    return snapshot.notes.find((n) => n.id === snapshot.selectedNoteId) || null;
-  }, [snapshot.notes, snapshot.selectedNoteId]);
+  const snapshot = useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
 
   const value: NotesContextType = useMemo(
     () => ({
-      ...snapshot,
-      selectedNote,
+      get notes() {
+        return store.getState().notes;
+      },
+      get selectedNoteId() {
+        return store.getState().selectedNoteId;
+      },
+      get selectedNote() {
+        const state = store.getState();
+        if (!state.selectedNoteId) return null;
+        return state.notes.find((n) => n.id === state.selectedNoteId) || null;
+      },
+      get isLoading() {
+        return store.getState().isLoading;
+      },
+      get saveStatus() {
+        return store.getState().saveStatus;
+      },
+      get lastSavedAt() {
+        return store.getState().lastSavedAt;
+      },
+      get error() {
+        return store.getState().error;
+      },
+      get attachmentProgress() {
+        return store.getState().attachmentProgress;
+      },
       selectNote: (id: string | null) => store.selectNote(id),
       createNote: (initial) => store.createNote(initial),
       updateNote: (id, updates) => store.updateNote(id, updates),
@@ -643,7 +679,7 @@ export const NotesProvider: React.FC<NotesProviderProps> = ({ children }) => {
       getAttachmentManifests: (noteId) => store.getAttachmentManifests(noteId),
       store,
     }),
-    [snapshot, selectedNote, store]
+    [store, snapshot]
   );
 
   return <NotesContext.Provider value={value}>{children}</NotesContext.Provider>;

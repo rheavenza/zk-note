@@ -29,6 +29,7 @@ export default defineConfig({
   plugins: [react(), devCspPlugin()],
   server: {
     port: 5173,
+    strictPort: true,
     host: "localhost",
     fs: {
       allow: ["../.."],

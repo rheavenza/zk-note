@@ -75,6 +75,9 @@ npm run dev
 ```
 Open your browser to `http://localhost:5173/`.
 
+Vite now stops with a port-in-use error when 5173 is occupied, so the browser
+address cannot silently change. Stop the older dev server before restarting.
+
 Vite proxies `/v1` to `http://127.0.0.1:8080` by default. Set `VITE_API_URL`
 to another API address when starting Vite if needed; the browser still sends
 requests to its own origin. The server must be configured with

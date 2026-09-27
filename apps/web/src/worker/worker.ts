@@ -6,23 +6,33 @@
  */
 
 import { VaultHandler } from "./vault-handler.js";
-import { WorkerRequest, WorkerOutgoingMessage } from "./protocol.js";
+import { WorkerErrorCode, WorkerRequest, WorkerOutgoingMessage } from "./protocol.js";
 
 const handler = new VaultHandler();
 
 // Setup listener for browser Web Worker environment
 if (typeof self !== "undefined" && typeof window === "undefined") {
   // Initialize WASM automatically if running in browser worker
-  handler.initWasm().catch((err) => {
-    console.error("Failed to initialize WASM in Web Worker:", err);
-  });
+  const wasmReady = handler.initWasm();
 
-  self.onmessage = (event: MessageEvent<WorkerRequest>) => {
-    handler.handleMessage(
-      event.data,
-      (res: WorkerOutgoingMessage) => self.postMessage(res),
-      (broadcast: WorkerOutgoingMessage) => self.postMessage(broadcast)
-    );
+  self.onmessage = async (event: MessageEvent<WorkerRequest>) => {
+    try {
+      await wasmReady;
+      handler.handleMessage(
+        event.data,
+        (res: WorkerOutgoingMessage) => self.postMessage(res),
+        (broadcast: WorkerOutgoingMessage) => self.postMessage(broadcast)
+      );
+    } catch {
+      self.postMessage({
+        id: event.data.id,
+        ok: false,
+        error: {
+          code: WorkerErrorCode.INTERNAL_ERROR,
+          message: "Cryptographic worker unavailable.",
+        },
+      });
+    }
   };
 }
 

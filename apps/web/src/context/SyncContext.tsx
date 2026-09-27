@@ -85,6 +85,7 @@ export class SyncStore {
   private lastSyncAt: Date | null = null;
   private error: string | null = null;
   private listeners = new Set<() => void>();
+  private snapshot: SyncStateSnapshot;
 
   constructor(
     public readonly storage: IndexedDbStorage,
@@ -93,10 +94,8 @@ export class SyncStore {
     if (typeof navigator !== "undefined" && typeof navigator.onLine === "boolean") {
       this.isNetworkOnline = navigator.onLine;
     }
-  }
 
-  public getSnapshot = (): SyncStateSnapshot => {
-    return {
+    this.snapshot = {
       status: this.getStatus(),
       isOnline: this.getIsOnline(),
       isSyncing: this.isSyncing,
@@ -105,6 +104,26 @@ export class SyncStore {
       lastSyncAt: this.lastSyncAt,
       error: this.error,
     };
+  }
+
+  private updateSnapshot(): void {
+    this.snapshot = {
+      status: this.getStatus(),
+      isOnline: this.getIsOnline(),
+      isSyncing: this.isSyncing,
+      pendingCount: this.pendingCount,
+      conflictCount: this.conflictCount,
+      lastSyncAt: this.lastSyncAt,
+      error: this.error,
+    };
+  }
+
+  public getState(): SyncStateSnapshot {
+    return this.snapshot;
+  }
+
+  public getSnapshot = (): SyncStateSnapshot => {
+    return this.snapshot;
   };
 
   public subscribe = (listener: () => void): (() => void) => {
@@ -115,6 +134,7 @@ export class SyncStore {
   };
 
   private notify(): void {
+    this.updateSnapshot();
     for (const listener of this.listeners) {
       listener();
     }
@@ -281,7 +301,7 @@ export const SyncProvider: React.FC<SyncProviderProps> = ({
     return () => clearInterval(interval);
   }, [store, vaultState]);
 
-  useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
+  const snapshot = useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
 
   const value: SyncContextType = useMemo(
     () => ({
@@ -292,7 +312,7 @@ export const SyncProvider: React.FC<SyncProviderProps> = ({
         return store.getIsOnline();
       },
       get isSyncing() {
-        return store.getSnapshot().isSyncing;
+        return store.getState().isSyncing;
       },
       get pendingCount() {
         return store.getPendingCount();
@@ -312,7 +332,7 @@ export const SyncProvider: React.FC<SyncProviderProps> = ({
       refreshStatus: () => store.refreshStatus(),
       store,
     }),
-    [store]
+    [store, snapshot]
   );
 
   return <SyncContext.Provider value={value}>{children}</SyncContext.Provider>;

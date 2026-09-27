@@ -20,6 +20,7 @@ import { SyncProvider } from "./context/SyncContext.js";
 import { ConflictProvider } from "./context/ConflictContext.js";
 import { SearchProvider } from "./context/SearchContext.js";
 import { NotesProvider } from "./context/NotesContext.js";
+import { ErrorBoundary } from "./components/ErrorBoundary.js";
 import { UnlockScreen } from "./components/UnlockScreen.js";
 import { NotesWorkspace } from "./components/NotesWorkspace.js";
 
@@ -49,7 +50,7 @@ export const App: React.FC<AppProps> = ({ client, storage, serverUrl }) => {
   const activeStorage = useMemo(() => storage || new IndexedDbStorage(), [storage]);
 
   return (
-    <AuthProvider serverUrl={serverUrl}>
+    <ErrorBoundary><AuthProvider serverUrl={serverUrl}>
       <VaultProvider client={activeClient} storage={activeStorage}>
         <SyncProvider>
           <ConflictProvider>
@@ -63,7 +64,7 @@ export const App: React.FC<AppProps> = ({ client, storage, serverUrl }) => {
           </ConflictProvider>
         </SyncProvider>
       </VaultProvider>
-    </AuthProvider>
+    </AuthProvider></ErrorBoundary>
   );
 };
 
