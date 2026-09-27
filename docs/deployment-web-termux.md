@@ -33,6 +33,9 @@ The native API remains on port 8090 for direct LAN access. The browser app
 should be opened at the HTTPS origin configured by `ZK_WEBAUTHN_ORIGIN`; its
 Server address field defaults to that same origin. The selected address is
 stored without credentials. Changing it clears the current browser session.
+Browser storage is scoped to the page origin. An existing vault created on a
+local development origin will not appear automatically at the HTTPS origin;
+the encrypted vault-link/restore flow is tracked separately in ZK-105.
 
 ## Rollback
 

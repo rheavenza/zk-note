@@ -68,7 +68,7 @@ Implementation note: account control, origin-bound session storage, RP checks,
 offline status, and local-only sync feedback are implemented on the ZK-104
 branch. Live RP-compatible browser smoke remains pending review.
 The server origin is editable in the browser. Same-origin Caddy hosting is
-staged and passes local API/web checks; public HTTPS verification is pending.
+deployed and passes public web/API checks; passkey ceremony verification is pending.
 
 ## ZK-105 — Safely link and restore encrypted vault bootstrap
 State: BACKLOG

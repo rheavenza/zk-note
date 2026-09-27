@@ -3,7 +3,8 @@
 }
 
 # Tailscale Funnel terminates HTTPS and forwards to this loopback listener.
-http://127.0.0.1:8091 {
+:8091 {
+    bind 127.0.0.1
     @api path /v1/* /health
     handle @api {
         reverse_proxy 127.0.0.1:8090
