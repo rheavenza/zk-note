@@ -31,7 +31,14 @@ export const AuthControls: React.FC = () => {
         <button type="submit" disabled={auth.isLoading}>Use server</button>
       </form>
       {serverError && <p role="alert">{serverError}</p>}
-      {!sameOrigin && <p role="note">Passkey sign-in needs the web page and API on the same HTTPS origin. Open the web app at the server’s HTTPS address.</p>}
+      {!sameOrigin && <p role="note">
+        Account creation and passkey sign-in are unavailable with this server address. The web page and API must share the server’s HTTPS origin. An HTTP LAN address is for API access and cannot be used for passkeys. Open the web app on the server’s HTTPS hostname, then use that page’s address as the server address.
+      </p>}
+      {!sameOrigin && <button type="button" onClick={() => {
+        auth.setServerOrigin(pageOrigin);
+        setServerInput(pageOrigin);
+        setServerError(null);
+      }}>Use this page’s server</button>}
       {auth.isAuthenticated ? <button type="button" disabled={auth.isLoading} onClick={() => void auth.logout()}>Sign out</button> : <>
         <label>Account name <input value={username} onChange={event => setUsername(event.target.value)} autoComplete="username" /></label>
         <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
