@@ -17,6 +17,7 @@ import { SyncStatusIndicator } from "./SyncStatusIndicator.js";
 import { ConflictResolverModal } from "./ConflictResolverModal.js";
 import { SecurityRecoveryModal } from "./SecurityRecoveryModal.js";
 import { DeviceManagementModal } from "./DeviceManagementModal.js";
+import { AuthControls } from "./AuthControls.js";
 
 export interface NotesWorkspaceProps {
   className?: string;
@@ -47,6 +48,7 @@ export const NotesWorkspace: React.FC<NotesWorkspaceProps> = ({ className }) => 
 
         <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
           <VaultStatusBadge />
+          <AuthControls />
           <button
             type="button"
             onClick={() => setIsSecurityModalOpen(true)}

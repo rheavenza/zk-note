@@ -7,6 +7,8 @@
  * - Tokens are handled in memory and passed via Bearer headers to sync APIs.
  */
 
+import { assertRpCompatible } from "./session.js";
+
 export interface WebAuthnSession {
   token: string;
   sessionId: string;
@@ -245,6 +247,8 @@ export async function registerPasskey(
 ): Promise<WebAuthnSession> {
   const start = await startRegistration(serverUrl, options);
 
+  if (typeof window !== "undefined") assertRpCompatible(start.rp.id, window.location.href);
+
   if (typeof navigator !== "undefined" && navigator.credentials && navigator.credentials.create) {
     const challengeBuffer = base64UrlToBuffer(start.challenge_b64);
     const userIdBuffer = new TextEncoder().encode(start.user.id);
@@ -303,6 +307,8 @@ export async function signInWithPasskey(
   options?: { accountId?: string; deviceId?: string }
 ): Promise<WebAuthnSession> {
   const start = await startLogin(serverUrl, options);
+
+  if (typeof window !== "undefined") assertRpCompatible(start.rp_id, window.location.href);
 
   if (typeof navigator !== "undefined" && navigator.credentials && navigator.credentials.get) {
     const challengeBuffer = base64UrlToBuffer(start.challenge_b64);
@@ -425,4 +431,3 @@ export async function revokeDevice(
         : (data.revokedSessionsCount ?? 0),
   };
 }
-

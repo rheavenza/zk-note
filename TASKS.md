@@ -57,13 +57,16 @@ verify one coherent step. The deployed server's private address and hostname
 belong in operator configuration, not public ticket text.
 
 ## ZK-104 — Web authentication and compatible origin
-State: READY
+State: IN_REVIEW
 Priority: P1
 Dependencies: existing auth API and browser vault lifecycle
 Ticket: [docs/tickets/ZK-104.md](docs/tickets/ZK-104.md)
 Acceptance: browser registration/sign-in/session handling; RP-compatible origin;
 offline/local-only status remains honest.
 Verification: web gates and real browser WebAuthn smoke on compatible HTTPS.
+Implementation note: account control, origin-bound session storage, RP checks,
+offline status, and local-only sync feedback are implemented on the ZK-104
+branch. Live RP-compatible browser smoke remains pending review.
 
 ## ZK-105 — Safely link and restore encrypted vault bootstrap
 State: BACKLOG

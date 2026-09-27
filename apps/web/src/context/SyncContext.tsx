@@ -18,6 +18,7 @@ import { useVault } from "./VaultContext.js";
 import { IndexedDbStorage } from "../storage/indexeddb.js";
 
 export type SyncStatus =
+  | "local only"
   | "offline"
   | "syncing"
   | "synced"
@@ -129,6 +130,7 @@ export class SyncStore {
     if (!this.getIsOnline()) return "offline";
     if (this.isSyncing) return "syncing";
     if (this.pendingCount > 0) return "pending changes";
+    if (!this.serverAdapter?.pushMutations || !this.serverAdapter?.pullChanges) return "local only";
     return "synced";
   }
 
@@ -185,6 +187,11 @@ export class SyncStore {
   }
 
   public async syncNow(): Promise<void> {
+    if (!this.serverAdapter?.pushMutations || !this.serverAdapter?.pullChanges) {
+      this.error = "Server synchronization is not configured. Notes remain local.";
+      this.notify();
+      return;
+    }
     if (!this.getIsOnline()) {
       this.error = "Cannot sync while offline.";
       this.notify();
@@ -198,14 +205,8 @@ export class SyncStore {
     this.notify();
 
     try {
-      if (this.serverAdapter) {
-        if (this.serverAdapter.pushMutations) {
-          await this.serverAdapter.pushMutations(this.storage);
-        }
-        if (this.serverAdapter.pullChanges) {
-          await this.serverAdapter.pullChanges(this.storage);
-        }
-      }
+      await this.serverAdapter.pushMutations(this.storage);
+      await this.serverAdapter.pullChanges(this.storage);
 
       const now = new Date();
       const existingState = await this.storage.getSyncState();

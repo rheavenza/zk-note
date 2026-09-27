@@ -75,6 +75,26 @@ npm run dev
 ```
 Open your browser to `http://localhost:5173/`.
 
+Vite proxies `/v1` to `http://127.0.0.1:8080` by default. Set `VITE_API_URL`
+to another API address when starting Vite if needed; the browser still sends
+requests to its own origin. The server must be configured with
+`ZK_WEBAUTHN_RP_ID=localhost` and
+`ZK_WEBAUTHN_ORIGIN=http://localhost:5173` for local passkeys. WebAuthn
+registration and login reject an incompatible browser domain before opening
+the authenticator.
+
+For deployment, serve the web assets over HTTPS and reverse proxy `/v1` to the
+API on the same origin. Set the server's WebAuthn origin to that exact browser
+origin, including its port, and the RP ID to its domain (or a registrable parent
+domain). Do not point a browser on `localhost` at an API configured for a
+different RP domain; open the web app on a compatible origin instead. Keep the
+production CSP restricted to the app origin.
+
+The Account control in the workspace can create an account, sign in with a
+passkey, and sign out. It does not upload the local vault. Until the vault-link
+and sync tickets are implemented, the sync indicator says **local only** and
+the Sync action cannot record a successful server sync.
+
 ---
 
 ## 3. Web Application Features
