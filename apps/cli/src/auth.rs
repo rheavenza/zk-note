@@ -141,25 +141,71 @@ pub fn load_auth_session(path: &Path) -> Result<StoredAuthSession, CliError> {
 /// Returns true if an auth session file exists on disk.
 #[must_use]
 pub fn has_auth_session(path: &Path) -> bool {
-    path.exists()
+    path.exists() || std::fs::symlink_metadata(path).is_ok()
 }
 
 /// Overwrites the auth session file with zeroes and unlinks it.
+///
+/// Fails closed: propagates any inspection, write, flush, or unlink errors,
+/// and verifies absence before reporting success.
 pub fn clear_auth_session(path: &Path) -> Result<(), CliError> {
-    if path.exists() {
-        if let Ok(metadata) = std::fs::metadata(path) {
-            let len = metadata.len();
-            if len > 0 {
-                if let Ok(mut file) = std::fs::OpenOptions::new().write(true).open(path) {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.is_file() {
+                let len = metadata.len();
+                if len > 0 {
+                    let mut file =
+                        std::fs::OpenOptions::new()
+                            .write(true)
+                            .open(path)
+                            .map_err(|e| {
+                                CliError::Io(format!(
+                                    "failed to open auth session file {} for zeroization: {e}",
+                                    path.display()
+                                ))
+                            })?;
                     use std::io::Write;
                     let zeroes = vec![0u8; len as usize];
-                    let _ = file.write_all(&zeroes);
-                    let _ = file.flush();
+                    file.write_all(&zeroes).map_err(|e| {
+                        CliError::Io(format!(
+                            "failed to overwrite auth session file {} with zeroes: {e}",
+                            path.display()
+                        ))
+                    })?;
+                    file.flush().map_err(|e| {
+                        CliError::Io(format!(
+                            "failed to flush zeroed auth session file {}: {e}",
+                            path.display()
+                        ))
+                    })?;
                 }
             }
+            std::fs::remove_file(path).map_err(|e| {
+                CliError::Io(format!(
+                    "failed to remove auth session file {}: {e}",
+                    path.display()
+                ))
+            })?;
         }
-        let _ = std::fs::remove_file(path);
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(());
+        }
+        Err(e) => {
+            return Err(CliError::Io(format!(
+                "failed to inspect auth session file {}: {e}",
+                path.display()
+            )));
+        }
     }
+
+    // Verify absence before reporting success
+    if path.exists() || std::fs::symlink_metadata(path).is_ok() {
+        return Err(CliError::Io(format!(
+            "auth session file {} still exists after removal attempt",
+            path.display()
+        )));
+    }
+
     Ok(())
 }
 
@@ -572,6 +618,69 @@ mod tests {
         let explicit = Uuid::new_v4();
         let dev_id3 = get_or_create_device_id(&temp_dir, Some(explicit)).unwrap();
         assert_eq!(dev_id3, explicit);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_clear_auth_session_fails_closed_on_non_removable_target() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("zk_auth_cleanup_test_{}", Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        // Subcase 1: Target is an invalid/non-removable target (directory instead of file)
+        let dir_target = temp_dir.join("auth_session.json");
+        std::fs::create_dir(&dir_target).unwrap();
+        assert!(has_auth_session(&dir_target));
+
+        let dir_err = clear_auth_session(&dir_target).unwrap_err();
+        assert!(
+            has_auth_session(&dir_target),
+            "target must not be reported cleared when cleanup fails"
+        );
+        let err_msg = dir_err.to_string();
+        assert!(
+            err_msg.contains("failed to remove") || err_msg.contains("still exists"),
+            "unexpected error message: {err_msg}"
+        );
+        let _ = std::fs::remove_dir(&dir_target);
+
+        // Subcase 2: Target is in a read-only directory where unlinking is forbidden (Unix)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let ro_dir = temp_dir.join("ro_dir");
+            std::fs::create_dir_all(&ro_dir).unwrap();
+            let ro_file = ro_dir.join("auth_session.json");
+            std::fs::write(&ro_file, b"test session data").unwrap();
+            assert!(has_auth_session(&ro_file));
+
+            // Remove write permissions on enclosing directory to block unlink
+            let mut perms = std::fs::metadata(&ro_dir).unwrap().permissions();
+            perms.set_mode(0o500);
+            std::fs::set_permissions(&ro_dir, perms).unwrap();
+
+            let ro_err = clear_auth_session(&ro_file).unwrap_err();
+            assert!(
+                has_auth_session(&ro_file),
+                "credential file must remain when unlink fails"
+            );
+            let ro_err_msg = ro_err.to_string();
+            assert!(
+                ro_err_msg.contains("Permission denied") || ro_err_msg.contains("failed to remove"),
+                "unexpected error message: {ro_err_msg}"
+            );
+
+            // Restore write permissions for cleanup
+            let mut restore_perms = std::fs::metadata(&ro_dir).unwrap().permissions();
+            restore_perms.set_mode(0o700);
+            let _ = std::fs::set_permissions(&ro_dir, restore_perms);
+        }
+
+        // Subcase 3: Absent target succeeds cleanly
+        let absent_target = temp_dir.join("does_not_exist.json");
+        assert!(!has_auth_session(&absent_target));
+        assert!(clear_auth_session(&absent_target).is_ok());
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

@@ -414,6 +414,7 @@ pub async fn authorize_terminal_device(
 /// - If server is unreachable or revocation fails, local credentials are NOT silently purged.
 ///   Instead, returns an error so credentials remain available for retry when online.
 /// - If revocation succeeds, local credentials file is zeroed and deleted.
+/// - Fails closed: propagates any cleanup/unlink errors and verifies absence before reporting success.
 pub async fn sign_out(custom_data_dir: Option<&Path>) -> Result<(), CliError> {
     let data_dir = resolve_data_dir(custom_data_dir);
     let auth_path = auth_session_file(&data_dir);
@@ -424,20 +425,40 @@ pub async fn sign_out(custom_data_dir: Option<&Path>) -> Result<(), CliError> {
 
     let session = load_auth_session(&auth_path)?;
 
-    // Attempt remote revocation
+    // Attempt remote revocation (preserves local credentials on failure)
     api_revoke_session(&session).await?;
 
-    // On successful revocation, zero and unlink local session file
+    // On successful revocation, zero and unlink local session file (fails closed)
     clear_auth_session(&auth_path)?;
+
+    // Fail-closed verification: ensure credential file is completely gone
+    if has_auth_session(&auth_path) {
+        return Err(CliError::Io(format!(
+            "auth session file {} still exists after sign-out cleanup",
+            auth_path.display()
+        )));
+    }
 
     Ok(())
 }
 
 /// Explicitly purges local credentials without contacting server.
+///
+/// Fails closed: propagates any cleanup/unlink errors and verifies absence before reporting success.
 pub fn force_clear_session(custom_data_dir: Option<&Path>) -> Result<(), CliError> {
     let data_dir = resolve_data_dir(custom_data_dir);
     let auth_path = auth_session_file(&data_dir);
-    clear_auth_session(&auth_path)
+    clear_auth_session(&auth_path)?;
+
+    // Fail-closed verification: ensure credential file is completely gone
+    if has_auth_session(&auth_path) {
+        return Err(CliError::Io(format!(
+            "auth session file {} still exists after force cleanup",
+            auth_path.display()
+        )));
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -861,5 +882,80 @@ mod tests {
         // Status check reports Revoked
         let st = check_auth_state_online(Some(dir_path)).await.unwrap();
         assert!(st.is_revoked(), "must report Revoked state");
+    }
+
+    #[test]
+    fn test_force_clear_session_fails_closed_on_cleanup_failure() {
+        let test_dir = TempDataDir::new("force_clear_fail");
+        let dir_path = test_dir.path();
+        let auth_path = auth_session_file(dir_path);
+
+        // Make auth_session.json an invalid/non-removable target (directory)
+        std::fs::create_dir(&auth_path).unwrap();
+        assert!(has_auth_session(&auth_path));
+
+        let res = force_clear_session(Some(dir_path));
+        assert!(
+            res.is_err(),
+            "force_clear_session must fail closed on cleanup error"
+        );
+        assert!(
+            has_auth_session(&auth_path),
+            "credential target must remain present on failure"
+        );
+
+        let _ = std::fs::remove_dir(&auth_path);
+    }
+
+    #[tokio::test]
+    async fn test_sign_out_fails_closed_when_credential_cleanup_fails() {
+        let (server_url, state, _shutdown) = start_test_server().await;
+        let test_dir = TempDataDir::new("sign_out_cleanup_fail");
+        let dir_path = test_dir.path();
+
+        let account_id = Uuid::new_v4();
+        let (_, authorizer) = state
+            .db
+            .create_session(account_id, None, None, Some(3600))
+            .await
+            .unwrap();
+
+        authorize_terminal_device(
+            Some(dir_path),
+            &server_url,
+            authorizer.expose_secret(),
+            Some(account_id),
+            Some("Cleanup Failure Test".to_string()),
+            None,
+        )
+        .await
+        .expect("auth succeeds");
+
+        let auth_path = auth_session_file(dir_path);
+        assert!(has_auth_session(&auth_path));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // Prevent deletion of auth_session.json by removing write permissions from enclosing directory
+            let mut perms = std::fs::metadata(dir_path).unwrap().permissions();
+            perms.set_mode(0o500);
+            std::fs::set_permissions(dir_path, perms).unwrap();
+
+            let sign_out_res = sign_out(Some(dir_path)).await;
+            assert!(
+                sign_out_res.is_err(),
+                "sign_out must fail closed when local file cleanup fails"
+            );
+            assert!(
+                has_auth_session(&auth_path),
+                "credentials must not be falsely reported deleted"
+            );
+
+            // Restore permissions for cleanup
+            let mut restore_perms = std::fs::metadata(dir_path).unwrap().permissions();
+            restore_perms.set_mode(0o700);
+            let _ = std::fs::set_permissions(dir_path, restore_perms);
+        }
     }
 }

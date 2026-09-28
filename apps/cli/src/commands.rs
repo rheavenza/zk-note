@@ -1894,7 +1894,7 @@ pub async fn cmd_device_revoke(
     // If the revoked device was this device, clear local auth session too
     let was_current = target_device_id == session.device_id;
     if was_current {
-        let _ = clear_auth_session(&auth_path);
+        clear_auth_session(&auth_path)?;
     }
 
     if json_output {

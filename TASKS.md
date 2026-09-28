@@ -73,8 +73,10 @@ Implementation notes:
   - Strict server URL validation: requires HTTPS for remote endpoints, allows HTTP strictly for loopback (`localhost`, `127.0.0.1`, `[::1]`), and strictly rejects paths, query strings, fragments, and credentials. Failed authorization preserves prior valid session.
   - Secret hygiene (`SEC-003`): masked input rendering, token inputs zeroized on cancel/lock/exit/submit/drop, token redacted in `Debug` and error representations.
   - Truthful sign-out revocation: invokes server session revocation (`api_revoke_session`) and preserves local credentials on network/offline failure so sign-out can be retried without false success.
+  - Fail-closed credential cleanup: `clear_auth_session`, `sign_out`, and `force_clear_session` propagate unlink/write/flush errors and verify absence before reporting success, preventing false success when credential removal fails.
   - Truthful status bar badges: added dynamic account badge (`[Local-only]`, `[Auth: <short-id>]`, `[Server: Offline]`, `[Server: Expired]`, `[Server: Revoked]`, `[Server: Error]`).
   - Preserved independent guarded sync semantics (`s`) and all existing CLI command flags, schemas, and exit behaviors.
+
 
 
 ---
