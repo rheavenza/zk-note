@@ -32,6 +32,18 @@ pub fn render_status_bar(f: &mut Frame<'_>, app: &App, area: Rect) {
         crate::client::auth::ClientAuthState::LocalOnly => {
             Span::styled("[Local-only] ", Style::default().fg(Color::DarkGray))
         }
+        crate::client::auth::ClientAuthState::Unverified { account_id, .. } => {
+            let id_str = account_id.to_string();
+            let short_id = if id_str.len() >= 8 {
+                &id_str[..8]
+            } else {
+                &id_str
+            };
+            Span::styled(
+                format!("[Auth: {short_id} (unverified)] "),
+                Style::default().fg(Color::Yellow),
+            )
+        }
         crate::client::auth::ClientAuthState::Authenticated { account_id, .. } => {
             let id_str = account_id.to_string();
             let short_id = if id_str.len() >= 8 {

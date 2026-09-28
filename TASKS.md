@@ -75,6 +75,10 @@ Implementation notes:
   - Truthful sign-out revocation: invokes server session revocation (`api_revoke_session`) and preserves local credentials on network/offline failure so sign-out can be retried without false success.
   - Fail-closed credential cleanup: `clear_auth_session`, `sign_out`, and `force_clear_session` propagate unlink/write/flush errors and verify absence before reporting success, preventing false success when credential removal fails.
   - Truthful status bar badges: added dynamic account badge (`[Local-only]`, `[Auth: <short-id>]`, `[Server: Offline]`, `[Server: Expired]`, `[Server: Revoked]`, `[Server: Error]`).
+  - Addressed review findings (PR #2 review comment 5336112430):
+    1. Honest unverified auth startup: `App::new` initializes saved credentials as `ClientAuthState::Unverified` (`[Auth: <short-id> (unverified)]`) and queues non-blocking `AccountPendingAction::StartupVerify`. The TUI renders frame 1 immediately for instant offline interaction while verifying against the server asynchronously, transitioning honestly to `Authenticated`, `Offline`, `Revoked`, or `Expired`.
+    2. Typed 401 `AUTH_EXPIRED`: added `CliError::SessionExpired` and mapped `ERROR_AUTH_EXPIRED` from server 401 responses in `api_query_status` and auth endpoints, allowing `check_auth_state_online` to yield `ClientAuthState::Expired`.
+    3. Fail-closed status check: `check_auth_state_online` requires explicit `"active"` server status; unknown statuses fail closed to `ClientAuthState::Error`.
   - Preserved independent guarded sync semantics (`s`) and all existing CLI command flags, schemas, and exit behaviors.
 
 

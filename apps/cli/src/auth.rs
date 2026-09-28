@@ -17,7 +17,7 @@ use zk_protocol::auth::{
     AuthToken, DeviceAuthRequest, DeviceAuthResponse, DeviceListResponse, RevokeDeviceResponse,
     SessionStatusResponse, REDACTED_TOKEN,
 };
-use zk_protocol::constants::{ERROR_AUTH_REVOKED, ERROR_DEVICE_REVOKED};
+use zk_protocol::constants::{ERROR_AUTH_EXPIRED, ERROR_AUTH_REVOKED, ERROR_DEVICE_REVOKED};
 use zk_protocol::webauthn::RevokeSessionRequest;
 
 /// Persisted client authentication session details.
@@ -259,8 +259,11 @@ pub async fn api_device_authorize(
                 .get("message")
                 .and_then(|m| m.as_str())
                 .unwrap_or("Unknown server error");
-            if code == ERROR_DEVICE_REVOKED {
+            if code == ERROR_DEVICE_REVOKED || code == ERROR_AUTH_REVOKED {
                 return Err(CliError::SessionRevoked);
+            }
+            if code == ERROR_AUTH_EXPIRED {
+                return Err(CliError::SessionExpired);
             }
             return Err(CliError::AuthError(format!("{code}: {msg}")));
         }
@@ -325,6 +328,9 @@ pub async fn api_verify_token(
                 .unwrap_or("Unknown server error");
             if code == ERROR_AUTH_REVOKED || code == ERROR_DEVICE_REVOKED {
                 return Err(CliError::SessionRevoked);
+            }
+            if code == ERROR_AUTH_EXPIRED {
+                return Err(CliError::SessionExpired);
             }
             return Err(CliError::AuthError(format!("{code}: {msg}")));
         }
@@ -431,6 +437,9 @@ pub async fn api_query_status(
             if code == ERROR_AUTH_REVOKED || code == ERROR_DEVICE_REVOKED {
                 return Err(CliError::SessionRevoked);
             }
+            if code == ERROR_AUTH_EXPIRED {
+                return Err(CliError::SessionExpired);
+            }
             return Err(CliError::AuthError(format!("{code}: {msg}")));
         }
         return Err(CliError::AuthError(format!("HTTP {status}")));
@@ -478,6 +487,9 @@ pub async fn api_list_devices(session: &StoredAuthSession) -> Result<DeviceListR
                 .unwrap_or("Unknown server error");
             if code == ERROR_AUTH_REVOKED || code == ERROR_DEVICE_REVOKED {
                 return Err(CliError::SessionRevoked);
+            }
+            if code == ERROR_AUTH_EXPIRED {
+                return Err(CliError::SessionExpired);
             }
             return Err(CliError::AuthError(format!("{code}: {msg}")));
         }
@@ -531,6 +543,9 @@ pub async fn api_revoke_device(
                 .unwrap_or("Unknown server error");
             if code == ERROR_AUTH_REVOKED || code == ERROR_DEVICE_REVOKED {
                 return Err(CliError::SessionRevoked);
+            }
+            if code == ERROR_AUTH_EXPIRED {
+                return Err(CliError::SessionExpired);
             }
             return Err(CliError::AuthError(format!("{code}: {msg}")));
         }

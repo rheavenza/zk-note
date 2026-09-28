@@ -1746,6 +1746,25 @@ pub async fn cmd_whoami(custom_data_dir: Option<&Path>, json_output: bool) -> Re
                     })
                 );
             }
+            crate::client::auth::ClientAuthState::Unverified {
+                server_url,
+                account_id,
+                device_id,
+                session_id,
+                ..
+            } => {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "authenticated": false,
+                        "server_url": server_url,
+                        "account_id": account_id,
+                        "device_id": device_id,
+                        "session_id": session_id,
+                        "status": "unverified",
+                    })
+                );
+            }
             crate::client::auth::ClientAuthState::LocalOnly => {
                 println!("{}", serde_json::json!({ "authenticated": false }));
             }
@@ -1815,6 +1834,21 @@ pub async fn cmd_whoami(custom_data_dir: Option<&Path>, json_output: bool) -> Re
             crate::client::auth::ClientAuthState::Error { server_url, error } => {
                 println!("Server:     {}", server_url);
                 println!("Status:     UNREACHABLE / ERROR ({error})");
+            }
+            crate::client::auth::ClientAuthState::Unverified {
+                server_url,
+                account_id,
+                device_id,
+                session_id,
+                ..
+            } => {
+                println!("Server:     {}", server_url);
+                println!("Account ID: {}", account_id);
+                println!("Device ID:  {}", device_id);
+                if let Some(sid) = session_id {
+                    println!("Session ID: {}", sid);
+                }
+                println!("Status:     UNVERIFIED (local session not yet verified online)");
             }
             crate::client::auth::ClientAuthState::LocalOnly => {
                 println!("Not logged in. Run 'zk-note login' to authenticate.");

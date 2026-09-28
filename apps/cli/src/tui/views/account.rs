@@ -160,6 +160,7 @@ pub fn render_account_modal(f: &mut Frame<'_>, app: &App, area: Rect) {
     // 6. Current Account Status & Device Details
     let (status_badge, status_color) = match &app.account_state {
         ClientAuthState::LocalOnly => ("Local Vault Only (Not Connected)", Color::DarkGray),
+        ClientAuthState::Unverified { .. } => ("Unverified (Pending Server Check)", Color::Yellow),
         ClientAuthState::Authenticated { .. } => ("Authenticated (Active)", Color::Green),
         ClientAuthState::Offline { .. } => ("Offline (Server Unreachable)", Color::Yellow),
         ClientAuthState::Expired { .. } => ("Session Expired", Color::Red),

@@ -51,6 +51,11 @@ fn render_to_string(app: &App, width: u16, height: u16) -> String {
     format!("{:?}", terminal.backend().buffer())
 }
 
+fn setup_unlocked_vault_in_dir(dir: &Path) {
+    cmd_init(Some(dir), Some("test-password-123".to_string()), true).expect("init vault");
+    let _key = unlock_vault(Some(dir), "test-password-123", None).expect("unlock vault");
+}
+
 /// Helper creating a synthetic unlocked vault and temporary data directory.
 fn setup_test_vault() -> (TestDir, App) {
     let temp_dir = TestDir::new("vault");
@@ -801,15 +806,26 @@ fn test_account_field_navigation_and_actions() {
 #[test]
 fn test_account_status_bar_badges() {
     let (_dir, mut app) = setup_test_vault();
+    let account_id = uuid::Uuid::new_v4();
+    let short_id = &account_id.to_string()[..8];
 
     // 1. Local-only
     app.account_state = ClientAuthState::LocalOnly;
     let out = render_to_string(&app, 80, 24);
     assert!(out.contains("[Local-only]"));
 
+    // 1b. Unverified
+    app.account_state = ClientAuthState::Unverified {
+        server_url: "http://127.0.0.1:8080".to_string(),
+        account_id,
+        device_id: uuid::Uuid::new_v4(),
+        session_id: Some(uuid::Uuid::new_v4()),
+        expires_at: None,
+    };
+    let out = render_to_string(&app, 80, 24);
+    assert!(out.contains(&format!("[Auth: {short_id} (unverified)]")));
+
     // 2. Authenticated
-    let account_id = uuid::Uuid::new_v4();
-    let short_id = &account_id.to_string()[..8];
     app.account_state = ClientAuthState::Authenticated {
         server_url: "http://127.0.0.1:8080".to_string(),
         account_id,
@@ -850,4 +866,230 @@ fn test_account_status_bar_badges() {
     };
     let out = render_to_string(&app, 80, 24);
     assert!(out.contains("[Server: Revoked]"));
+}
+
+#[tokio::test]
+async fn test_startup_offline_preserves_offline_first_and_updates_badge() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("zk_tui_startup_off_{}", uuid::Uuid::new_v4()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    setup_unlocked_vault_in_dir(&temp_dir);
+
+    let account_id = uuid::Uuid::new_v4();
+    let short_id = &account_id.to_string()[..8];
+    // Point to an unreachable port to simulate offline
+    let session = crate::auth::StoredAuthSession {
+        server_url: "http://127.0.0.1:1".to_string(),
+        account_id,
+        device_id: uuid::Uuid::new_v4(),
+        session_id: Some(uuid::Uuid::new_v4()),
+        token: zk_protocol::auth::AuthToken::new("test_tok"),
+        expires_at: None,
+    };
+    crate::auth::save_auth_session(&crate::config::auth_session_file(&temp_dir), &session).unwrap();
+
+    // 1. App::new initializes with Unverified state and queues StartupVerify
+    let mut app = App::new(Some(&temp_dir), 100, 30);
+    assert!(app.account_state.is_unverified());
+    assert_eq!(
+        app.account_pending_action,
+        Some(AccountPendingAction::StartupVerify)
+    );
+
+    // 2. Initial render shows honest unverified badge, never falsely active
+    let initial_render = render_to_string(&app, 100, 30);
+    assert!(initial_render.contains(&format!("[Auth: {short_id} (unverified)]")));
+    assert!(!initial_render.contains(&format!("[Auth: {short_id}] ")));
+
+    // 3. User can interact offline immediately without blocking
+    app.update(Action::MoveDown);
+    assert!(!app.should_quit);
+
+    // 4. Dispatch StartupVerify
+    match app.account_pending_action.take() {
+        Some(AccountPendingAction::StartupVerify) => {
+            let st = crate::client::auth::check_auth_state_online(Some(&temp_dir))
+                .await
+                .unwrap();
+            assert!(st.is_offline(), "offline server must yield Offline state");
+            app.account_state = st;
+        }
+        other => panic!("expected StartupVerify, got {other:?}"),
+    }
+
+    // 5. Subsequent render shows [Server: Offline]
+    let verified_render = render_to_string(&app, 100, 30);
+    assert!(verified_render.contains("[Server: Offline]"));
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_startup_revoked_session_updates_badge() {
+    let (server_url, state, _shutdown) = crate::client::auth::tests::start_test_server().await;
+    let temp_dir =
+        std::env::temp_dir().join(format!("zk_tui_startup_rev_{}", uuid::Uuid::new_v4()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    setup_unlocked_vault_in_dir(&temp_dir);
+
+    let account_id = uuid::Uuid::new_v4();
+    let short_id = &account_id.to_string()[..8];
+    let (_, authorizer) = state
+        .db
+        .create_session(account_id, None, None, Some(3600))
+        .await
+        .unwrap();
+
+    let session = crate::client::auth::authorize_terminal_device(
+        Some(&temp_dir),
+        &server_url,
+        authorizer.expose_secret(),
+        Some(account_id),
+        Some("Revoked Startup".to_string()),
+        None,
+    )
+    .await
+    .expect("auth succeeds");
+
+    // Revoke device on server
+    state
+        .db
+        .revoke_device(account_id, session.device_id)
+        .await
+        .unwrap();
+
+    let mut app = App::new(Some(&temp_dir), 100, 30);
+    assert!(app.account_state.is_unverified());
+    let initial_render = render_to_string(&app, 100, 30);
+    assert!(initial_render.contains(&format!("[Auth: {short_id} (unverified)]")));
+
+    match app.account_pending_action.take() {
+        Some(AccountPendingAction::StartupVerify) => {
+            let st = crate::client::auth::check_auth_state_online(Some(&temp_dir))
+                .await
+                .unwrap();
+            assert!(st.is_revoked(), "revoked device must yield Revoked state");
+            app.account_state = st;
+        }
+        other => panic!("expected StartupVerify, got {other:?}"),
+    }
+
+    let verified_render = render_to_string(&app, 100, 30);
+    assert!(verified_render.contains("[Server: Revoked]"));
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_startup_expired_session_updates_badge() {
+    let (server_url, state, _shutdown) = crate::client::auth::tests::start_test_server().await;
+    let temp_dir =
+        std::env::temp_dir().join(format!("zk_tui_startup_exp_{}", uuid::Uuid::new_v4()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    setup_unlocked_vault_in_dir(&temp_dir);
+
+    let account_id = uuid::Uuid::new_v4();
+    let short_id = &account_id.to_string()[..8];
+    let (server_sess, token) = state
+        .db
+        .create_session(
+            account_id,
+            None,
+            Some("Expired Startup".to_string()),
+            Some(-10),
+        )
+        .await
+        .unwrap();
+
+    let session = crate::auth::StoredAuthSession {
+        server_url: server_url.clone(),
+        account_id,
+        device_id: server_sess.device_id.unwrap_or_else(uuid::Uuid::new_v4),
+        session_id: Some(server_sess.session_id),
+        token,
+        expires_at: None,
+    };
+    crate::auth::save_auth_session(&crate::config::auth_session_file(&temp_dir), &session).unwrap();
+
+    let mut app = App::new(Some(&temp_dir), 100, 30);
+    assert!(app.account_state.is_unverified());
+    let initial_render = render_to_string(&app, 100, 30);
+    assert!(initial_render.contains(&format!("[Auth: {short_id} (unverified)]")));
+
+    match app.account_pending_action.take() {
+        Some(AccountPendingAction::StartupVerify) => {
+            let st = crate::client::auth::check_auth_state_online(Some(&temp_dir))
+                .await
+                .unwrap();
+            assert!(st.is_expired(), "expired session must yield Expired state");
+            app.account_state = st;
+        }
+        other => panic!("expected StartupVerify, got {other:?}"),
+    }
+
+    let verified_render = render_to_string(&app, 100, 30);
+    assert!(verified_render.contains("[Server: Expired]"));
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_startup_with_saved_session_verifies_active() {
+    let (server_url, state, _shutdown) = crate::client::auth::tests::start_test_server().await;
+    let temp_dir =
+        std::env::temp_dir().join(format!("zk_tui_startup_act_{}", uuid::Uuid::new_v4()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    setup_unlocked_vault_in_dir(&temp_dir);
+
+    let account_id = uuid::Uuid::new_v4();
+    let short_id = &account_id.to_string()[..8];
+    let (server_sess, token) = state
+        .db
+        .create_session(
+            account_id,
+            None,
+            Some("Active Startup".to_string()),
+            Some(3600),
+        )
+        .await
+        .unwrap();
+
+    let session = crate::auth::StoredAuthSession {
+        server_url: server_url.clone(),
+        account_id,
+        device_id: server_sess.device_id.unwrap_or_else(uuid::Uuid::new_v4),
+        session_id: Some(server_sess.session_id),
+        token,
+        expires_at: None,
+    };
+    crate::auth::save_auth_session(&crate::config::auth_session_file(&temp_dir), &session).unwrap();
+
+    let mut app = App::new(Some(&temp_dir), 100, 30);
+    assert!(app.account_state.is_unverified());
+    assert_eq!(
+        app.account_pending_action,
+        Some(AccountPendingAction::StartupVerify)
+    );
+    let initial_render = render_to_string(&app, 100, 30);
+    assert!(initial_render.contains(&format!("[Auth: {short_id} (unverified)]")));
+
+    match app.account_pending_action.take() {
+        Some(AccountPendingAction::StartupVerify) => {
+            let st = crate::client::auth::check_auth_state_online(Some(&temp_dir))
+                .await
+                .unwrap();
+            assert!(
+                st.is_authenticated(),
+                "active session must yield Authenticated state"
+            );
+            app.account_state = st;
+        }
+        other => panic!("expected StartupVerify, got {other:?}"),
+    }
+
+    let verified_render = render_to_string(&app, 100, 30);
+    assert!(verified_render.contains(&format!("[Auth: {short_id}]")));
+    assert!(!verified_render.contains("(unverified)"));
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
 }

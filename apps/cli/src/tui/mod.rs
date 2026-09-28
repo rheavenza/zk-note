@@ -181,6 +181,25 @@ pub async fn run_tui(data_dir: Option<&Path>) -> Result<(), CliError> {
                         }
                     }
                 }
+                app::AccountPendingAction::StartupVerify => {
+                    match crate::client::auth::check_auth_state_online(app.data_dir.as_deref())
+                        .await
+                    {
+                        Ok(st) => {
+                            app.account_state = st;
+                        }
+                        Err(e) => {
+                            app.account_state = crate::client::auth::ClientAuthState::Error {
+                                server_url: app
+                                    .account_state
+                                    .server_url()
+                                    .unwrap_or("")
+                                    .to_string(),
+                                error: e.to_string(),
+                            };
+                        }
+                    }
+                }
             }
         }
 

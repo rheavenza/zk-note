@@ -26,7 +26,15 @@ use uuid::Uuid;
 pub enum ClientAuthState {
     /// No server session is configured (offline local vault).
     LocalOnly,
-    /// Device is authenticated with an active server session.
+    /// A session is saved locally, but has not yet been verified online with the sync server.
+    Unverified {
+        server_url: String,
+        account_id: Uuid,
+        device_id: Uuid,
+        session_id: Option<Uuid>,
+        expires_at: Option<String>,
+    },
+    /// Device is authenticated with an active server session verified online.
     Authenticated {
         server_url: String,
         account_id: Uuid,
@@ -64,6 +72,9 @@ impl fmt::Display for ClientAuthState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ClientAuthState::LocalOnly => write!(f, "Local vault only (not signed in)"),
+            ClientAuthState::Unverified { account_id, .. } => {
+                write!(f, "Saved session ({account_id}) — unverified")
+            }
             ClientAuthState::Authenticated { account_id, .. } => {
                 write!(f, "Signed in ({account_id})")
             }
@@ -76,7 +87,7 @@ impl fmt::Display for ClientAuthState {
 }
 
 impl ClientAuthState {
-    /// Returns true if currently authenticated with an active session.
+    /// Returns true if currently authenticated with an active session verified online.
     #[must_use]
     pub fn is_authenticated(&self) -> bool {
         matches!(self, ClientAuthState::Authenticated { .. })
@@ -86,6 +97,12 @@ impl ClientAuthState {
     #[must_use]
     pub fn is_local_only(&self) -> bool {
         matches!(self, ClientAuthState::LocalOnly)
+    }
+
+    /// Returns true if saved credentials exist but have not yet been verified online.
+    #[must_use]
+    pub fn is_unverified(&self) -> bool {
+        matches!(self, ClientAuthState::Unverified { .. })
     }
 
     /// Returns true if currently offline / unreachable.
@@ -111,7 +128,8 @@ impl ClientAuthState {
     pub fn server_url(&self) -> Option<&str> {
         match self {
             ClientAuthState::LocalOnly => None,
-            ClientAuthState::Authenticated { server_url, .. }
+            ClientAuthState::Unverified { server_url, .. }
+            | ClientAuthState::Authenticated { server_url, .. }
             | ClientAuthState::Offline { server_url, .. }
             | ClientAuthState::Expired { server_url, .. }
             | ClientAuthState::Revoked { server_url, .. }
@@ -123,7 +141,8 @@ impl ClientAuthState {
     #[must_use]
     pub fn account_id(&self) -> Option<Uuid> {
         match self {
-            ClientAuthState::Authenticated { account_id, .. }
+            ClientAuthState::Unverified { account_id, .. }
+            | ClientAuthState::Authenticated { account_id, .. }
             | ClientAuthState::Offline { account_id, .. }
             | ClientAuthState::Expired { account_id, .. }
             | ClientAuthState::Revoked { account_id, .. } => Some(*account_id),
@@ -135,7 +154,8 @@ impl ClientAuthState {
     #[must_use]
     pub fn device_id(&self) -> Option<Uuid> {
         match self {
-            ClientAuthState::Authenticated { device_id, .. }
+            ClientAuthState::Unverified { device_id, .. }
+            | ClientAuthState::Authenticated { device_id, .. }
             | ClientAuthState::Offline { device_id, .. }
             | ClientAuthState::Expired { device_id, .. }
             | ClientAuthState::Revoked { device_id, .. } => Some(*device_id),
@@ -147,7 +167,8 @@ impl ClientAuthState {
     #[must_use]
     pub fn session_id(&self) -> Option<Uuid> {
         match self {
-            ClientAuthState::Authenticated { session_id, .. }
+            ClientAuthState::Unverified { session_id, .. }
+            | ClientAuthState::Authenticated { session_id, .. }
             | ClientAuthState::Offline { session_id, .. }
             | ClientAuthState::Expired { session_id, .. }
             | ClientAuthState::Revoked { session_id, .. } => *session_id,
@@ -267,6 +288,9 @@ pub fn validate_and_normalize_server_url(raw: &str) -> Result<String, CliError> 
 }
 
 /// Reads the local authentication session state without performing network operations.
+///
+/// If a saved session file exists, returns `ClientAuthState::Unverified` because
+/// its active status has not yet been verified online with the server.
 pub fn get_local_auth_state(custom_data_dir: Option<&Path>) -> Result<ClientAuthState, CliError> {
     let data_dir = resolve_data_dir(custom_data_dir);
     let auth_path = auth_session_file(&data_dir);
@@ -276,7 +300,7 @@ pub fn get_local_auth_state(custom_data_dir: Option<&Path>) -> Result<ClientAuth
     }
 
     let session = load_auth_session(&auth_path)?;
-    Ok(ClientAuthState::Authenticated {
+    Ok(ClientAuthState::Unverified {
         server_url: session.server_url,
         account_id: session.account_id,
         device_id: session.device_id,
@@ -289,10 +313,11 @@ pub fn get_local_auth_state(custom_data_dir: Option<&Path>) -> Result<ClientAuth
 ///
 /// Returns an honest connection state:
 /// - `LocalOnly` if no credentials exist.
-/// - `Authenticated` if the session is verified active.
+/// - `Authenticated` if the session is explicitly verified active on the server.
 /// - `Offline` if network connection fails.
 /// - `Revoked` if session or device was revoked.
 /// - `Expired` if session token has expired.
+/// - `Error` if status is unrecognized or server error occurs.
 pub async fn check_auth_state_online(
     custom_data_dir: Option<&Path>,
 ) -> Result<ClientAuthState, CliError> {
@@ -307,32 +332,38 @@ pub async fn check_auth_state_online(
     let status_res = api_query_status(&session).await;
 
     match status_res {
-        Ok(status) => {
-            if status.status == "revoked" {
-                Ok(ClientAuthState::Revoked {
-                    server_url: session.server_url,
-                    account_id: session.account_id,
-                    device_id: session.device_id,
-                    session_id: session.session_id,
-                })
-            } else if status.status == "expired" {
-                Ok(ClientAuthState::Expired {
-                    server_url: session.server_url,
-                    account_id: session.account_id,
-                    device_id: session.device_id,
-                    session_id: session.session_id,
-                })
-            } else {
-                Ok(ClientAuthState::Authenticated {
-                    server_url: session.server_url,
-                    account_id: status.account_id,
-                    device_id: status.device_id.unwrap_or(session.device_id),
-                    session_id: status.session_id.or(session.session_id),
-                    expires_at: session.expires_at,
-                })
-            }
-        }
+        Ok(status) => match status.status.as_str() {
+            "active" => Ok(ClientAuthState::Authenticated {
+                server_url: session.server_url,
+                account_id: status.account_id,
+                device_id: status.device_id.unwrap_or(session.device_id),
+                session_id: status.session_id.or(session.session_id),
+                expires_at: session.expires_at,
+            }),
+            "revoked" => Ok(ClientAuthState::Revoked {
+                server_url: session.server_url,
+                account_id: session.account_id,
+                device_id: session.device_id,
+                session_id: session.session_id,
+            }),
+            "expired" => Ok(ClientAuthState::Expired {
+                server_url: session.server_url,
+                account_id: session.account_id,
+                device_id: session.device_id,
+                session_id: session.session_id,
+            }),
+            other => Ok(ClientAuthState::Error {
+                server_url: session.server_url,
+                error: format!("unrecognized session status '{other}'"),
+            }),
+        },
         Err(CliError::SessionRevoked) => Ok(ClientAuthState::Revoked {
+            server_url: session.server_url,
+            account_id: session.account_id,
+            device_id: session.device_id,
+            session_id: session.session_id,
+        }),
+        Err(CliError::SessionExpired) => Ok(ClientAuthState::Expired {
             server_url: session.server_url,
             account_id: session.account_id,
             device_id: session.device_id,
@@ -463,8 +494,9 @@ pub fn force_clear_session(custom_data_dir: Option<&Path>) -> Result<(), CliErro
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use zk_protocol::auth::AuthToken;
 
     #[test]
     fn test_server_url_validation_loopback_allowed() {
@@ -548,7 +580,7 @@ mod tests {
         assert!(ftp_err.to_string().contains("Unsupported"));
     }
 
-    async fn start_test_server() -> (
+    pub(crate) async fn start_test_server() -> (
         String,
         zk_server::AppState,
         tokio::sync::oneshot::Sender<()>,
@@ -957,5 +989,135 @@ mod tests {
             restore_perms.set_mode(0o700);
             let _ = std::fs::set_permissions(dir_path, restore_perms);
         }
+    }
+
+    #[tokio::test]
+    async fn test_expired_session_reporting_server_401() {
+        let (server_url, state, _shutdown) = start_test_server().await;
+        let test_dir = TempDataDir::new("expired_reporting");
+        let dir_path = test_dir.path();
+
+        let account_id = Uuid::new_v4();
+        // Create session expired in the past (-10 seconds TTL)
+        let (server_sess, token) = state
+            .db
+            .create_session(
+                account_id,
+                None,
+                Some("Expired Session".to_string()),
+                Some(-10),
+            )
+            .await
+            .unwrap();
+
+        let session = StoredAuthSession {
+            server_url: server_url.clone(),
+            account_id,
+            device_id: server_sess.device_id.unwrap_or_else(Uuid::new_v4),
+            session_id: Some(server_sess.session_id),
+            token,
+            expires_at: None,
+        };
+        save_auth_session(&auth_session_file(dir_path), &session).unwrap();
+
+        let st = check_auth_state_online(Some(dir_path)).await.unwrap();
+        assert!(
+            st.is_expired(),
+            "must report Expired state on server 401 AUTH_EXPIRED"
+        );
+        match st {
+            ClientAuthState::Expired {
+                server_url: s_url,
+                account_id: a_id,
+                ..
+            } => {
+                assert_eq!(s_url, server_url);
+                assert_eq!(a_id, account_id);
+            }
+            other => panic!("expected Expired state, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_unknown_session_status_fails_closed() {
+        use axum::routing::get;
+        let app = axum::Router::new().route(
+            "/v1/auth/session/status",
+            get(|| async {
+                axum::Json(serde_json::json!({
+                    "account_id": Uuid::new_v4(),
+                    "device_id": Uuid::new_v4(),
+                    "status": "suspended" // unrecognized status
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock server");
+        let local_addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await;
+        });
+
+        let test_dir = TempDataDir::new("unknown_status_fail");
+        let dir_path = test_dir.path();
+        let session = StoredAuthSession {
+            server_url: format!("http://{}", local_addr),
+            account_id: Uuid::new_v4(),
+            device_id: Uuid::new_v4(),
+            session_id: Some(Uuid::new_v4()),
+            token: AuthToken::new("mock_token"),
+            expires_at: None,
+        };
+        save_auth_session(&auth_session_file(dir_path), &session).unwrap();
+
+        let st = check_auth_state_online(Some(dir_path)).await.unwrap();
+        assert!(
+            !st.is_authenticated(),
+            "unknown status must not be treated as Authenticated"
+        );
+        match st {
+            ClientAuthState::Error { error, .. } => {
+                assert!(error.contains("unrecognized session status 'suspended'"));
+            }
+            other => panic!("expected Error state, got {other:?}"),
+        }
+        let _ = shutdown_tx.send(());
+    }
+
+    #[test]
+    fn test_local_auth_state_returns_unverified_when_credentials_exist() {
+        let test_dir = TempDataDir::new("local_unverified");
+        let dir_path = test_dir.path();
+
+        // When no credentials exist
+        assert_eq!(
+            get_local_auth_state(Some(dir_path)).unwrap(),
+            ClientAuthState::LocalOnly
+        );
+
+        // When credentials exist
+        let session = StoredAuthSession {
+            server_url: "https://notes.example.com".to_string(),
+            account_id: Uuid::new_v4(),
+            device_id: Uuid::new_v4(),
+            session_id: Some(Uuid::new_v4()),
+            token: AuthToken::new("test_tok"),
+            expires_at: None,
+        };
+        save_auth_session(&auth_session_file(dir_path), &session).unwrap();
+
+        let state = get_local_auth_state(Some(dir_path)).unwrap();
+        assert!(
+            state.is_unverified(),
+            "saved credentials must initialize as unverified"
+        );
+        assert_eq!(state.server_url(), Some("https://notes.example.com"));
+        assert_eq!(state.account_id(), Some(session.account_id));
     }
 }

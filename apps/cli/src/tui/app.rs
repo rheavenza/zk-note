@@ -72,6 +72,7 @@ pub enum AccountPendingAction {
     Connect { server_url: String, token: String },
     SignOut,
     RefreshStatus,
+    StartupVerify,
 }
 
 impl fmt::Debug for AccountPendingAction {
@@ -84,6 +85,7 @@ impl fmt::Debug for AccountPendingAction {
                 .finish(),
             AccountPendingAction::SignOut => write!(f, "AccountPendingAction::SignOut"),
             AccountPendingAction::RefreshStatus => write!(f, "AccountPendingAction::RefreshStatus"),
+            AccountPendingAction::StartupVerify => write!(f, "AccountPendingAction::StartupVerify"),
         }
     }
 }
@@ -193,6 +195,12 @@ impl App {
             initial_mode
         };
 
+        let initial_pending_action = if initial_auth.is_unverified() {
+            Some(AccountPendingAction::StartupVerify)
+        } else {
+            None
+        };
+
         let mut app = Self {
             mode,
             previous_mode: if mode == AppMode::TerminalTooSmall {
@@ -222,7 +230,7 @@ impl App {
             account_server_input: default_server,
             account_token_input: String::new(),
             account_focus_field: AccountField::ServerUrl,
-            account_pending_action: None,
+            account_pending_action: initial_pending_action,
             sync_status: initial_sync,
             status_message: None,
             error_message: None,
