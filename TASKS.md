@@ -48,7 +48,7 @@ Every task must satisfy:
 ---
 
 ## ZK-101 — Add lazygit-style interactive terminal UI
-Status: VERIFIED (PR #2; pending merge)
+Status: DONE (PR #2 merged)
 Priority: P1
 Dependencies: ZK-027, ZK-040 through ZK-046, ZK-050 through ZK-057, ZK-072, ZK-076
 
@@ -62,9 +62,9 @@ Review note (2026-09-28): Codex independently verified worker head
 `93ee29916fc33610fcc2532bb7fd5112c2a34351` against `master`
 `46682e8722c37d5a45a6051db9a46d1f71f54786`. AC-01–AC-11 and the
 server-auth addendum criteria passed; exact-head formatting, Clippy, 101 CLI
-tests, full CI, and synthetic PTY/plaintext checks passed. The PR remains
-unmerged pending final integration; see PR #2 for the evidence and recorded
-transitive dependency audit warnings.
+tests, full CI, and synthetic PTY/plaintext checks passed. PR #2 merged into
+`master` as `45f26aa5e598208618952d1b611c8e70ab89ff4f`; see the PR for
+evidence and recorded transitive dependency audit warnings.
 
 Implementation notes:
 - Implemented full-screen keyboard-first TUI via Ratatui 0.29 and Crossterm 0.28 under `apps/cli/src/tui`.
