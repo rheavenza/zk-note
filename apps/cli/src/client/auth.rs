@@ -1120,4 +1120,208 @@ pub(crate) mod tests {
         assert_eq!(state.server_url(), Some("https://notes.example.com"));
         assert_eq!(state.account_id(), Some(session.account_id));
     }
+
+    #[tokio::test]
+    async fn test_malicious_server_echoing_bearer_token_is_never_leaked() {
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use axum::routing::{delete, get, post};
+
+        let canary = "super_secret_bearer_token_canary_123456789";
+
+        // Mock malicious handler that echoes the bearer token back in an error response message
+        let malicious_handler = |headers: axum::http::HeaderMap| async move {
+            let token_str = headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("no_auth");
+            (
+                StatusCode::UNAUTHORIZED,
+                axum::Json(serde_json::json!({
+                    "code": "AUTH_FAILED",
+                    "message": format!("Server received token: {token_str}")
+                })),
+            )
+                .into_response()
+        };
+
+        let malicious_revoke_handler = |headers: axum::http::HeaderMap| async move {
+            let token_str = headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("no_auth");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(serde_json::json!({
+                    "code": "SERVER_ERROR",
+                    "message": format!("Server received token: {token_str}")
+                })),
+            )
+                .into_response()
+        };
+
+        let app = axum::Router::new()
+            .route("/v1/auth/device/authorize", post(malicious_handler))
+            .route("/v1/auth/session/status", get(malicious_handler))
+            .route("/v1/auth/session/revoke", post(malicious_revoke_handler))
+            .route("/v1/devices", get(malicious_handler))
+            .route("/v1/devices/{id}", delete(malicious_handler));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock server");
+        let local_addr = listener.local_addr().unwrap();
+        let server_url = format!("http://{}", local_addr);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await;
+        });
+
+        let test_account = Uuid::new_v4();
+        let test_device = Uuid::new_v4();
+        let session = StoredAuthSession {
+            server_url: server_url.clone(),
+            account_id: test_account,
+            device_id: test_device,
+            session_id: Some(Uuid::new_v4()),
+            token: AuthToken::new(canary),
+            expires_at: None,
+        };
+
+        // 1. api_device_authorize
+        let err1 =
+            crate::auth::api_device_authorize(&server_url, canary, test_account, test_device, None)
+                .await
+                .unwrap_err();
+        assert!(
+            !err1.to_string().contains(canary),
+            "api_device_authorize leaked token: {err1}"
+        );
+        assert!(
+            !err1.to_string().contains("Server received token"),
+            "api_device_authorize leaked raw message: {err1}"
+        );
+
+        // 2. api_verify_token
+        let err2 = crate::auth::api_verify_token(&server_url, canary, test_device)
+            .await
+            .unwrap_err();
+        assert!(
+            !err2.to_string().contains(canary),
+            "api_verify_token leaked token: {err2}"
+        );
+        assert!(
+            !err2.to_string().contains("Server received token"),
+            "api_verify_token leaked raw message: {err2}"
+        );
+
+        // 3. api_query_status
+        let err3 = crate::auth::api_query_status(&session).await.unwrap_err();
+        assert!(
+            !err3.to_string().contains(canary),
+            "api_query_status leaked token: {err3}"
+        );
+        assert!(
+            !err3.to_string().contains("Server received token"),
+            "api_query_status leaked raw message: {err3}"
+        );
+
+        // 4. api_revoke_session
+        let err4 = crate::auth::api_revoke_session(&session).await.unwrap_err();
+        assert!(
+            !err4.to_string().contains(canary),
+            "api_revoke_session leaked token: {err4}"
+        );
+        assert!(
+            !err4.to_string().contains("Server received token"),
+            "api_revoke_session leaked raw message: {err4}"
+        );
+
+        // 5. api_list_devices
+        let err5 = crate::auth::api_list_devices(&session).await.unwrap_err();
+        assert!(
+            !err5.to_string().contains(canary),
+            "api_list_devices leaked token: {err5}"
+        );
+        assert!(
+            !err5.to_string().contains("Server received token"),
+            "api_list_devices leaked raw message: {err5}"
+        );
+
+        // 6. api_revoke_device
+        let err6 = crate::auth::api_revoke_device(&session, test_device)
+            .await
+            .unwrap_err();
+        assert!(
+            !err6.to_string().contains(canary),
+            "api_revoke_device leaked token: {err6}"
+        );
+        assert!(
+            !err6.to_string().contains("Server received token"),
+            "api_revoke_device leaked raw message: {err6}"
+        );
+
+        let _ = shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn test_stalled_server_bounded_request_times_out() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let local_addr = listener.local_addr().expect("local addr");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = shutdown_rx => {},
+                res = listener.accept() => {
+                    if let Ok((mut socket, _)) = res {
+                        use tokio::io::AsyncReadExt;
+                        let mut buf = [0u8; 1024];
+                        let _ = socket.read(&mut buf).await;
+                        // Deliberately stall: never write response bytes
+                        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                    }
+                }
+            }
+        });
+
+        // Set short timeout override for test
+        std::env::set_var("ZK_AUTH_TIMEOUT_MS", "200");
+        std::env::set_var("ZK_AUTH_CONNECT_TIMEOUT_MS", "200");
+
+        let test_dir = TempDataDir::new("stall_timeout");
+        let dir_path = test_dir.path();
+        let session = StoredAuthSession {
+            server_url: format!("http://{}", local_addr),
+            account_id: Uuid::new_v4(),
+            device_id: Uuid::new_v4(),
+            session_id: Some(Uuid::new_v4()),
+            token: AuthToken::new("test_tok"),
+            expires_at: None,
+        };
+        save_auth_session(&auth_session_file(dir_path), &session).unwrap();
+
+        let start = std::time::Instant::now();
+        let st = check_auth_state_online(Some(dir_path)).await.unwrap();
+        let elapsed = start.elapsed();
+
+        std::env::remove_var("ZK_AUTH_TIMEOUT_MS");
+        std::env::remove_var("ZK_AUTH_CONNECT_TIMEOUT_MS");
+
+        assert!(st.is_offline(), "stalled server must yield Offline state");
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "bounded request must time out quickly, took {:?}",
+            elapsed
+        );
+
+        let _ = shutdown_tx.send(());
+    }
 }

@@ -1093,3 +1093,85 @@ async fn test_startup_with_saved_session_verifies_active() {
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
+
+#[tokio::test]
+async fn test_startup_verification_stalled_server_preserves_offline_first_and_updates_badge() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind listener");
+    let local_addr = listener.local_addr().expect("local addr");
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = shutdown_rx => {},
+            res = listener.accept() => {
+                if let Ok((mut socket, _)) = res {
+                    use tokio::io::AsyncReadExt;
+                    let mut buf = [0u8; 1024];
+                    let _ = socket.read(&mut buf).await;
+                    // Deliberately stall: never write response bytes
+                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                }
+            }
+        }
+    });
+
+    std::env::set_var("ZK_AUTH_TIMEOUT_MS", "200");
+    std::env::set_var("ZK_AUTH_CONNECT_TIMEOUT_MS", "200");
+
+    let temp_dir =
+        std::env::temp_dir().join(format!("zk_tui_startup_stall_{}", uuid::Uuid::new_v4()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    setup_unlocked_vault_in_dir(&temp_dir);
+
+    let account_id = uuid::Uuid::new_v4();
+    let short_id = &account_id.to_string()[..8];
+    let session = crate::auth::StoredAuthSession {
+        server_url: format!("http://{}", local_addr),
+        account_id,
+        device_id: uuid::Uuid::new_v4(),
+        session_id: Some(uuid::Uuid::new_v4()),
+        token: zk_protocol::auth::AuthToken::new("test_tok"),
+        expires_at: None,
+    };
+    crate::auth::save_auth_session(&crate::config::auth_session_file(&temp_dir), &session).unwrap();
+
+    // 1. App initializes with Unverified state and queues StartupVerify
+    let mut app = App::new(Some(&temp_dir), 100, 30);
+    assert!(app.account_state.is_unverified());
+    assert_eq!(
+        app.account_pending_action,
+        Some(AccountPendingAction::StartupVerify)
+    );
+
+    // 2. Initial render shows honest unverified badge immediately without freeze
+    let initial_render = render_to_string(&app, 100, 30);
+    assert!(initial_render.contains(&format!("[Auth: {short_id} (unverified)]")));
+
+    // 3. User can interact offline immediately without blocking
+    app.update(Action::MoveDown);
+    assert!(!app.should_quit);
+
+    // 4. Dispatch bounded request against stalled server (times out quickly)
+    match app.account_pending_action.take() {
+        Some(AccountPendingAction::StartupVerify) => {
+            let st = crate::client::auth::check_auth_state_online(Some(&temp_dir))
+                .await
+                .unwrap();
+            assert!(st.is_offline(), "stalled server must yield Offline state");
+            app.account_state = st;
+        }
+        other => panic!("expected StartupVerify, got {other:?}"),
+    }
+
+    std::env::remove_var("ZK_AUTH_TIMEOUT_MS");
+    std::env::remove_var("ZK_AUTH_CONNECT_TIMEOUT_MS");
+
+    // 5. Subsequent render shows [Server: Offline]
+    let verified_render = render_to_string(&app, 100, 30);
+    assert!(verified_render.contains("[Server: Offline]"));
+
+    let _ = shutdown_tx.send(());
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}

@@ -24,6 +24,13 @@ use std::time::Duration;
 use terminal::{CrosstermAdapter, TerminalGuard};
 use zeroize::Zeroize;
 
+/// Asynchronous background authentication events received by the TUI event loop.
+#[derive(Debug)]
+enum AuthWorkerEvent {
+    StartupVerify(Result<crate::client::auth::ClientAuthState, CliError>),
+    RefreshStatus(Result<crate::client::auth::ClientAuthState, CliError>),
+}
+
 /// Launches and runs the full-screen interactive terminal interface.
 pub async fn run_tui(data_dir: Option<&Path>) -> Result<(), CliError> {
     let adapter = CrosstermAdapter;
@@ -41,7 +48,37 @@ pub async fn run_tui(data_dir: Option<&Path>) -> Result<(), CliError> {
     let mut app = App::new(data_dir, size.width, size.height);
     let tick_rate = Duration::from_millis(250);
 
+    let (auth_tx, mut auth_rx) = tokio::sync::mpsc::unbounded_channel::<AuthWorkerEvent>();
+
     while !app.should_quit {
+        // Drain any asynchronous background auth results without blocking the UI
+        while let Ok(msg) = auth_rx.try_recv() {
+            match msg {
+                AuthWorkerEvent::StartupVerify(res) => match res {
+                    Ok(st) => {
+                        app.account_state = st;
+                    }
+                    Err(e) => {
+                        app.account_state = crate::client::auth::ClientAuthState::Error {
+                            server_url: app.account_state.server_url().unwrap_or("").to_string(),
+                            error: e.to_string(),
+                        };
+                    }
+                },
+                AuthWorkerEvent::RefreshStatus(res) => match res {
+                    Ok(st) => {
+                        app.account_state = st;
+                        app.status_message = Some("Server status updated.".to_string());
+                        app.error_message = None;
+                    }
+                    Err(e) => {
+                        app.error_message = Some(format!("Failed to refresh status: {e}"));
+                        app.status_message = None;
+                    }
+                },
+            }
+        }
+
         terminal
             .draw(|f| ui::render(f, &app))
             .map_err(|e| CliError::Io(format!("failed to render TUI frame: {e}")))?;
@@ -168,37 +205,25 @@ pub async fn run_tui(data_dir: Option<&Path>) -> Result<(), CliError> {
                     }
                 }
                 app::AccountPendingAction::RefreshStatus => {
-                    match crate::client::auth::check_auth_state_online(app.data_dir.as_deref())
-                        .await
-                    {
-                        Ok(st) => {
-                            app.account_state = st;
-                            app.status_message = Some("Server status updated.".to_string());
-                            app.error_message = None;
-                        }
-                        Err(e) => {
-                            app.error_message = Some(format!("Failed to refresh status: {e}"));
-                        }
-                    }
+                    let tx = auth_tx.clone();
+                    let data_dir_opt = app.data_dir.clone();
+                    app.status_message = Some("Checking server status...".to_string());
+                    tokio::spawn(async move {
+                        let res =
+                            crate::client::auth::check_auth_state_online(data_dir_opt.as_deref())
+                                .await;
+                        let _ = tx.send(AuthWorkerEvent::RefreshStatus(res));
+                    });
                 }
                 app::AccountPendingAction::StartupVerify => {
-                    match crate::client::auth::check_auth_state_online(app.data_dir.as_deref())
-                        .await
-                    {
-                        Ok(st) => {
-                            app.account_state = st;
-                        }
-                        Err(e) => {
-                            app.account_state = crate::client::auth::ClientAuthState::Error {
-                                server_url: app
-                                    .account_state
-                                    .server_url()
-                                    .unwrap_or("")
-                                    .to_string(),
-                                error: e.to_string(),
-                            };
-                        }
-                    }
+                    let tx = auth_tx.clone();
+                    let data_dir_opt = app.data_dir.clone();
+                    tokio::spawn(async move {
+                        let res =
+                            crate::client::auth::check_auth_state_online(data_dir_opt.as_deref())
+                                .await;
+                        let _ = tx.send(AuthWorkerEvent::StartupVerify(res));
+                    });
                 }
             }
         }
