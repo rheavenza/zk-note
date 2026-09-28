@@ -5,18 +5,23 @@ use super::action::Action;
 use super::app::{AccountField, AccountPendingAction, App, AppMode, Focus};
 use super::ui::render;
 use crate::client::auth::ClientAuthState;
-use crate::client::conflicts::ClientConflictSummary;
+use crate::client::conflicts::{ClientConflictDetail, ClientConflictSummary};
 use crate::client::notes::create_note;
 use crate::client::sync::SyncStatus;
 use crate::client::vault::unlock_vault;
 use crate::commands::cmd_init;
-use crate::config::session_file;
+use crate::config::{db_file, session_file};
 use crate::error::CliError;
 use crate::session::{get_session_info, update_session_timeout};
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 use std::path::{Path, PathBuf};
+use zk_core::note::PlaintextNote;
+use zk_protocol::constants::OBJECT_KIND_NOTE;
+use zk_storage::models::ConflictRecord;
+use zk_storage::sqlite::SqliteStorage;
+use zk_storage::traits::{ConflictStore, ObjectStore};
 
 struct TestDir(PathBuf);
 
@@ -49,6 +54,24 @@ fn render_to_string(app: &App, width: u16, height: u16) -> String {
     let mut terminal = Terminal::new(backend).expect("create test terminal");
     terminal.draw(|f| render(f, app)).expect("draw frame");
     format!("{:?}", terminal.backend().buffer())
+}
+
+/// Helper to render an app to a TestBackend terminal and return clean visual screen text lines.
+fn buffer_to_screen_text(app: &App, width: u16, height: u16) -> String {
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("create test terminal");
+    terminal.draw(|f| render(f, app)).expect("draw frame");
+    let buf = terminal.backend().buffer();
+    let mut s = String::new();
+    for y in 0..height {
+        let mut line = String::new();
+        for x in 0..width {
+            line.push_str(buf[(x, y)].symbol());
+        }
+        s.push_str(line.trim_end());
+        s.push('\n');
+    }
+    s
 }
 
 fn setup_unlocked_vault_in_dir(dir: &Path) {
@@ -1427,4 +1450,435 @@ fn test_auth_superseded_refresh_is_rejected() {
         app.error_message.is_none(),
         "Superseded error must not set error_message"
     );
+}
+
+fn create_test_conflict(
+    dir: &Path,
+    vault_key: &zk_crypto::keys::VaultKey,
+    local_deleted: bool,
+    remote_deleted: bool,
+) -> (String, String) {
+    let obj_id = uuid::Uuid::new_v4().to_string();
+    let local_note = PlaintextNote::new("Local Title", "Local modified content");
+    let remote_note = PlaintextNote::new("Remote Title", "Remote modified content");
+    let base_note = PlaintextNote::new("Base Title", "Base initial content");
+
+    let env_local = local_note.encrypt(vault_key, &obj_id).expect("enc local");
+    let env_remote = remote_note.encrypt(vault_key, &obj_id).expect("enc remote");
+    let env_base = base_note.encrypt(vault_key, &obj_id).expect("enc base");
+
+    let conf_id = format!("conf-{}", uuid::Uuid::new_v4());
+    let record = ConflictRecord::new(
+        &conf_id,
+        &obj_id,
+        OBJECT_KIND_NOTE,
+        1,
+        2,
+        Some(env_base),
+        env_local.clone(),
+        env_remote,
+        None,
+        "2026-09-28T12:00:00Z",
+    )
+    .with_deletion_flags(local_deleted, remote_deleted);
+
+    let storage = SqliteStorage::open(db_file(dir)).expect("open db");
+    storage.put_conflict(&record).expect("put conflict");
+
+    (conf_id, obj_id)
+}
+
+#[test]
+fn test_tui_conflict_key_and_action_strategy_mappings() {
+    // 1. Keep Local: Test key '1' and key 'l'
+    {
+        let (_dir, mut app) = setup_test_vault();
+        let key = app.vault_key.clone().unwrap();
+        let (conf_id, obj_id) =
+            create_test_conflict(app.data_dir.as_deref().unwrap(), &key, false, false);
+
+        app.mode = AppMode::Conflict;
+        app.reload_conflicts();
+        assert_eq!(app.conflicts.len(), 1);
+        app.selected_conflict_index = Some(0);
+        app.load_selected_conflict_detail();
+
+        // Key '1' triggers Action::ConflictKeepLocal
+        app.handle_key(KeyEvent::from(KeyCode::Char('1')));
+        assert!(
+            app.status_message
+                .as_ref()
+                .unwrap()
+                .contains(&format!("Conflict resolved for note {obj_id}")),
+            "key '1' must resolve via KeepLocal"
+        );
+        assert_eq!(app.conflicts.len(), 0);
+
+        let storage = SqliteStorage::open(db_file(app.data_dir.as_deref().unwrap())).unwrap();
+        let conf = storage.get_conflict(&conf_id).unwrap().unwrap();
+        assert!(conf.resolved);
+    }
+
+    {
+        let (_dir, mut app) = setup_test_vault();
+        let key = app.vault_key.clone().unwrap();
+        let (_conf_id, obj_id) =
+            create_test_conflict(app.data_dir.as_deref().unwrap(), &key, false, false);
+
+        app.mode = AppMode::Conflict;
+        app.reload_conflicts();
+        app.selected_conflict_index = Some(0);
+        app.load_selected_conflict_detail();
+
+        // Key 'l' also triggers Action::ConflictKeepLocal
+        app.handle_key(KeyEvent::from(KeyCode::Char('l')));
+        assert!(
+            app.status_message
+                .as_ref()
+                .unwrap()
+                .contains(&format!("Conflict resolved for note {obj_id}")),
+            "key 'l' must resolve via KeepLocal"
+        );
+        assert_eq!(app.conflicts.len(), 0);
+    }
+
+    // 2. Accept Remote: Test key '2' and key 'r'
+    {
+        let (_dir, mut app) = setup_test_vault();
+        let key = app.vault_key.clone().unwrap();
+        let (_conf_id, obj_id) =
+            create_test_conflict(app.data_dir.as_deref().unwrap(), &key, false, false);
+
+        app.mode = AppMode::Conflict;
+        app.reload_conflicts();
+        app.selected_conflict_index = Some(0);
+        app.load_selected_conflict_detail();
+
+        // Key '2' triggers Action::ConflictAcceptRemote
+        app.handle_key(KeyEvent::from(KeyCode::Char('2')));
+        assert!(
+            app.status_message
+                .as_ref()
+                .unwrap()
+                .contains(&format!("Conflict resolved for note {obj_id}")),
+            "key '2' must resolve via KeepRemote"
+        );
+        assert_eq!(app.conflicts.len(), 0);
+    }
+
+    {
+        let (_dir, mut app) = setup_test_vault();
+        let key = app.vault_key.clone().unwrap();
+        let (_conf_id, obj_id) =
+            create_test_conflict(app.data_dir.as_deref().unwrap(), &key, false, false);
+
+        app.mode = AppMode::Conflict;
+        app.reload_conflicts();
+        app.selected_conflict_index = Some(0);
+        app.load_selected_conflict_detail();
+
+        // Key 'r' also triggers Action::ConflictAcceptRemote
+        app.handle_key(KeyEvent::from(KeyCode::Char('r')));
+        assert!(
+            app.status_message
+                .as_ref()
+                .unwrap()
+                .contains(&format!("Conflict resolved for note {obj_id}")),
+            "key 'r' must resolve via KeepRemote"
+        );
+        assert_eq!(app.conflicts.len(), 0);
+    }
+
+    // 3. 3-Way Merge Candidate: Test key '3' and key 'm'
+    {
+        let (_dir, mut app) = setup_test_vault();
+        let key = app.vault_key.clone().unwrap();
+        let (_conf_id, obj_id) =
+            create_test_conflict(app.data_dir.as_deref().unwrap(), &key, false, false);
+
+        app.mode = AppMode::Conflict;
+        app.reload_conflicts();
+        app.selected_conflict_index = Some(0);
+        app.load_selected_conflict_detail();
+        assert!(app
+            .conflict_detail
+            .as_ref()
+            .unwrap()
+            .candidate_note
+            .is_some());
+
+        // Key '3' triggers Action::ConflictMerge
+        app.handle_key(KeyEvent::from(KeyCode::Char('3')));
+        assert!(
+            app.status_message
+                .as_ref()
+                .unwrap()
+                .contains(&format!("Conflict resolved for note {obj_id}")),
+            "key '3' must resolve via Merge"
+        );
+        assert_eq!(app.conflicts.len(), 0);
+    }
+
+    {
+        let (_dir, mut app) = setup_test_vault();
+        let key = app.vault_key.clone().unwrap();
+        let (_conf_id, obj_id) =
+            create_test_conflict(app.data_dir.as_deref().unwrap(), &key, false, false);
+
+        app.mode = AppMode::Conflict;
+        app.reload_conflicts();
+        app.selected_conflict_index = Some(0);
+        app.load_selected_conflict_detail();
+
+        // Key 'm' also triggers Action::ConflictMerge
+        app.handle_key(KeyEvent::from(KeyCode::Char('m')));
+        assert!(
+            app.status_message
+                .as_ref()
+                .unwrap()
+                .contains(&format!("Conflict resolved for note {obj_id}")),
+            "key 'm' must resolve via Merge"
+        );
+        assert_eq!(app.conflicts.len(), 0);
+    }
+
+    // 4. Duplicate As Separate: Test key '4' and key 'd'
+    {
+        let (_dir, mut app) = setup_test_vault();
+        let key = app.vault_key.clone().unwrap();
+        let (_conf_id, obj_id) =
+            create_test_conflict(app.data_dir.as_deref().unwrap(), &key, false, false);
+
+        app.mode = AppMode::Conflict;
+        app.reload_conflicts();
+        app.selected_conflict_index = Some(0);
+        app.load_selected_conflict_detail();
+
+        // Key '4' triggers Action::ConflictDuplicate
+        app.handle_key(KeyEvent::from(KeyCode::Char('4')));
+        assert!(
+            app.status_message
+                .as_ref()
+                .unwrap()
+                .contains(&format!("Conflict resolved for note {obj_id}")),
+            "key '4' must resolve via Duplicate"
+        );
+        assert_eq!(app.conflicts.len(), 0);
+    }
+
+    {
+        let (_dir, mut app) = setup_test_vault();
+        let key = app.vault_key.clone().unwrap();
+        let (_conf_id, obj_id) =
+            create_test_conflict(app.data_dir.as_deref().unwrap(), &key, false, false);
+
+        app.mode = AppMode::Conflict;
+        app.reload_conflicts();
+        app.selected_conflict_index = Some(0);
+        app.load_selected_conflict_detail();
+
+        // Key 'd' also triggers Action::ConflictDuplicate
+        app.handle_key(KeyEvent::from(KeyCode::Char('d')));
+        assert!(
+            app.status_message
+                .as_ref()
+                .unwrap()
+                .contains(&format!("Conflict resolved for note {obj_id}")),
+            "key 'd' must resolve via Duplicate"
+        );
+        assert_eq!(app.conflicts.len(), 0);
+    }
+
+    // 5. Restore / Resurrect on delete-vs-edit conflict: Test key 'R'
+    {
+        let (_dir, mut app) = setup_test_vault();
+        let key = app.vault_key.clone().unwrap();
+        // remote deleted it -> local_deleted: false, remote_deleted: true
+        let (conf_id, obj_id) =
+            create_test_conflict(app.data_dir.as_deref().unwrap(), &key, false, true);
+
+        app.mode = AppMode::Conflict;
+        app.reload_conflicts();
+        assert_eq!(app.conflicts.len(), 1);
+        assert!(app.conflicts[0].remote_is_deleted);
+        app.selected_conflict_index = Some(0);
+        app.load_selected_conflict_detail();
+
+        // Key 'R' triggers Action::ConflictRestore -> RestoreResurrect
+        app.handle_key(KeyEvent::from(KeyCode::Char('R')));
+        assert!(
+            app.status_message
+                .as_ref()
+                .unwrap()
+                .contains(&format!("Conflict resolved for note {obj_id}")),
+            "key 'R' must resolve via RestoreResurrect"
+        );
+        assert_eq!(app.conflicts.len(), 0);
+
+        // Verify storage: conflict is marked resolved, and object is restored and NOT deleted
+        let storage = SqliteStorage::open(db_file(app.data_dir.as_deref().unwrap())).unwrap();
+        let conf = storage.get_conflict(&conf_id).unwrap().unwrap();
+        assert!(conf.resolved);
+        let obj = storage.get_object(&obj_id).unwrap().unwrap();
+        assert!(
+            !obj.is_deleted,
+            "restored note must not be deleted in storage"
+        );
+    }
+
+    // 6. Navigation (j, k, Down, Up) and closing (Esc, q) in Conflict mode
+    {
+        let (_dir, mut app) = setup_test_vault();
+        let key = app.vault_key.clone().unwrap();
+        let (_c1, _) = create_test_conflict(app.data_dir.as_deref().unwrap(), &key, false, false);
+        let (_c2, _) = create_test_conflict(app.data_dir.as_deref().unwrap(), &key, false, false);
+
+        app.mode = AppMode::Conflict;
+        app.reload_conflicts();
+        assert_eq!(app.conflicts.len(), 2);
+        assert_eq!(app.selected_conflict_index, Some(0));
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('j')));
+        assert_eq!(app.selected_conflict_index, Some(1));
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('k')));
+        assert_eq!(app.selected_conflict_index, Some(0));
+
+        app.handle_key(KeyEvent::from(KeyCode::Down));
+        assert_eq!(app.selected_conflict_index, Some(1));
+
+        app.handle_key(KeyEvent::from(KeyCode::Up));
+        assert_eq!(app.selected_conflict_index, Some(0));
+
+        // 'q' closes conflicts
+        app.handle_key(KeyEvent::from(KeyCode::Char('q')));
+        assert_eq!(app.mode, AppMode::Normal);
+
+        // 'Esc' also closes conflicts
+        app.mode = AppMode::Conflict;
+        app.handle_key(KeyEvent::from(KeyCode::Esc));
+        assert_eq!(app.mode, AppMode::Normal);
+    }
+}
+
+#[test]
+fn test_synthetic_view_text_captures() {
+    // 1. Locked view (80x24)
+    let mut locked_app = App::new(None, 80, 24);
+    locked_app.mode = AppMode::Locked;
+    locked_app.passphrase_input = "secret123".to_string();
+    let locked_text = buffer_to_screen_text(&locked_app, 80, 24);
+    assert!(locked_text.contains("Master Passphrase"));
+    assert!(locked_text.contains("Enter Master Passphrase"));
+    assert!(!locked_text.contains("secret123")); // Passphrase is masked!
+    println!("=== VIEW: locked ===\n{locked_text}");
+
+    // 2. Empty view (80x24)
+    let empty_dir = TestDir::new("cap_empty");
+    setup_unlocked_vault_in_dir(empty_dir.path());
+    let empty_app = App::new(Some(empty_dir.path()), 80, 24);
+    let empty_text = buffer_to_screen_text(&empty_app, 80, 24);
+    assert!(empty_text.contains("Notes (0)"));
+    assert!(empty_text.contains("No notes found"));
+    println!("=== VIEW: empty ===\n{empty_text}");
+
+    // 3. Populated view (80x24)
+    let (_pop_dir, pop_app) = setup_test_vault();
+    let pop_text = buffer_to_screen_text(&pop_app, 80, 24);
+    assert!(pop_text.contains("Notes (2)"));
+    assert!(pop_text.contains("Alpha Note"));
+    assert!(pop_text.contains("Beta Document"));
+    println!("=== VIEW: populated ===\n{pop_text}");
+
+    // 4. Search view (80x24)
+    let (_search_dir, mut search_app) = setup_test_vault();
+    search_app.update(Action::EnterSearch);
+    search_app.update(Action::SearchChar('A'));
+    search_app.update(Action::SearchChar('l'));
+    search_app.update(Action::SearchChar('p'));
+    search_app.update(Action::SearchChar('h'));
+    let search_text = buffer_to_screen_text(&search_app, 80, 24);
+    assert!(search_text.contains("/ Alph"));
+    assert!(search_text.contains("[SEARCH]"));
+    println!("=== VIEW: search ===\n{search_text}");
+
+    // 5. Delete confirmation view (80x24)
+    let (_del_dir, mut del_app) = setup_test_vault();
+    del_app.update(Action::AskDelete);
+    let del_text = buffer_to_screen_text(&del_app, 80, 24);
+    assert!(del_text.contains("Confirm Deletion"));
+    assert!(del_text.contains("[y] Confirm Delete"));
+    println!("=== VIEW: delete ===\n{del_text}");
+
+    // 6. Conflict view (80x24)
+    let (_conf_dir, mut conf_app) = setup_test_vault();
+    conf_app.conflicts = vec![ClientConflictSummary {
+        conflict_id: "conf-sample-1".to_string(),
+        object_id: "note-uuid-sample".to_string(),
+        object_kind: 1,
+        base_revision: 2,
+        remote_revision: 5,
+        resolved: false,
+        remote_is_deleted: false,
+        local_is_deleted: false,
+        conflict_type: "EditVsEdit".to_string(),
+        title: "Conflicted Roadmap".to_string(),
+        created_at: "2026-09-28T12:00:00Z".to_string(),
+        resolved_at: None,
+    }];
+    conf_app.selected_conflict_index = Some(0);
+    conf_app.mode = AppMode::Conflict;
+    conf_app.conflict_detail = Some(ClientConflictDetail {
+        conflict_id: "conf-sample-1".to_string(),
+        object_id: "note-uuid-sample".to_string(),
+        base_revision: 2,
+        remote_revision: 5,
+        resolved: false,
+        remote_is_deleted: false,
+        local_is_deleted: false,
+        conflict_type: "EditVsEdit".to_string(),
+        local_note: Some(PlaintextNote::new("Roadmap (Local)", "Offline local edits")),
+        remote_note: Some(PlaintextNote::new(
+            "Roadmap (Remote)",
+            "Server concurrent edits",
+        )),
+        candidate_note: Some(PlaintextNote::new(
+            "Roadmap (Merged)",
+            "3-way merged candidate content",
+        )),
+    });
+    let conf_text = buffer_to_screen_text(&conf_app, 80, 24);
+    assert!(conf_text.contains("Unresolved Synchronization Conflicts"));
+    assert!(conf_text.contains("Roadmap"));
+    assert!(conf_text.contains("[1/l] Keep Local"));
+    assert!(conf_text.contains("[R] Restore"));
+    println!("=== VIEW: conflict ===\n{conf_text}");
+
+    // 7. Help overlay view (80x24)
+    let (_help_dir, mut help_app) = setup_test_vault();
+    help_app.update(Action::ToggleHelp);
+    let help_text = buffer_to_screen_text(&help_app, 80, 24);
+    assert!(help_text.contains("Keyboard Shortcut Cheat Sheet"));
+    println!("=== VIEW: help ===\n{help_text}");
+
+    // 8. Terminal Too Small view (50x15)
+    let mut small_app = App::new(None, 50, 15);
+    small_app.mode = AppMode::TerminalTooSmall;
+    let small_text = buffer_to_screen_text(&small_app, 50, 15);
+    assert!(small_text.contains("Terminal Too Small"));
+    assert!(small_text.contains("50x15"));
+    assert!(small_text.contains("80x24"));
+    println!("=== VIEW: too-small ===\n{small_text}");
+
+    // 9. Account modal view (80x24)
+    let (_acc_dir, mut acc_app) = setup_test_vault();
+    acc_app.mode = AppMode::Account;
+    acc_app.account_server_input = "http://127.0.0.1:8080".to_string();
+    acc_app.account_token_input = "tok-secret".to_string();
+    let acc_text = buffer_to_screen_text(&acc_app, 80, 24);
+    assert!(acc_text.contains("Server Connection & Account"));
+    assert!(acc_text.contains("http://127.0.0.1:8080"));
+    assert!(!acc_text.contains("tok-secret")); // Token is masked!
+    assert!(acc_text.contains("**********"));
+    println!("=== VIEW: account ===\n{acc_text}");
 }

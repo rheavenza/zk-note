@@ -24,7 +24,7 @@ pub fn render_conflict_screen(f: &mut Frame<'_>, app: &App, area: Rect) {
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(5), Constraint::Length(3)])
+        .constraints([Constraint::Min(5), Constraint::Length(4)])
         .split(inner);
 
     let top_split = Layout::default()
@@ -210,6 +210,7 @@ pub fn render_conflict_screen(f: &mut Frame<'_>, app: &App, area: Rect) {
         Span::styled("[4/d] Duplicate  ", Style::default().fg(Color::Cyan)),
         Span::styled("[R] Restore  ", Style::default().fg(Color::Magenta)),
         Span::styled("[Esc/q] Close", Style::default().fg(Color::DarkGray)),
-    ]));
+    ]))
+    .wrap(Wrap { trim: true });
     f.render_widget(actions, action_inner);
 }

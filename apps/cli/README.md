@@ -325,13 +325,14 @@ zk-note --data-dir /path/to/data tui
 | | `Esc` | Cancel editing (discards unsaved draft) |
 | **Delete Confirmation (`d`)** | `y` / `Y` / `Enter` | Confirm deletion (creates revisioned tombstone) |
 | | `n` / `N` / `Esc` | Cancel deletion |
-| **Conflicts View (`c`)** | `j` / `k` | Navigate conflict list |
-| | `k` / `l` / `1` | Keep Local revision |
-| | `r` / `2` | Accept Remote revision |
-| | `m` / `3` | 3-way Merge candidate |
-| | `d` / `4` | Duplicate (fork local into new note) |
-| | `u` / `5` | Restore / Keep Local (for tombstone conflict) |
-| | `Esc` / `q` / `c` | Close conflicts view |
+| **Conflicts View (`c`)** | `j` / `Down` | Move down in conflict list |
+| | `k` / `Up` | Move up in conflict list |
+| | `1` / `l` | Keep Local revision |
+| | `2` / `r` | Accept Remote revision |
+| | `3` / `m` | 3-way Merge candidate |
+| | `4` / `d` | Duplicate (fork local into new note) |
+| | `R` | Restore (for tombstone / delete conflict) |
+| | `Esc` / `q` | Close conflicts view |
 | **Locked Screen** | `Enter` | Submit passphrase to unlock |
 | | `Backspace` | Delete masked character |
 | | `Esc` / `q` | Quit application |
