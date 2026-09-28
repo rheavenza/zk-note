@@ -46,6 +46,8 @@ pub enum CliError {
     AuthError(String),
     /// Active session or device was revoked on the server.
     SessionRevoked,
+    /// Active session has expired on the server.
+    SessionExpired,
     /// Network or HTTP connection error.
     Network(String),
 }
@@ -88,6 +90,10 @@ impl fmt::Display for CliError {
             Self::SessionRevoked => write!(
                 f,
                 "session or device has been revoked on the server; please re-authenticate"
+            ),
+            Self::SessionExpired => write!(
+                f,
+                "session has expired on the server; please re-authenticate"
             ),
             Self::Network(msg) => write!(f, "network error: {msg}"),
         }

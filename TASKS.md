@@ -47,6 +47,54 @@ Every task must satisfy:
 
 ---
 
+## ZK-101 — Add lazygit-style interactive terminal UI
+Status: VERIFIED (PR #2; pending merge)
+Priority: P1
+Dependencies: ZK-027, ZK-040 through ZK-046, ZK-050 through ZK-057, ZK-072, ZK-076
+
+Implement the GitHub-requested full-screen Ratatui/Crossterm interface in the
+existing `zk-note` binary while preserving non-interactive CLI compatibility and
+all zero-knowledge/security boundaries. The complete READY contract, acceptance
+criteria, verification procedure, artifact requirements, and fallback are in
+[`docs/tickets/ZK-101.md`](docs/tickets/ZK-101.md).
+
+Review note (2026-09-28): Codex independently verified worker head
+`93ee29916fc33610fcc2532bb7fd5112c2a34351` against `master`
+`46682e8722c37d5a45a6051db9a46d1f71f54786`. AC-01–AC-11 and the
+server-auth addendum criteria passed; exact-head formatting, Clippy, 101 CLI
+tests, full CI, and synthetic PTY/plaintext checks passed. The PR remains
+unmerged pending final integration; see PR #2 for the evidence and recorded
+transitive dependency audit warnings.
+
+Implementation notes:
+- Implemented full-screen keyboard-first TUI via Ratatui 0.29 and Crossterm 0.28 under `apps/cli/src/tui`.
+- Extracted reusable, non-printing native client services under `apps/cli/src/client/{conflicts,editor,notes,sync,vault}`. Refactored Clap CLI handlers in `apps/cli/src/commands.rs` to delegate domain logic to shared services.
+- Addressed blocking review repairs:
+  1. Idle auto-lock semantics: 250ms tick inspects expiry via `is_session_expired()` without touching activity. Real user input refreshes activity via explicit `touch_session_activity()`. Deterministic tests verify ticks do not extend session and expiry locks and scrubs all decrypted buffers.
+  2. Honest lock failures: `lock_and_clear()` records typed failure and displays truthful error state when persisted session invalidation fails; fail-closed memory scrubbing executes regardless.
+  3. AC-05 full-text search: `perform_incremental_search` delegates to shared `search_notes` over `InMemorySearchIndex` to match title, tag, and body content without disk persistence or network leakage.
+  4. Service extraction: unifies note, conflict, and vault models across CLI and TUI. All CLI commands, options, and JSON outputs preserved.
+  5. Terminal restoration: `TerminalGuard` uses granular tracking of raw mode, alternate screen, and cursor visibility with drop-safe retry and ordered cleanup.
+- Addendum implementation:
+  - Extracted shared non-printing client authentication service `apps/cli/src/client/auth.rs` reused across CLI `commands.rs` (`cmd_login`, `cmd_logout`, `cmd_whoami`) and TUI without shelling out.
+  - Implemented full-screen modal server connection & native device authentication dialog (`AppMode::Account`, accessible via `a` shortcut or help view) with server URL input, masked authorization token entry (`*`), connection/authorization execution, live status checking, and sign-out.
+  - Strict server URL validation: requires HTTPS for remote endpoints, allows HTTP strictly for loopback (`localhost`, `127.0.0.1`, `[::1]`), and strictly rejects paths, query strings, fragments, and credentials. Failed authorization preserves prior valid session.
+  - Secret hygiene (`SEC-003`): masked input rendering, token inputs zeroized on cancel/lock/exit/submit/drop, token redacted in `Debug` and error representations.
+  - Truthful sign-out revocation: invokes server session revocation (`api_revoke_session`) and preserves local credentials on network/offline failure so sign-out can be retried without false success.
+  - Fail-closed credential cleanup: `clear_auth_session`, `sign_out`, and `force_clear_session` propagate unlink/write/flush errors and verify absence before reporting success, preventing false success when credential removal fails.
+  - Truthful status bar badges: added dynamic account badge (`[Local-only]`, `[Auth: <short-id>]`, `[Server: Offline]`, `[Server: Expired]`, `[Server: Revoked]`, `[Server: Error]`).
+  - Addressed review findings (PR #2 review comment 5336112430 & 5336425393):
+    1. Honest unverified auth startup & non-blocking background verification: `App::new` initializes saved credentials as `ClientAuthState::Unverified` (`[Auth: <short-id> (unverified)]`) and queues `AccountPendingAction::StartupVerify`. The TUI event loop spawns verification into a background tokio task and drains results via non-blocking channel polling (`try_recv()`). The TUI draws frame 1 immediately and allows full offline note interaction without freezing, even when the server stalls. Bounded HTTP timeouts (`DEFAULT_AUTH_TIMEOUT = 5s`, `DEFAULT_AUTH_CONNECT_TIMEOUT = 3s`, overridable via `ZK_AUTH_TIMEOUT_MS`) guarantee requests never hang indefinitely. Added deterministic local server stall test.
+    2. Typed 401 `AUTH_EXPIRED`: added `CliError::SessionExpired` and mapped `ERROR_AUTH_EXPIRED` from server 401 responses in `api_query_status` and auth endpoints, allowing `check_auth_state_online` to yield `ClientAuthState::Expired`.
+    3. Fail-closed status check: `check_auth_state_online` requires explicit `"active"` server status; unknown statuses fail closed to `ClientAuthState::Error`.
+    4. Safe error parsing & SEC-003 secret hygiene: all six token-bearing auth endpoints (`api_device_authorize`, `api_verify_token`, `api_revoke_session`, `api_query_status`, `api_list_devices`, `api_revoke_device`) use `parse_safe_auth_error_with_redaction` and `auth_http_client`. Untrusted server error messages are never interpolated into `CliError::AuthError`; fixed allowlisted code-based messages are used instead, with defense-in-depth token redaction. Added deterministic test proving a malicious server echoing the bearer token never leaks credentials.
+    5. Generation and session-identity guard for async auth state machine: `App` maintains a monotonic generation counter (`auth_op_generation`) incremented via `invalidate_auth_ops()` whenever an account action is dispatched (`Connect`, `SignOut`, `RefreshStatus`) or completed. Background worker events (`StartupVerify`, `RefreshStatus`) carry generation, expected account ID, and expected server URL. `apply_auth_worker_result` strictly rejects stale completions from earlier generations, operations arriving while `LocalOnly`, or completions targeting mismatched accounts or servers before modifying `account_state`, `status_message`, or `error_message`. Added deterministic unit tests covering out-of-order rejection after sign-out, account change, and superseded refresh requests.
+  - Preserved independent guarded sync semantics (`s`) and all existing CLI command flags, schemas, and exit behaviors.
+
+
+
+---
+
 # Web vault synchronization follow-up
 
 Source: https://github.com/rheavenza/zk-note/issues/3

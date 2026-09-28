@@ -1,11 +1,13 @@
 //! Terminal/CLI client for zero-knowledge notes (`zk-note`).
 
 mod auth;
+pub mod client;
 mod commands;
 mod config;
 mod edit;
 mod error;
 mod session;
+pub mod tui;
 
 use clap::{Parser, Subcommand};
 use commands::{
@@ -326,6 +328,8 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Launch interactive terminal user interface (ZK-101)
+    Tui,
 }
 
 /// Device management subcommands (ZK-075).
@@ -493,6 +497,7 @@ async fn run() -> Result<(), CliError> {
             )?;
             Ok(())
         }
+        Commands::Tui => tui::run_tui(data_dir).await,
     }
 }
 
@@ -3006,5 +3011,30 @@ mod tests {
         assert!(note_after.attachments.is_empty());
 
         let _ = fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn test_cli_tui_command_parsing_and_compatibility() {
+        // Verify `zk-note tui` command parsing (AC-01)
+        let parsed = Cli::try_parse_from(["zk-note", "tui"]).expect("parse tui command");
+        assert!(matches!(parsed.command, Commands::Tui));
+        assert!(parsed.data_dir.is_none());
+
+        // Verify with global --data-dir flag
+        let parsed_custom =
+            Cli::try_parse_from(["zk-note", "--data-dir", "/tmp/zk-test-dir", "tui"])
+                .expect("parse tui with data-dir");
+        assert!(matches!(parsed_custom.command, Commands::Tui));
+        assert_eq!(
+            parsed_custom.data_dir.as_deref(),
+            Some(std::path::Path::new("/tmp/zk-test-dir"))
+        );
+
+        // Verify existing commands remain intact
+        let parsed_list = Cli::try_parse_from(["zk-note", "list", "--json"]).expect("parse list");
+        assert!(matches!(
+            parsed_list.command,
+            Commands::List { json: true, .. }
+        ));
     }
 }

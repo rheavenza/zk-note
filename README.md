@@ -211,9 +211,12 @@ zk-note resolve <conflict-id> --merge    # Resolve conflict via 3-way merge in $
 zk-note resolve <conflict-id> --local    # Resolve conflict keeping local version
 zk-note resolve <conflict-id> --remote   # Resolve conflict accepting remote version
 zk-note resolve <conflict-id> --duplicate# Resolve conflict preserving both versions
+
+# Interactive Terminal UI (TUI)
+zk-note tui                              # Launch lazygit-style interactive terminal UI (>= 80x24)
 ```
 
-For complete CLI documentation, see [`apps/cli/README.md`](apps/cli/README.md).
+For complete CLI and TUI documentation, keybindings, and workflows, see [`apps/cli/README.md`](apps/cli/README.md).
 
 ---
 

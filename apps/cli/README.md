@@ -201,10 +201,30 @@ zk-note detach <note-id> <attachment-id>
 
 ### 3.4 Multi-Device Synchronization & Server Authentication
 
-#### Connect to Sync Server
+`zk-note` synchronizes opaque encrypted note envelopes with a zero-knowledge sync server.
+
+#### Prerequisites: Session Token Provisioning
+In accordance with ADR 0006, device authorization requires an existing valid account session token (e.g. provisioned via web client passkey login or personal access token). The terminal client does not invent unauthenticated token endpoints or display/copy browser session storage.
+
+#### Server URL Validation & Security Rules
+- **HTTPS Required for Remote**: Insecure HTTP is prohibited for remote servers to prevent bearer token interception.
+- **Local Development Loopback**: Plain HTTP is permitted strictly for loopback hosts (`localhost`, `127.0.0.1`, `[::1]`).
+- **Canonical Origins**: URLs must not contain credentials, query parameters, URL fragments, or arbitrary paths.
+
+#### Connect & Authorize Device
 ```bash
 zk-note login --server http://127.0.0.1:8080 --account-id <uuid> --token <auth-token>
 ```
+Credentials are saved to `~/.local/share/zk-notes/session_auth.json` with strict POSIX `0600` permissions.
+
+#### Sign-Out & Server Revocation Behavior
+```bash
+zk-note logout
+```
+Signing out revokes the session on the sync server before deleting local credentials. If the server is offline or unreachable, local credentials are intentionally preserved with a truthful warning so the user can retry revocation when connectivity is restored.
+
+#### Authentication vs. Vault Linking / Sync
+> **Important**: Signing in authorizes this terminal device with the server account. It does **not** link, upload, replace, or restore your vault. Vault synchronization is a separate, guarded operation (`zk-note sync` or `s` in the TUI) that uses compare-and-swap (CAS) revision checks to prevent silent overwrites.
 
 #### Check Sync & Device Identity
 ```bash
@@ -220,6 +240,7 @@ zk-note device list
 # Revoke a lost or compromised device
 zk-note device revoke <device-id>
 ```
+
 
 ---
 
@@ -241,6 +262,81 @@ zk-note resolve <conflict-id> --remote     # Discard local edits, accept remote 
 zk-note resolve <conflict-id> --duplicate  # Accept remote and fork local changes into a new note
 ```
 
+### 3.6 Interactive Terminal UI (`zk-note tui`)
+
+Launch the lazygit-style interactive terminal UI:
+```bash
+zk-note tui
+```
+or with a custom data directory:
+```bash
+zk-note --data-dir /path/to/data tui
+```
+
+#### Responsive Constraints
+- **Minimum Terminal Size**: `80 x 24` columns and rows.
+- If the terminal is resized below 80x24, the TUI safely suspends the multi-pane display and renders a dedicated `Terminal Too Small` view showing current and required dimensions without panicking or leaking decrypted content.
+
+#### Locked / Unlocked Lifecycle
+- **Locked State**: If the vault is locked or has no active session upon launch, the TUI displays a centered masked unlock modal.
+- **Passphrase Entry**: Passphrase characters are masked (`*`), and the input buffer is zeroized in memory on unlock or cancel.
+- **Explicit Lock (`l`)**: Pressing `l` immediately locks the vault session, zeroizes all decrypted note contents, search terms, conflict records, and edit buffers, and returns to the locked modal.
+- **Idle Auto-Lock**: The TUI runs an internal tick handler that checks the existing session timeout. If the session expires due to inactivity, it triggers the exact same zeroizing lock path.
+
+#### External Editor Workflow (`E`)
+- Pressing `E` on any note temporarily suspends raw terminal mode and the alternate screen via `TerminalGuard::suspend`.
+- The note is opened in `$VISUAL` or `$EDITOR` (falling back to `nano`/`vi`) using the existing secure `TempFileGuard` mechanism in a RAM-backed tmpfs (`/dev/shm`, `$XDG_RUNTIME_DIR`) with `0600` permissions.
+- When the editor exits, the temporary file is zeroized before unlinking, the updated note is encrypted and saved, and the TUI resumes seamlessly.
+
+#### Keybinding Cheat Sheet
+
+| Mode / View | Key | Action |
+| :--- | :--- | :--- |
+| **Global / Navigation** | `j` / `Down` | Move down in notes or conflict list |
+| | `k` / `Up` | Move up in notes or conflict list |
+| | `g` | Jump to first item |
+| | `G` | Jump to last item |
+| | `Enter` | Open selected note into preview / focus pane |
+| | `Tab` | Cycle focus forward (Notes -> Preview -> Metadata) |
+| | `Shift+Tab` / `BackTab` | Cycle focus backward |
+| | `Esc` | Return focus to Notes list / close modals |
+| | `?` | Toggle Help overlay modal |
+| | `q` | Quit TUI |
+| | `l` | Explicitly lock vault and purge decrypted buffers |
+| | `a` | Open server connection & account authentication modal |
+| **Note Operations** | `n` | Create new note (inline editor) |
+| | `e` | Inline edit current note (title, tags, body) |
+| | `E` | External edit current note via `$EDITOR` (`TempFileGuard`) |
+| | `d` | Delete current note (confirmation gated) |
+| | `/` | Incremental in-memory search across notes |
+| | `s` | Trigger manual guarded sync |
+| | `c` | Open Conflicts overlay view |
+| **Server / Account (`a`)** | `Tab` / `Down` | Cycle fields (Server URL -> Token -> Connect -> Sign Out) |
+| | `Shift+Tab` / `Up` | Cycle fields backward |
+| | `Enter` | Submit / execute focused action |
+| | `Ctrl+X` | Trigger Sign Out & remote session revocation |
+| | `Ctrl+R` | Refresh server connection status |
+| | `Esc` | Close modal and zeroize token buffer |
+| **Search Mode (`/`)** | `Enter` / `Esc` | Finish search and keep filter / navigate results |
+| | `Backspace` | Erase character from search query |
+| | Any text | Filter note list dynamically in memory |
+| **Inline Editor (`n` / `e`)** | `Tab` | Cycle field (Title -> Tags -> Body) |
+| | `Ctrl+S` | Save note and return to normal mode |
+| | `Esc` | Cancel editing (discards unsaved draft) |
+| **Delete Confirmation (`d`)** | `y` / `Y` / `Enter` | Confirm deletion (creates revisioned tombstone) |
+| | `n` / `N` / `Esc` | Cancel deletion |
+| **Conflicts View (`c`)** | `j` / `Down` | Move down in conflict list |
+| | `k` / `Up` | Move up in conflict list |
+| | `1` / `l` | Keep Local revision |
+| | `2` / `r` | Accept Remote revision |
+| | `3` / `m` | 3-way Merge candidate |
+| | `4` / `d` | Duplicate (fork local into new note) |
+| | `R` | Restore (for tombstone / delete conflict) |
+| | `Esc` / `q` | Close conflicts view |
+| **Locked Screen** | `Enter` | Submit passphrase to unlock |
+| | `Backspace` | Delete masked character |
+| | `Esc` / `q` | Quit application |
+
 ---
 
 ## 4. Security Guarantees & Threat Boundaries
@@ -257,3 +353,14 @@ zk-note resolve <conflict-id> --duplicate  # Accept remote and fork local change
 3. **Plaintext Isolation (`SEC-001`, `SEC-002`)**:
    - Plaintext exists only in volatile process memory while unlocked.
    - Persistent SQLite databases contain exclusively encrypted envelopes.
+   - The server never receives Vault Keys, Note Keys, passphrases, note plaintext, or search queries.
+
+4. **Secret Hygiene & Token Protection (`SEC-003`)**:
+   - Session tokens and passphrases are entered with masked feedback (`*`), never echoed in terminal history.
+   - Bearer tokens are redacted in all `Debug` representations, error messages, and logs.
+   - In-memory token buffers are aggressively scrubbed using `Zeroize` upon submission, cancellation, vault lock, application quit, and drop.
+
+5. **Server Isolation & Honest Status**:
+   - Failed or offline authorization attempts never overwrite or invalidate existing valid local sessions.
+   - Sign-out attempts server revocation before deleting local credentials; if offline, credentials are preserved with an actionable warning to allow retry.
+   - Signing in never automatically uploads, links, replaces, or replaces a local vault.

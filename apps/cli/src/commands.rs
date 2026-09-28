@@ -2,24 +2,22 @@
 //! `new`, `edit`, `show`, `search`, `delete`, `history`, and `list`.
 
 use crate::auth::{
-    api_device_authorize, api_list_devices, api_query_status, api_revoke_device,
-    api_revoke_session, api_verify_token, clear_auth_session, get_or_create_device_id,
-    has_auth_session, load_auth_session, save_auth_session,
+    api_list_devices, api_revoke_device, clear_auth_session, has_auth_session, load_auth_session,
 };
+
 use crate::config::{auth_session_file, db_file, resolve_data_dir, session_file, vault_file};
 use crate::edit::{note_to_edit_buffer, parse_edit_buffer, run_editor, TempFileGuard};
 use crate::error::CliError;
 use crate::session::{
-    clear_session, get_session_info, has_active_session, load_session_key, save_session_key,
+    get_session_info, has_active_session, load_session_key, save_session_key,
     save_session_key_with_timeout, update_session_timeout,
 };
-use serde::Serialize;
 use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 use uuid::Uuid;
 use zk_core::note::{NoteBuilder, NoteHistoryItem, PlaintextNote};
-use zk_core::search::{InMemorySearchIndex, SearchResult};
+use zk_core::search::SearchResult;
 use zk_core::time::now_utc_rfc3339;
 use zk_core::vault::VaultManager;
 use zk_crypto::kdf::{KdfParams, TEST_MEMORY_KIB};
@@ -28,16 +26,11 @@ use zk_protocol::constants::{
     OBJECT_KIND_ATTACHMENT_MANIFEST, OBJECT_KIND_NOTE,
 };
 use zk_protocol::vault::VaultBootstrap;
-use zk_storage::models::ConflictRecord;
-use zk_storage::traits::{BaseVersionStore, ConflictStore, MutationStore, ObjectStore};
+use zk_storage::traits::{BaseVersionStore, MutationStore, ObjectStore};
 use zk_storage::{
-    MutationStatus, MutationType, ObjectFilter, PendingMutation, SqliteStorage,
-    StoredEncryptedObject,
+    MutationStatus, MutationType, PendingMutation, SqliteStorage, StoredEncryptedObject,
 };
-use zk_sync::{
-    generate_merge_candidate, resolve_conflict, ConflictResolutionResult,
-    ConflictResolutionStrategy, PendingMutationQueue,
-};
+use zk_sync::{generate_merge_candidate, ConflictResolutionResult, ConflictResolutionStrategy};
 
 /// Initializes a new zero-knowledge note vault.
 pub fn cmd_init(
@@ -456,10 +449,7 @@ pub fn cmd_recover(
 
 /// Locks the vault and clears active session key material.
 pub fn cmd_lock(custom_data_dir: Option<&Path>) -> Result<(), CliError> {
-    let data_dir = resolve_data_dir(custom_data_dir);
-    let sess_path = session_file(&data_dir);
-
-    clear_session(&sess_path)?;
+    crate::client::vault::lock_vault(custom_data_dir)?;
     println!("Vault locked.");
     Ok(())
 }
@@ -467,18 +457,21 @@ pub fn cmd_lock(custom_data_dir: Option<&Path>) -> Result<(), CliError> {
 /// Displays the current vault status (UNINITIALIZED, LOCKED, or UNLOCKED).
 pub fn cmd_status(custom_data_dir: Option<&Path>) -> Result<(), CliError> {
     let data_dir = resolve_data_dir(custom_data_dir);
-    let vault_path = vault_file(&data_dir);
-    let sess_path = session_file(&data_dir);
-
-    if !vault_path.exists() {
-        println!("Vault status: UNINITIALIZED");
-        println!("Path: {}", data_dir.display());
-        println!("Run 'zk-note init' to create a new vault.");
-    } else if has_active_session(&sess_path) {
-        match get_session_info(&sess_path) {
-            Ok(Some(info)) if info.is_active => {
-                println!("Vault status: UNLOCKED");
-                println!("Path: {}", data_dir.display());
+    match crate::client::vault::get_vault_status(custom_data_dir)? {
+        crate::client::vault::VaultState::Uninitialized => {
+            println!("Vault status: UNINITIALIZED");
+            println!("Path: {}", data_dir.display());
+            println!("Run 'zk-note init' to create a new vault.");
+        }
+        crate::client::vault::VaultState::Locked => {
+            println!("Vault status: LOCKED");
+            println!("Path: {}", data_dir.display());
+            println!("Run 'zk-note unlock' to unlock the vault.");
+        }
+        crate::client::vault::VaultState::Unlocked { auto_lock_info } => {
+            println!("Vault status: UNLOCKED");
+            println!("Path: {}", data_dir.display());
+            if let Some(info) = auto_lock_info {
                 if let Some(timeout) = info.idle_timeout_secs {
                     let rem_mins = info.remaining_secs.unwrap_or(0) / 60;
                     let rem_secs = info.remaining_secs.unwrap_or(0) % 60;
@@ -492,28 +485,10 @@ pub fn cmd_status(custom_data_dir: Option<&Path>) -> Result<(), CliError> {
                 } else {
                     println!("Auto-lock:    Disabled (never expires)");
                 }
+            } else {
+                println!("Auto-lock:    Disabled (never expires)");
             }
-            Ok(Some(info)) if info.is_expired => {
-                let _ = clear_session(&sess_path);
-                println!("Vault status: LOCKED (idle auto-lock timeout expired)");
-                println!("Path: {}", data_dir.display());
-                println!("Run 'zk-note unlock' to unlock the vault.");
-            }
-            _ => match load_session_key(&sess_path) {
-                Ok(_) => {
-                    println!("Vault status: UNLOCKED");
-                    println!("Path: {}", data_dir.display());
-                }
-                Err(_) => {
-                    println!("Vault status: LOCKED (corrupted session file)");
-                    println!("Path: {}", data_dir.display());
-                }
-            },
         }
-    } else {
-        println!("Vault status: LOCKED");
-        println!("Path: {}", data_dir.display());
-        println!("Run 'zk-note unlock' to unlock the vault.");
     }
 
     let auth_path = auth_session_file(&data_dir);
@@ -542,7 +517,6 @@ pub fn cmd_new(
 ) -> Result<String, CliError> {
     let data_dir = resolve_data_dir(custom_data_dir);
     let vault_path = vault_file(&data_dir);
-    let db_path = db_file(&data_dir);
     let sess_path = session_file(&data_dir);
 
     if !vault_path.exists() {
@@ -596,47 +570,10 @@ pub fn cmd_new(
         }
     };
 
-    let note_id = uuid::Uuid::new_v4().to_string();
-    let now = now_utc_rfc3339();
-
-    let note = NoteBuilder::new()
-        .title(title)
-        .body(body)
-        .tags(tags)
-        .created_at(now.clone())
-        .updated_at(now.clone())
-        .build()?;
-
-    // Encrypt note using the unlocked VaultKey
-    let envelope = note.encrypt(&vault_key, &note_id)?;
-
-    // Store in SqliteStorage
-    let storage = SqliteStorage::open(&db_path)?;
-
-    let stored_obj = StoredEncryptedObject {
-        object_id: note_id.clone(),
-        object_kind: OBJECT_KIND_NOTE,
-        revision: INITIAL_OBJECT_REVISION,
-        server_seq: INITIAL_SERVER_SEQ,
-        is_deleted: false,
-        envelope: envelope.clone(),
-        updated_at: now.clone(),
-    };
-    storage.put_object(&stored_obj)?;
-
-    // Enqueue pending mutation for future sync
-    let mutation = PendingMutation {
-        mutation_id: uuid::Uuid::new_v4().to_string(),
-        object_id: note_id.clone(),
-        expected_revision: INITIAL_EXPECTED_REVISION,
-        object_kind: OBJECT_KIND_NOTE,
-        mutation_type: MutationType::Upsert,
-        envelope,
-        created_at: now,
-        retry_count: 0,
-        status: MutationStatus::Pending,
-    };
-    storage.enqueue_mutation(&mutation)?;
+    let note_id =
+        crate::client::notes::create_note(custom_data_dir, &vault_key, &title, &body, tags)?;
+    let (_, note) =
+        crate::client::notes::get_plaintext_note(custom_data_dir, &vault_key, &note_id)?;
 
     println!("Created note: {note_id}");
     println!("Title: {}", note.title);
@@ -647,65 +584,7 @@ pub fn cmd_new(
     Ok(note_id)
 }
 
-/// Helper to resolve a stored note object by exact ID or unique >=4 character prefix.
-fn find_note_object(
-    storage: &SqliteStorage,
-    note_id: &str,
-    include_deleted: bool,
-) -> Result<StoredEncryptedObject, CliError> {
-    let stored_opt = storage.get_object(note_id)?;
-    if let Some(obj) = stored_opt {
-        if obj.object_kind == OBJECT_KIND_NOTE {
-            if obj.is_deleted && !include_deleted {
-                return Err(CliError::NoteAlreadyDeleted(obj.object_id));
-            }
-            return Ok(obj);
-        }
-    }
-
-    if note_id.len() >= 4 {
-        let all = storage.list_objects(&ObjectFilter {
-            kind: Some(OBJECT_KIND_NOTE),
-            include_deleted,
-        })?;
-        let mut matches: Vec<_> = all
-            .into_iter()
-            .filter(|o| o.object_id.starts_with(note_id))
-            .collect();
-        if matches.len() == 1 {
-            let obj = matches.remove(0);
-            if obj.is_deleted && !include_deleted {
-                return Err(CliError::NoteAlreadyDeleted(obj.object_id));
-            }
-            Ok(obj)
-        } else if matches.len() > 1 {
-            Err(CliError::Io(format!(
-                "ambiguous note id prefix '{note_id}' matches {} notes",
-                matches.len()
-            )))
-        } else {
-            // Check if it matched a deleted note when include_deleted was false
-            if !include_deleted {
-                let all_deleted = storage.list_objects(&ObjectFilter {
-                    kind: Some(OBJECT_KIND_NOTE),
-                    include_deleted: true,
-                })?;
-                let deleted_matches: Vec<_> = all_deleted
-                    .into_iter()
-                    .filter(|o| o.object_id.starts_with(note_id) && o.is_deleted)
-                    .collect();
-                if !deleted_matches.is_empty() {
-                    return Err(CliError::NoteAlreadyDeleted(
-                        deleted_matches[0].object_id.clone(),
-                    ));
-                }
-            }
-            Err(CliError::NoteNotFound(note_id.to_string()))
-        }
-    } else {
-        Err(CliError::NoteNotFound(note_id.to_string()))
-    }
-}
+pub use crate::client::notes::find_note_object;
 
 /// Displays the decrypted contents of a note by its ID.
 pub fn cmd_show(
@@ -714,21 +593,13 @@ pub fn cmd_show(
     json_output: bool,
 ) -> Result<PlaintextNote, CliError> {
     let data_dir = resolve_data_dir(custom_data_dir);
-    let vault_path = vault_file(&data_dir);
-    let db_path = db_file(&data_dir);
     let sess_path = session_file(&data_dir);
-
-    if !vault_path.exists() {
-        return Err(CliError::VaultUninitialized);
-    }
 
     // Must be unlocked to decrypt note
     let vault_key = load_session_key(&sess_path)?;
 
-    let storage = SqliteStorage::open(&db_path)?;
-    let stored = find_note_object(&storage, note_id, false)?;
-
-    let note = PlaintextNote::decrypt(&stored.envelope, &vault_key)?;
+    let (stored, note) =
+        crate::client::notes::get_plaintext_note(custom_data_dir, &vault_key, note_id)?;
 
     if json_output {
         let json = serde_json::to_string_pretty(&note)
@@ -765,32 +636,12 @@ pub fn cmd_search(
     json_output: bool,
 ) -> Result<Vec<SearchResult>, CliError> {
     let data_dir = resolve_data_dir(custom_data_dir);
-    let vault_path = vault_file(&data_dir);
-    let db_path = db_file(&data_dir);
     let sess_path = session_file(&data_dir);
-
-    if !vault_path.exists() {
-        return Err(CliError::VaultUninitialized);
-    }
 
     // Must be unlocked to decrypt note contents into volatile memory index
     let vault_key = load_session_key(&sess_path)?;
 
-    let storage = SqliteStorage::open(&db_path)?;
-    // List only active (non-tombstoned) notes
-    let stored_objects = storage.list_objects(&ObjectFilter::for_kind(OBJECT_KIND_NOTE))?;
-
-    let mut index = InMemorySearchIndex::new();
-    for stored in stored_objects {
-        if stored.is_deleted {
-            continue;
-        }
-
-        let note = PlaintextNote::decrypt(&stored.envelope, &vault_key)?;
-        index.insert(&stored.object_id, &note);
-    }
-
-    let results = index.search(query);
+    let results = crate::client::notes::search_notes(custom_data_dir, &vault_key, query)?;
 
     if json_output {
         let json = serde_json::to_string_pretty(&results)
@@ -843,7 +694,6 @@ pub fn cmd_edit(
 ) -> Result<PlaintextNote, CliError> {
     let data_dir = resolve_data_dir(custom_data_dir);
     let vault_path = vault_file(&data_dir);
-    let db_path = db_file(&data_dir);
     let sess_path = session_file(&data_dir);
 
     if !vault_path.exists() {
@@ -853,11 +703,8 @@ pub fn cmd_edit(
     // Must be unlocked
     let vault_key = load_session_key(&sess_path)?;
 
-    let storage = SqliteStorage::open(&db_path)?;
-    let stored = find_note_object(&storage, note_id, false)?;
-
-    // Decrypt current note
-    let current_note = PlaintextNote::decrypt(&stored.envelope, &vault_key)?;
+    let (stored, current_note) =
+        crate::client::notes::get_plaintext_note(custom_data_dir, &vault_key, note_id)?;
 
     let (new_title, new_tags, new_body) =
         if title_override.is_some() || body_override.is_some() || tag_override.is_some() {
@@ -919,47 +766,22 @@ pub fn cmd_edit(
         return Ok(current_note);
     }
 
-    let now = now_utc_rfc3339();
-    let updated_note = NoteBuilder::new()
+    let new_revision = crate::client::notes::update_note(
+        custom_data_dir,
+        &vault_key,
+        &stored.object_id,
+        &new_title,
+        &new_body,
+        new_tags.clone(),
+    )?;
+
+    let mut updated_note = NoteBuilder::new()
         .title(new_title)
         .body(new_body)
         .tags(new_tags)
-        .created_at(current_note.created_at.clone())
-        .updated_at(now.clone())
+        .created_at(&current_note.created_at)
         .build()?;
-
-    // Encrypt updated note
-    let new_envelope = updated_note.encrypt(&vault_key, &stored.object_id)?;
-
-    // Archive base version for three-way merge
-    storage.put_base_version(&stored.object_id, stored.revision, &stored.envelope)?;
-
-    // Save updated object
-    let new_revision = stored.revision + 1;
-    let updated_stored_obj = StoredEncryptedObject {
-        object_id: stored.object_id.clone(),
-        object_kind: OBJECT_KIND_NOTE,
-        revision: new_revision,
-        server_seq: stored.server_seq,
-        is_deleted: false,
-        envelope: new_envelope.clone(),
-        updated_at: now.clone(),
-    };
-    storage.put_object(&updated_stored_obj)?;
-
-    // Enqueue pending mutation
-    let mutation = PendingMutation {
-        mutation_id: uuid::Uuid::new_v4().to_string(),
-        object_id: stored.object_id.clone(),
-        expected_revision: stored.revision,
-        object_kind: OBJECT_KIND_NOTE,
-        mutation_type: MutationType::Upsert,
-        envelope: new_envelope,
-        created_at: now,
-        retry_count: 0,
-        status: MutationStatus::Pending,
-    };
-    storage.enqueue_mutation(&mutation)?;
+    updated_note.canonicalize();
 
     println!("Updated note: {}", stored.object_id);
     println!("Title:    {}", updated_note.title);
@@ -979,83 +801,29 @@ pub fn cmd_delete(
     purge: bool,
 ) -> Result<u64, CliError> {
     let data_dir = resolve_data_dir(custom_data_dir);
-    let vault_path = vault_file(&data_dir);
-    let db_path = db_file(&data_dir);
     let sess_path = session_file(&data_dir);
-
-    if !vault_path.exists() {
-        return Err(CliError::VaultUninitialized);
-    }
 
     // Must be unlocked to delete note
     let vault_key = load_session_key(&sess_path)?;
 
-    let storage = SqliteStorage::open(&db_path)?;
-    let stored = find_note_object(&storage, note_id, purge)?;
-
     if purge {
-        storage.purge_object(&stored.object_id)?;
-        storage.clear_base_versions(&stored.object_id)?;
-        println!("Purged note: {}", stored.object_id);
-        return Ok(stored.revision);
+        let (obj_id, revision) = crate::client::notes::delete_note(custom_data_dir, note_id, true)?;
+        println!("Purged note: {obj_id}");
+        return Ok(revision);
     }
 
-    // Decrypt to verify key authenticity and obtain title for confirmation
-    let note = PlaintextNote::decrypt(&stored.envelope, &vault_key)?;
+    let (stored, note) =
+        crate::client::notes::get_plaintext_note(custom_data_dir, &vault_key, note_id)?;
+    let (obj_id, revision) =
+        crate::client::notes::delete_note(custom_data_dir, &stored.object_id, false)?;
 
-    // Archive current version as base version before creating tombstone
-    storage.put_base_version(&stored.object_id, stored.revision, &stored.envelope)?;
+    println!("Deleted note: {} (\"{}\")", obj_id, note.title);
+    println!("Tombstone revision: {revision}");
 
-    // Increment revision for the tombstone mutation (monotonic revision bump)
-    let new_revision = stored.revision + 1;
-    let now = now_utc_rfc3339();
-
-    // Mark as deleted in local_objects (tombstone)
-    storage.mark_deleted(
-        &stored.object_id,
-        new_revision,
-        stored.envelope.clone(),
-        now.clone(),
-    )?;
-
-    // Enqueue pending delete mutation for sync (expected_revision = prior revision)
-    let mutation = PendingMutation {
-        mutation_id: uuid::Uuid::new_v4().to_string(),
-        object_id: stored.object_id.clone(),
-        expected_revision: stored.revision,
-        object_kind: OBJECT_KIND_NOTE,
-        mutation_type: MutationType::Delete,
-        envelope: stored.envelope,
-        created_at: now,
-        retry_count: 0,
-        status: MutationStatus::Pending,
-    };
-    storage.enqueue_mutation(&mutation)?;
-
-    println!("Deleted note: {} (\"{}\")", stored.object_id, note.title);
-    println!("Tombstone revision: {new_revision}");
-
-    Ok(new_revision)
+    Ok(revision)
 }
 
-/// Note summary row for decrypted list display and JSON output.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct NoteSummary {
-    /// Object identifier (UUID v4 string).
-    pub id: String,
-    /// Note title.
-    pub title: String,
-    /// Canonicalized note tags.
-    pub tags: Vec<String>,
-    /// Last update timestamp (RFC 3339 UTC).
-    pub updated_at: String,
-    /// Creation timestamp (RFC 3339 UTC).
-    pub created_at: String,
-    /// Current local revision counter.
-    pub revision: u64,
-    /// True if this note has been marked as deleted (tombstone).
-    pub is_deleted: bool,
-}
+pub use crate::client::notes::ClientNoteSummary as NoteSummary;
 
 /// Lists notes using locally decrypted state while unlocked.
 pub fn cmd_list(
@@ -1065,52 +833,17 @@ pub fn cmd_list(
     json_output: bool,
 ) -> Result<Vec<NoteSummary>, CliError> {
     let data_dir = resolve_data_dir(custom_data_dir);
-    let vault_path = vault_file(&data_dir);
-    let db_path = db_file(&data_dir);
     let sess_path = session_file(&data_dir);
-
-    if !vault_path.exists() {
-        return Err(CliError::VaultUninitialized);
-    }
 
     // Must be unlocked to decrypt note titles/tags
     let vault_key = load_session_key(&sess_path)?;
 
-    let storage = SqliteStorage::open(&db_path)?;
-    let stored_objects = storage.list_objects(&ObjectFilter {
-        kind: Some(OBJECT_KIND_NOTE),
+    let notes = crate::client::notes::list_notes(
+        custom_data_dir,
+        &vault_key,
         include_deleted,
-    })?;
-
-    let mut notes = Vec::new();
-    let normalized_filter = tag_filter.as_ref().map(|t| t.trim().to_lowercase());
-
-    for stored in stored_objects {
-        if stored.is_deleted && !include_deleted {
-            continue;
-        }
-
-        let note = PlaintextNote::decrypt(&stored.envelope, &vault_key)?;
-
-        if let Some(ref tag) = normalized_filter {
-            if !note.tags.contains(tag) {
-                continue;
-            }
-        }
-
-        notes.push(NoteSummary {
-            id: stored.object_id,
-            title: note.title,
-            tags: note.tags,
-            updated_at: note.updated_at,
-            created_at: note.created_at,
-            revision: stored.revision,
-            is_deleted: stored.is_deleted,
-        });
-    }
-
-    // Sort by updated_at descending
-    notes.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        tag_filter.as_deref(),
+    )?;
 
     if json_output {
         let json = serde_json::to_string_pretty(&notes)
@@ -1262,61 +995,8 @@ pub fn cmd_history(
     Ok(history)
 }
 
-/// Summary representation of a conflict record for listing and JSON serialization.
-#[derive(Debug, Clone, Serialize)]
-pub struct ConflictListItem {
-    pub conflict_id: String,
-    pub object_id: String,
-    pub object_kind: u16,
-    pub base_revision: u64,
-    pub remote_revision: u64,
-    pub resolved: bool,
-    pub remote_is_deleted: bool,
-    pub local_is_deleted: bool,
-    pub conflict_type: String,
-    pub created_at: String,
-    pub resolved_at: Option<String>,
-    pub title: String,
-}
-
-impl ConflictListItem {
-    pub fn is_delete_vs_edit(&self) -> bool {
-        self.remote_is_deleted && !self.local_is_deleted
-    }
-    pub fn is_edit_vs_delete(&self) -> bool {
-        self.local_is_deleted && !self.remote_is_deleted
-    }
-}
-
-/// Helper to resolve a stored conflict record by exact ID or unique >=4 character prefix.
-pub fn find_conflict_record(
-    storage: &SqliteStorage,
-    conflict_id: &str,
-) -> Result<ConflictRecord, CliError> {
-    if let Some(record) = storage.get_conflict(conflict_id)? {
-        return Ok(record);
-    }
-
-    if conflict_id.len() >= 4 {
-        let all = storage.list_conflicts(None)?;
-        let mut matches: Vec<_> = all
-            .into_iter()
-            .filter(|c| c.conflict_id.starts_with(conflict_id))
-            .collect();
-        if matches.len() == 1 {
-            Ok(matches.remove(0))
-        } else if matches.len() > 1 {
-            Err(CliError::Io(format!(
-                "ambiguous conflict id prefix '{conflict_id}' matches {} conflicts",
-                matches.len()
-            )))
-        } else {
-            Err(CliError::ConflictNotFound(conflict_id.to_string()))
-        }
-    } else {
-        Err(CliError::ConflictNotFound(conflict_id.to_string()))
-    }
-}
+pub use crate::client::conflicts::find_conflict_record;
+pub use crate::client::conflicts::ClientConflictSummary as ConflictListItem;
 
 /// Lists active or all conflict records (`zk-note conflicts`).
 pub fn cmd_conflicts(
@@ -1325,55 +1005,14 @@ pub fn cmd_conflicts(
     json_output: bool,
 ) -> Result<Vec<ConflictListItem>, CliError> {
     let data_dir = resolve_data_dir(custom_data_dir);
-    let vault_path = vault_file(&data_dir);
-    let db_path = db_file(&data_dir);
     let sess_path = session_file(&data_dir);
-
-    if !vault_path.exists() {
-        return Err(CliError::VaultUninitialized);
-    }
-
-    let storage = SqliteStorage::open(&db_path)?;
-    let filter = if include_resolved { None } else { Some(false) };
-    let raw_conflicts = storage.list_conflicts(filter)?;
-
     let vault_key_opt = load_session_key(&sess_path).ok();
 
-    let mut items = Vec::with_capacity(raw_conflicts.len());
-    for c in raw_conflicts {
-        let title = match &vault_key_opt {
-            Some(key) => {
-                let env = if c.remote_is_deleted {
-                    &c.local_envelope
-                } else if c.local_is_deleted {
-                    &c.remote_envelope
-                } else {
-                    c.candidate_envelope.as_ref().unwrap_or(&c.local_envelope)
-                };
-                PlaintextNote::decrypt(env, key)
-                    .map(|n| n.title)
-                    .unwrap_or_else(|_| "[decryption error]".to_string())
-            }
-            None => "[locked]".to_string(),
-        };
-
-        let conflict_type = c.conflict_type_str().to_string();
-
-        items.push(ConflictListItem {
-            conflict_id: c.conflict_id,
-            object_id: c.object_id,
-            object_kind: c.object_kind,
-            base_revision: c.base_revision,
-            remote_revision: c.remote_revision,
-            resolved: c.resolved,
-            remote_is_deleted: c.remote_is_deleted,
-            local_is_deleted: c.local_is_deleted,
-            conflict_type,
-            created_at: c.created_at,
-            resolved_at: c.resolved_at,
-            title,
-        });
-    }
+    let items = crate::client::conflicts::list_conflicts(
+        custom_data_dir,
+        vault_key_opt.as_ref(),
+        include_resolved,
+    )?;
 
     if json_output {
         let json = serde_json::to_string_pretty(&items)
@@ -1859,10 +1498,8 @@ pub fn cmd_resolve(
         }
     };
 
-    let queue = PendingMutationQueue::new(Arc::clone(&storage));
-    let result = resolve_conflict(
-        &storage,
-        &queue,
+    let result = crate::client::conflicts::resolve_conflict_item(
+        custom_data_dir,
         &vault_key,
         &conflict.conflict_id,
         strategy,
@@ -1917,10 +1554,7 @@ pub async fn cmd_login(
     device_id_opt: Option<String>,
     token_opt: Option<String>,
 ) -> Result<(), CliError> {
-    let data_dir = resolve_data_dir(custom_data_dir);
-    std::fs::create_dir_all(&data_dir).map_err(|e| CliError::Io(e.to_string()))?;
-
-    let server_url = if let Some(s) = server_opt {
+    let server_raw = if let Some(s) = server_opt {
         s
     } else if let Ok(env_s) = std::env::var("ZK_SERVER_URL") {
         env_s
@@ -1939,6 +1573,8 @@ pub async fn cmd_login(
         "http://127.0.0.1:8080".to_string()
     };
 
+    let server_url = crate::client::auth::validate_and_normalize_server_url(&server_raw)?;
+
     let explicit_dev_id = if let Some(d_str) = device_id_opt {
         Some(
             Uuid::parse_str(&d_str)
@@ -1948,9 +1584,16 @@ pub async fn cmd_login(
         None
     };
 
-    let device_id = get_or_create_device_id(&data_dir, explicit_dev_id)?;
+    let parsed_account_id = if let Some(account) = account_id_opt {
+        Some(
+            Uuid::parse_str(&account)
+                .map_err(|_| CliError::AuthError("Invalid account ID".into()))?,
+        )
+    } else {
+        None
+    };
 
-    let token = zk_protocol::auth::AuthToken::new(match token_opt {
+    let token_raw = match token_opt {
         Some(token) => token,
         None if io::stdin().is_terminal() => {
             rpassword::prompt_password("Existing session token to authorize this device: ")
@@ -1961,28 +1604,17 @@ pub async fn cmd_login(
                 "An existing session token is required; use --token or interactive login".into(),
             ))
         }
-    });
-    let verified = api_verify_token(&server_url, token.expose_secret(), device_id).await?;
-    if let Some(account) = account_id_opt {
-        let account = Uuid::parse_str(&account)
-            .map_err(|_| CliError::AuthError("Invalid account ID".into()))?;
-        if account != verified.account_id {
-            return Err(CliError::AuthError(
-                "Session does not authorize the requested account".into(),
-            ));
-        }
-    }
-    let auth_session = api_device_authorize(
+    };
+
+    let auth_session = crate::client::auth::authorize_terminal_device(
+        custom_data_dir,
         &server_url,
-        token.expose_secret(),
-        verified.account_id,
-        device_id,
+        &token_raw,
+        parsed_account_id,
         device_name_opt,
+        explicit_dev_id,
     )
     .await?;
-
-    let auth_path = auth_session_file(&data_dir);
-    save_auth_session(&auth_path, &auth_session)?;
 
     println!("Successfully authenticated!");
     println!("Server:     {}", auth_session.server_url);
@@ -2008,10 +1640,9 @@ pub async fn cmd_logout(custom_data_dir: Option<&Path>) -> Result<(), CliError> 
 
     if let Ok(session) = load_auth_session(&auth_path) {
         println!("Revoking session with {}...", session.server_url);
-        let _ = api_revoke_session(&session).await;
     }
 
-    clear_auth_session(&auth_path)?;
+    crate::client::auth::sign_out(custom_data_dir).await?;
     println!("Logged out successfully. Local credentials cleared.");
     Ok(())
 }
@@ -2030,56 +1661,197 @@ pub async fn cmd_whoami(custom_data_dir: Option<&Path>, json_output: bool) -> Re
         return Ok(());
     }
 
-    let session = load_auth_session(&auth_path)?;
-
-    // Verify active status with server
-    let status_res = api_query_status(&session).await;
+    let auth_state = crate::client::auth::check_auth_state_online(custom_data_dir).await?;
 
     if json_output {
-        match status_res {
-            Ok(status) => {
+        match auth_state {
+            crate::client::auth::ClientAuthState::Authenticated {
+                server_url,
+                account_id,
+                device_id,
+                session_id,
+                ..
+            } => {
                 println!(
                     "{}",
                     serde_json::json!({
                         "authenticated": true,
-                        "server_url": session.server_url,
-                        "account_id": status.account_id,
-                        "device_id": status.device_id.unwrap_or(session.device_id),
-                        "session_id": status.session_id.or(session.session_id),
-                        "status": status.status,
+                        "server_url": server_url,
+                        "account_id": account_id,
+                        "device_id": device_id,
+                        "session_id": session_id,
+                        "status": "active",
                     })
                 );
             }
-            Err(e) => {
+            crate::client::auth::ClientAuthState::Offline {
+                server_url,
+                account_id,
+                device_id,
+                session_id: _,
+                error,
+            } => {
                 println!(
                     "{}",
                     serde_json::json!({
                         "authenticated": false,
-                        "server_url": session.server_url,
-                        "account_id": session.account_id,
-                        "device_id": session.device_id,
-                        "error": e.to_string(),
+                        "server_url": server_url,
+                        "account_id": account_id,
+                        "device_id": device_id,
+                        "error": error,
                     })
                 );
             }
+            crate::client::auth::ClientAuthState::Revoked {
+                server_url,
+                account_id,
+                device_id,
+                ..
+            } => {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "authenticated": false,
+                        "server_url": server_url,
+                        "account_id": account_id,
+                        "device_id": device_id,
+                        "error": "SessionRevoked",
+                    })
+                );
+            }
+            crate::client::auth::ClientAuthState::Expired {
+                server_url,
+                account_id,
+                device_id,
+                ..
+            } => {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "authenticated": false,
+                        "server_url": server_url,
+                        "account_id": account_id,
+                        "device_id": device_id,
+                        "error": "SessionExpired",
+                    })
+                );
+            }
+            crate::client::auth::ClientAuthState::Error { server_url, error } => {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "authenticated": false,
+                        "server_url": server_url,
+                        "error": error,
+                    })
+                );
+            }
+            crate::client::auth::ClientAuthState::Unverified {
+                server_url,
+                account_id,
+                device_id,
+                session_id,
+                ..
+            } => {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "authenticated": false,
+                        "server_url": server_url,
+                        "account_id": account_id,
+                        "device_id": device_id,
+                        "session_id": session_id,
+                        "status": "unverified",
+                    })
+                );
+            }
+            crate::client::auth::ClientAuthState::LocalOnly => {
+                println!("{}", serde_json::json!({ "authenticated": false }));
+            }
         }
     } else {
-        println!("Server:     {}", session.server_url);
-        println!("Account ID: {}", session.account_id);
-        println!("Device ID:  {}", session.device_id);
-        if let Some(sid) = session.session_id {
-            println!("Session ID: {}", sid);
-        }
-        match status_res {
-            Ok(status) => {
-                println!("Status:     Active ({})", status.status);
+        match auth_state {
+            crate::client::auth::ClientAuthState::Authenticated {
+                server_url,
+                account_id,
+                device_id,
+                session_id,
+                ..
+            } => {
+                println!("Server:     {}", server_url);
+                println!("Account ID: {}", account_id);
+                println!("Device ID:  {}", device_id);
+                if let Some(sid) = session_id {
+                    println!("Session ID: {}", sid);
+                }
+                println!("Status:     Active (active)");
             }
-            Err(CliError::SessionRevoked) => {
+            crate::client::auth::ClientAuthState::Revoked {
+                server_url,
+                account_id,
+                device_id,
+                session_id,
+            } => {
+                println!("Server:     {}", server_url);
+                println!("Account ID: {}", account_id);
+                println!("Device ID:  {}", device_id);
+                if let Some(sid) = session_id {
+                    println!("Session ID: {}", sid);
+                }
                 println!("Status:     REVOKED (session or device revoked on server)");
                 println!("Run 'zk-note login' to re-authenticate.");
             }
-            Err(e) => {
-                println!("Status:     UNREACHABLE / ERROR ({e})");
+            crate::client::auth::ClientAuthState::Expired {
+                server_url,
+                account_id,
+                device_id,
+                session_id,
+            } => {
+                println!("Server:     {}", server_url);
+                println!("Account ID: {}", account_id);
+                println!("Device ID:  {}", device_id);
+                if let Some(sid) = session_id {
+                    println!("Session ID: {}", sid);
+                }
+                println!("Status:     EXPIRED (session token expired)");
+                println!("Run 'zk-note login' to re-authenticate.");
+            }
+            crate::client::auth::ClientAuthState::Offline {
+                server_url,
+                account_id,
+                device_id,
+                session_id,
+                error,
+            } => {
+                println!("Server:     {}", server_url);
+                println!("Account ID: {}", account_id);
+                println!("Device ID:  {}", device_id);
+                if let Some(sid) = session_id {
+                    println!("Session ID: {}", sid);
+                }
+                println!("Status:     UNREACHABLE / ERROR ({error})");
+            }
+            crate::client::auth::ClientAuthState::Error { server_url, error } => {
+                println!("Server:     {}", server_url);
+                println!("Status:     UNREACHABLE / ERROR ({error})");
+            }
+            crate::client::auth::ClientAuthState::Unverified {
+                server_url,
+                account_id,
+                device_id,
+                session_id,
+                ..
+            } => {
+                println!("Server:     {}", server_url);
+                println!("Account ID: {}", account_id);
+                println!("Device ID:  {}", device_id);
+                if let Some(sid) = session_id {
+                    println!("Session ID: {}", sid);
+                }
+                println!("Status:     UNVERIFIED (local session not yet verified online)");
+            }
+            crate::client::auth::ClientAuthState::LocalOnly => {
+                println!("Not logged in. Run 'zk-note login' to authenticate.");
             }
         }
     }
@@ -2156,7 +1928,7 @@ pub async fn cmd_device_revoke(
     // If the revoked device was this device, clear local auth session too
     let was_current = target_device_id == session.device_id;
     if was_current {
-        let _ = clear_auth_session(&auth_path);
+        clear_auth_session(&auth_path)?;
     }
 
     if json_output {
