@@ -27,8 +27,18 @@ use zeroize::Zeroize;
 /// Asynchronous background authentication events received by the TUI event loop.
 #[derive(Debug)]
 enum AuthWorkerEvent {
-    StartupVerify(Result<crate::client::auth::ClientAuthState, CliError>),
-    RefreshStatus(Result<crate::client::auth::ClientAuthState, CliError>),
+    StartupVerify {
+        generation: u64,
+        expected_account_id: Option<uuid::Uuid>,
+        expected_server_url: Option<String>,
+        result: Result<crate::client::auth::ClientAuthState, CliError>,
+    },
+    RefreshStatus {
+        generation: u64,
+        expected_account_id: Option<uuid::Uuid>,
+        expected_server_url: Option<String>,
+        result: Result<crate::client::auth::ClientAuthState, CliError>,
+    },
 }
 
 /// Launches and runs the full-screen interactive terminal interface.
@@ -54,28 +64,34 @@ pub async fn run_tui(data_dir: Option<&Path>) -> Result<(), CliError> {
         // Drain any asynchronous background auth results without blocking the UI
         while let Ok(msg) = auth_rx.try_recv() {
             match msg {
-                AuthWorkerEvent::StartupVerify(res) => match res {
-                    Ok(st) => {
-                        app.account_state = st;
-                    }
-                    Err(e) => {
-                        app.account_state = crate::client::auth::ClientAuthState::Error {
-                            server_url: app.account_state.server_url().unwrap_or("").to_string(),
-                            error: e.to_string(),
-                        };
-                    }
-                },
-                AuthWorkerEvent::RefreshStatus(res) => match res {
-                    Ok(st) => {
-                        app.account_state = st;
-                        app.status_message = Some("Server status updated.".to_string());
-                        app.error_message = None;
-                    }
-                    Err(e) => {
-                        app.error_message = Some(format!("Failed to refresh status: {e}"));
-                        app.status_message = None;
-                    }
-                },
+                AuthWorkerEvent::StartupVerify {
+                    generation,
+                    expected_account_id,
+                    expected_server_url,
+                    result,
+                } => {
+                    app.apply_auth_worker_result(
+                        generation,
+                        expected_account_id,
+                        expected_server_url.as_deref(),
+                        result,
+                        false,
+                    );
+                }
+                AuthWorkerEvent::RefreshStatus {
+                    generation,
+                    expected_account_id,
+                    expected_server_url,
+                    result,
+                } => {
+                    app.apply_auth_worker_result(
+                        generation,
+                        expected_account_id,
+                        expected_server_url.as_deref(),
+                        result,
+                        true,
+                    );
+                }
             }
         }
 
@@ -150,6 +166,7 @@ pub async fn run_tui(data_dir: Option<&Path>) -> Result<(), CliError> {
                     .await;
                     token.zeroize();
                     drop(token);
+                    app.invalidate_auth_ops();
                     match auth_res {
                         Ok(session) => {
                             app.account_state =
@@ -181,6 +198,7 @@ pub async fn run_tui(data_dir: Option<&Path>) -> Result<(), CliError> {
                 }
                 app::AccountPendingAction::SignOut => {
                     let sign_out_res = crate::client::auth::sign_out(app.data_dir.as_deref()).await;
+                    app.invalidate_auth_ops();
                     match sign_out_res {
                         Ok(()) => {
                             app.account_state = crate::client::auth::ClientAuthState::LocalOnly;
@@ -205,6 +223,9 @@ pub async fn run_tui(data_dir: Option<&Path>) -> Result<(), CliError> {
                     }
                 }
                 app::AccountPendingAction::RefreshStatus => {
+                    let generation = app.auth_op_generation;
+                    let expected_account_id = app.account_state.account_id();
+                    let expected_server_url = app.account_state.server_url().map(str::to_string);
                     let tx = auth_tx.clone();
                     let data_dir_opt = app.data_dir.clone();
                     app.status_message = Some("Checking server status...".to_string());
@@ -212,17 +233,30 @@ pub async fn run_tui(data_dir: Option<&Path>) -> Result<(), CliError> {
                         let res =
                             crate::client::auth::check_auth_state_online(data_dir_opt.as_deref())
                                 .await;
-                        let _ = tx.send(AuthWorkerEvent::RefreshStatus(res));
+                        let _ = tx.send(AuthWorkerEvent::RefreshStatus {
+                            generation,
+                            expected_account_id,
+                            expected_server_url,
+                            result: res,
+                        });
                     });
                 }
                 app::AccountPendingAction::StartupVerify => {
+                    let generation = app.auth_op_generation;
+                    let expected_account_id = app.account_state.account_id();
+                    let expected_server_url = app.account_state.server_url().map(str::to_string);
                     let tx = auth_tx.clone();
                     let data_dir_opt = app.data_dir.clone();
                     tokio::spawn(async move {
                         let res =
                             crate::client::auth::check_auth_state_online(data_dir_opt.as_deref())
                                 .await;
-                        let _ = tx.send(AuthWorkerEvent::StartupVerify(res));
+                        let _ = tx.send(AuthWorkerEvent::StartupVerify {
+                            generation,
+                            expected_account_id,
+                            expected_server_url,
+                            result: res,
+                        });
                     });
                 }
             }

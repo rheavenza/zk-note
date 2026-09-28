@@ -19,6 +19,7 @@ use crate::error::CliError;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::fmt;
 use std::path::{Path, PathBuf};
+use uuid::Uuid;
 use zeroize::Zeroize;
 use zk_crypto::keys::VaultKey;
 use zk_sync::ConflictResolutionStrategy;
@@ -125,6 +126,7 @@ pub struct App {
 
     // Server & Account Authentication state (ZK-101 Addendum)
     pub account_state: ClientAuthState,
+    pub auth_op_generation: u64,
     pub account_server_input: String,
     pub account_token_input: String,
     pub account_focus_field: AccountField,
@@ -151,6 +153,7 @@ impl fmt::Debug for App {
             .field("selected_index", &self.selected_index)
             .field("sync_status", &self.sync_status)
             .field("account_state", &self.account_state)
+            .field("auth_op_generation", &self.auth_op_generation)
             .field("account_server_input", &self.account_server_input)
             .field("account_token_input", &"[REDACTED]")
             .field("account_focus_field", &self.account_focus_field)
@@ -227,6 +230,7 @@ impl App {
             passphrase_input: String::new(),
             unlock_error: None,
             account_state: initial_auth,
+            auth_op_generation: 1,
             account_server_input: default_server,
             account_token_input: String::new(),
             account_focus_field: AccountField::ServerUrl,
@@ -838,6 +842,7 @@ impl App {
                     if tok.is_empty() {
                         self.error_message = Some("Session token cannot be empty.".to_string());
                     } else {
+                        self.invalidate_auth_ops();
                         self.account_pending_action = Some(AccountPendingAction::Connect {
                             server_url: url,
                             token: tok,
@@ -851,6 +856,7 @@ impl App {
             }
             Action::AccountSignOut => {
                 if self.mode == AppMode::Account {
+                    self.invalidate_auth_ops();
                     self.account_pending_action = Some(AccountPendingAction::SignOut);
                     self.status_message = Some("Revoking session with server...".to_string());
                     self.error_message = None;
@@ -858,6 +864,7 @@ impl App {
             }
             Action::AccountRefresh => {
                 if self.mode == AppMode::Account {
+                    self.invalidate_auth_ops();
                     self.account_pending_action = Some(AccountPendingAction::RefreshStatus);
                     self.status_message = Some("Checking server status...".to_string());
                     self.error_message = None;
@@ -981,6 +988,108 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Increments the background authentication operation generation counter,
+    /// invalidating any in-flight background operations.
+    pub fn invalidate_auth_ops(&mut self) -> u64 {
+        self.auth_op_generation = self.auth_op_generation.wrapping_add(1);
+        self.auth_op_generation
+    }
+
+    /// Returns the current authentication operation generation.
+    #[must_use]
+    pub fn current_auth_generation(&self) -> u64 {
+        self.auth_op_generation
+    }
+
+    /// Applies the result of an asynchronous authentication background worker operation.
+    ///
+    /// Verifies generation and session identity guards:
+    /// - Rejects completions whose generation does not match the active generation.
+    /// - Rejects completions if the client is currently in LocalOnly mode.
+    /// - Rejects completions if the expected account ID does not match current state.
+    /// - Rejects completions if the expected server URL does not match current state.
+    /// - Rejects completions if the new state account ID conflicts with current state.
+    /// - Rejects completions if the new state server URL conflicts with current state.
+    ///
+    /// Returns `true` if the result was accepted and applied, or `false` if rejected as stale.
+    pub fn apply_auth_worker_result(
+        &mut self,
+        generation: u64,
+        expected_account_id: Option<Uuid>,
+        expected_server_url: Option<&str>,
+        result: Result<ClientAuthState, CliError>,
+        is_refresh: bool,
+    ) -> bool {
+        // 1. Generation guard: must match the active auth operation generation
+        if generation != self.auth_op_generation {
+            return false;
+        }
+
+        // 2. Local-only guard: if the client is currently local-only (e.g. signed out),
+        // any background server auth results must be rejected.
+        if self.account_state.is_local_only() {
+            return false;
+        }
+
+        // 3. Account identity guard: if an account ID was expected, current state must match
+        if let Some(expected_id) = expected_account_id {
+            if self.account_state.account_id() != Some(expected_id) {
+                return false;
+            }
+        }
+
+        // 4. Server URL guard: if a server URL was expected, current state must match
+        if let Some(expected_url) = expected_server_url {
+            if self.account_state.server_url() != Some(expected_url) {
+                return false;
+            }
+        }
+
+        // 5. Result payload identity guard: if incoming state is Ok(st), ensure it matches current identity
+        if let Ok(st) = &result {
+            // If incoming state is for a specific account, ensure it does not conflict with current account
+            if let (Some(curr_id), Some(new_id)) =
+                (self.account_state.account_id(), st.account_id())
+            {
+                if curr_id != new_id {
+                    return false;
+                }
+            }
+            // If incoming state is for a specific server, ensure it does not conflict with current server
+            if let (Some(curr_url), Some(new_url)) =
+                (self.account_state.server_url(), st.server_url())
+            {
+                if curr_url != new_url {
+                    return false;
+                }
+            }
+        }
+
+        // All guards passed. Apply result to state machine.
+        match result {
+            Ok(st) => {
+                self.account_state = st;
+                if is_refresh {
+                    self.status_message = Some("Server status updated.".to_string());
+                    self.error_message = None;
+                }
+            }
+            Err(e) => {
+                if is_refresh {
+                    self.error_message = Some(format!("Failed to refresh status: {e}"));
+                    self.status_message = None;
+                } else {
+                    self.account_state = ClientAuthState::Error {
+                        server_url: self.account_state.server_url().unwrap_or("").to_string(),
+                        error: e.to_string(),
+                    };
+                }
+            }
+        }
+
+        true
     }
 
     /// Translates a Crossterm [`KeyEvent`] to an [`Action`] according to active mode.

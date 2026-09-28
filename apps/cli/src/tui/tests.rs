@@ -8,10 +8,10 @@ use crate::client::auth::ClientAuthState;
 use crate::client::conflicts::ClientConflictSummary;
 use crate::client::notes::create_note;
 use crate::client::sync::SyncStatus;
-
 use crate::client::vault::unlock_vault;
 use crate::commands::cmd_init;
 use crate::config::session_file;
+use crate::error::CliError;
 use crate::session::{get_session_info, update_session_timeout};
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::backend::TestBackend;
@@ -1174,4 +1174,257 @@ async fn test_startup_verification_stalled_server_preserves_offline_first_and_up
 
     let _ = shutdown_tx.send(());
     let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_auth_out_of_order_result_after_sign_out_is_rejected() {
+    let (_dir, mut app) = setup_test_vault();
+    let account_a = uuid::Uuid::new_v4();
+    let device_a = uuid::Uuid::new_v4();
+    let server_a = "http://server-a:8080".to_string();
+
+    app.account_state = ClientAuthState::Authenticated {
+        server_url: server_a.clone(),
+        account_id: account_a,
+        device_id: device_a,
+        session_id: Some(uuid::Uuid::new_v4()),
+        expires_at: None,
+    };
+    let gen_a = app.current_auth_generation();
+
+    // 1. User signs out in Account modal
+    app.mode = AppMode::Account;
+    app.update(Action::AccountSignOut);
+    assert!(
+        app.current_auth_generation() > gen_a,
+        "SignOut must invalidate in-flight auth generation"
+    );
+
+    // Simulate completion of sign-out in event loop
+    app.invalidate_auth_ops();
+    app.account_state = ClientAuthState::LocalOnly;
+    app.status_message = Some("Session revoked. Signed out successfully.".to_string());
+    app.error_message = None;
+
+    // 2. Delayed background completion for Account A arrives
+    let delayed_state = ClientAuthState::Authenticated {
+        server_url: server_a.clone(),
+        account_id: account_a,
+        device_id: device_a,
+        session_id: Some(uuid::Uuid::new_v4()),
+        expires_at: None,
+    };
+
+    let applied_stale_gen = app.apply_auth_worker_result(
+        gen_a,
+        Some(account_a),
+        Some(&server_a),
+        Ok(delayed_state.clone()),
+        false,
+    );
+    assert!(
+        !applied_stale_gen,
+        "Stale completion from prior generation must be rejected"
+    );
+    assert_eq!(
+        app.account_state,
+        ClientAuthState::LocalOnly,
+        "LocalOnly state must not be overwritten by delayed success"
+    );
+    assert_eq!(
+        app.status_message.as_deref(),
+        Some("Session revoked. Signed out successfully.")
+    );
+    assert!(app.error_message.is_none());
+
+    // 3. Even if generation somehow matched, LocalOnly guard must reject server auth results
+    let curr_gen = app.current_auth_generation();
+    let applied_local_only = app.apply_auth_worker_result(
+        curr_gen,
+        Some(account_a),
+        Some(&server_a),
+        Ok(delayed_state),
+        false,
+    );
+    assert!(
+        !applied_local_only,
+        "LocalOnly state machine guard must reject any background server auth results"
+    );
+    assert_eq!(app.account_state, ClientAuthState::LocalOnly);
+
+    // 4. Stale background error must also be rejected without modifying error_message
+    let applied_err = app.apply_auth_worker_result(
+        gen_a,
+        Some(account_a),
+        Some(&server_a),
+        Err(CliError::Network("connection reset".to_string())),
+        true,
+    );
+    assert!(!applied_err, "Stale error must be rejected");
+    assert_eq!(app.account_state, ClientAuthState::LocalOnly);
+    assert!(
+        app.error_message.is_none(),
+        "Stale completion must not set error_message"
+    );
+}
+
+#[test]
+fn test_auth_out_of_order_result_after_account_change_is_rejected() {
+    let (_dir, mut app) = setup_test_vault();
+    let account_a = uuid::Uuid::new_v4();
+    let server_a = "http://server-a:8080".to_string();
+
+    app.account_state = ClientAuthState::Authenticated {
+        server_url: server_a.clone(),
+        account_id: account_a,
+        device_id: uuid::Uuid::new_v4(),
+        session_id: Some(uuid::Uuid::new_v4()),
+        expires_at: None,
+    };
+    let gen_a = app.current_auth_generation();
+
+    // 1. User connects to a new server and account B
+    let account_b = uuid::Uuid::new_v4();
+    let server_b = "http://server-b:8080".to_string();
+    app.mode = AppMode::Account;
+    app.account_server_input = server_b.clone();
+    app.account_token_input = "tok-b".to_string();
+    app.update(Action::AccountSubmit);
+    assert!(
+        app.current_auth_generation() > gen_a,
+        "AccountSubmit must invalidate in-flight auth generation"
+    );
+
+    // Simulate successful authorization of device on server B
+    app.invalidate_auth_ops();
+    let gen_b = app.current_auth_generation();
+    app.account_state = ClientAuthState::Authenticated {
+        server_url: server_b.clone(),
+        account_id: account_b,
+        device_id: uuid::Uuid::new_v4(),
+        session_id: Some(uuid::Uuid::new_v4()),
+        expires_at: None,
+    };
+    app.status_message = Some("Device authorized on server B.".to_string());
+    app.error_message = None;
+
+    // 2. Delayed background result for Account A arrives with old generation
+    let delayed_state_a = ClientAuthState::Authenticated {
+        server_url: server_a.clone(),
+        account_id: account_a,
+        device_id: uuid::Uuid::new_v4(),
+        session_id: Some(uuid::Uuid::new_v4()),
+        expires_at: None,
+    };
+
+    let applied_stale_gen = app.apply_auth_worker_result(
+        gen_a,
+        Some(account_a),
+        Some(&server_a),
+        Ok(delayed_state_a.clone()),
+        false,
+    );
+    assert!(
+        !applied_stale_gen,
+        "Stale completion for Account A must be rejected by generation guard"
+    );
+    assert_eq!(
+        app.account_state.account_id(),
+        Some(account_b),
+        "Account B must remain active"
+    );
+    assert_eq!(app.account_state.server_url(), Some(server_b.as_str()));
+    assert_eq!(
+        app.status_message.as_deref(),
+        Some("Device authorized on server B.")
+    );
+
+    // 3. Even if generation matched gen_b, session identity guard must reject Account A
+    let applied_mismatched_id = app.apply_auth_worker_result(
+        gen_b,
+        Some(account_a),
+        Some(&server_a),
+        Ok(delayed_state_a),
+        true,
+    );
+    assert!(
+        !applied_mismatched_id,
+        "Session identity guard must reject result for mismatched account"
+    );
+    assert_eq!(app.account_state.account_id(), Some(account_b));
+    assert_eq!(app.account_state.server_url(), Some(server_b.as_str()));
+}
+
+#[test]
+fn test_auth_superseded_refresh_is_rejected() {
+    let (_dir, mut app) = setup_test_vault();
+    let account_a = uuid::Uuid::new_v4();
+    let server_a = "http://server-a:8080".to_string();
+
+    app.account_state = ClientAuthState::Authenticated {
+        server_url: server_a.clone(),
+        account_id: account_a,
+        device_id: uuid::Uuid::new_v4(),
+        session_id: Some(uuid::Uuid::new_v4()),
+        expires_at: None,
+    };
+
+    // 1. User triggers first refresh (gen1)
+    app.mode = AppMode::Account;
+    app.update(Action::AccountRefresh);
+    let gen1 = app.current_auth_generation();
+
+    // 2. User triggers second refresh (gen2)
+    app.update(Action::AccountRefresh);
+    let gen2 = app.current_auth_generation();
+    assert!(
+        gen2 > gen1,
+        "Subsequent refresh must advance the generation counter"
+    );
+
+    // 3. Second refresh completes first and succeeds
+    let refreshed_state = ClientAuthState::Authenticated {
+        server_url: server_a.clone(),
+        account_id: account_a,
+        device_id: uuid::Uuid::new_v4(),
+        session_id: Some(uuid::Uuid::new_v4()),
+        expires_at: Some("2026-10-01T00:00:00Z".to_string()),
+    };
+    let applied2 = app.apply_auth_worker_result(
+        gen2,
+        Some(account_a),
+        Some(&server_a),
+        Ok(refreshed_state.clone()),
+        true,
+    );
+    assert!(applied2, "Current generation refresh must be accepted");
+    assert_eq!(app.account_state, refreshed_state);
+    assert_eq!(
+        app.status_message.as_deref(),
+        Some("Server status updated.")
+    );
+    assert!(app.error_message.is_none());
+
+    // 4. First refresh finishes later with an error (e.g. timeout)
+    let applied1 = app.apply_auth_worker_result(
+        gen1,
+        Some(account_a),
+        Some(&server_a),
+        Err(CliError::Network("timed out".to_string())),
+        true,
+    );
+    assert!(!applied1, "Superseded refresh result must be rejected");
+    assert_eq!(
+        app.account_state, refreshed_state,
+        "Newer auth state must not be overwritten by superseded result"
+    );
+    assert_eq!(
+        app.status_message.as_deref(),
+        Some("Server status updated."),
+        "Newer status message must not be cleared by superseded result"
+    );
+    assert!(
+        app.error_message.is_none(),
+        "Superseded error must not set error_message"
+    );
 }
