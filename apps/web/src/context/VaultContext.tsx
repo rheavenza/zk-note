@@ -17,18 +17,21 @@ import React, {
 import { VaultWorkerClient, WorkerError } from "../worker/client.js";
 import { IndexedDbStorage } from "../storage/indexeddb.js";
 import { WorkerErrorCode } from "../worker/protocol.js";
+import {
+  VaultLinkRecord,
+  readVaultLink,
+  writeVaultLink,
+  type VaultBootstrapData,
+} from "../auth/vault-link.js";
 
 export type VaultState = "UNINITIALIZED" | "LOCKED" | "UNLOCKING" | "UNLOCKED";
 
-export interface VaultBootstrapData {
-  wrappedVaultKey: string;
-  kdfParamsJson: string;
-  wrappedRecoveryKey: string;
-}
+export type { VaultBootstrapData };
 
 export interface VaultSnapshot {
   vaultState: VaultState;
   bootstrap: VaultBootstrapData | null;
+  vaultLink: VaultLinkRecord | null;
   error: string | null;
   autoLockTimeoutMinutes: number;
 }
@@ -36,6 +39,7 @@ export interface VaultSnapshot {
 export interface VaultContextType {
   vaultState: VaultState;
   bootstrap: VaultBootstrapData | null;
+  vaultLink: VaultLinkRecord | null;
   error: string | null;
   autoLockTimeoutMinutes: number;
   clearError: () => void;
@@ -49,6 +53,8 @@ export interface VaultContextType {
   ) => Promise<void>;
   lock: () => Promise<void>;
   setAutoLockTimeout: (minutes: number) => void;
+  setVaultLink: (link: VaultLinkRecord | null) => void;
+  restoreFromRemote: (bootstrap: VaultBootstrapData, link?: VaultLinkRecord) => void;
   recordActivity: () => void;
   checkIdleLock: () => Promise<void>;
   client: VaultWorkerClient;
@@ -117,6 +123,7 @@ function persistAutoLockTimeout(minutes: number): void {
 export class VaultStore {
   private state: VaultState;
   private bootstrap: VaultBootstrapData | null;
+  private vaultLink: VaultLinkRecord | null = null;
   private error: string | null = null;
   private autoLockTimeoutMinutes: number;
   private lastActivityTime: number = Date.now();
@@ -130,12 +137,22 @@ export class VaultStore {
     public readonly client: VaultWorkerClient,
     public readonly storage: IndexedDbStorage,
     initialBootstrap: VaultBootstrapData | null = null,
-    initialAutoLockMinutes?: number
+    initialAutoLockMinutes?: number,
+    initialVaultLink?: VaultLinkRecord | null
   ) {
     this.autoLockTimeoutMinutes =
       initialAutoLockMinutes !== undefined
         ? initialAutoLockMinutes
         : getStoredAutoLockTimeout();
+
+    if (initialVaultLink !== undefined) {
+      this.vaultLink = initialVaultLink;
+    } else {
+      this.vaultLink =
+        typeof window !== "undefined" && window.localStorage
+          ? readVaultLink(window.localStorage)
+          : null;
+    }
 
     if (initialBootstrap !== undefined && initialBootstrap !== null) {
       this.bootstrap = initialBootstrap;
@@ -157,6 +174,7 @@ export class VaultStore {
     this.snapshot = {
       vaultState: this.state,
       bootstrap: this.bootstrap,
+      vaultLink: this.vaultLink,
       error: this.error,
       autoLockTimeoutMinutes: this.autoLockTimeoutMinutes,
     };
@@ -201,6 +219,7 @@ export class VaultStore {
     this.snapshot = {
       vaultState: this.state,
       bootstrap: this.bootstrap,
+      vaultLink: this.vaultLink,
       error: this.error,
       autoLockTimeoutMinutes: this.autoLockTimeoutMinutes,
     };
@@ -213,6 +232,35 @@ export class VaultStore {
   public getSnapshot = (): VaultSnapshot => {
     return this.snapshot;
   };
+
+  public getVaultLink(): VaultLinkRecord | null {
+    return this.vaultLink;
+  }
+
+  public setVaultLink(link: VaultLinkRecord | null): void {
+    this.vaultLink = link;
+    if (typeof window !== "undefined" && window.localStorage) {
+      writeVaultLink(window.localStorage, link);
+    }
+    this.notify();
+  }
+
+  public restoreFromRemote(
+    bootstrap: VaultBootstrapData,
+    link?: VaultLinkRecord
+  ): void {
+    persistBootstrap(bootstrap);
+    this.bootstrap = bootstrap;
+    if (link !== undefined) {
+      this.vaultLink = link;
+      if (typeof window !== "undefined" && window.localStorage) {
+        writeVaultLink(window.localStorage, link);
+      }
+    }
+    this.state = "LOCKED";
+    this.error = null;
+    this.notify();
+  }
 
   public setAutoLockTimeout(minutes: number): void {
     this.autoLockTimeoutMinutes = Math.max(0, minutes);
@@ -436,6 +484,7 @@ export interface VaultProviderProps {
   storage: IndexedDbStorage;
   initialBootstrap?: VaultBootstrapData | null;
   initialAutoLockMinutes?: number;
+  initialVaultLink?: VaultLinkRecord | null;
   children: React.ReactNode;
 }
 
@@ -444,11 +493,12 @@ export const VaultProvider: React.FC<VaultProviderProps> = ({
   storage,
   initialBootstrap = null,
   initialAutoLockMinutes,
+  initialVaultLink,
   children,
 }) => {
   const store = useMemo(
-    () => new VaultStore(client, storage, initialBootstrap, initialAutoLockMinutes),
-    [client, storage, initialBootstrap, initialAutoLockMinutes]
+    () => new VaultStore(client, storage, initialBootstrap, initialAutoLockMinutes, initialVaultLink),
+    [client, storage, initialBootstrap, initialAutoLockMinutes, initialVaultLink]
   );
 
   useEffect(() => {
@@ -501,6 +551,9 @@ export const VaultProvider: React.FC<VaultProviderProps> = ({
       get bootstrap() {
         return store.getState().bootstrap;
       },
+      get vaultLink() {
+        return store.getState().vaultLink;
+      },
       get error() {
         return store.getState().error;
       },
@@ -515,6 +568,9 @@ export const VaultProvider: React.FC<VaultProviderProps> = ({
         store.rewrapPassphrase(p, k, old),
       lock: () => store.lock(),
       setAutoLockTimeout: (minutes: number) => store.setAutoLockTimeout(minutes),
+      setVaultLink: (link: VaultLinkRecord | null) => store.setVaultLink(link),
+      restoreFromRemote: (b: VaultBootstrapData, l?: VaultLinkRecord) =>
+        store.restoreFromRemote(b, l),
       recordActivity: () => store.recordActivity(),
       checkIdleLock: () => store.checkIdleLock(),
       client: store.client,
@@ -526,6 +582,10 @@ export const VaultProvider: React.FC<VaultProviderProps> = ({
 
   return <VaultContext.Provider value={value}>{children}</VaultContext.Provider>;
 };
+
+export function useVaultOptional(): VaultContextType | null {
+  return useContext(VaultContext);
+}
 
 export function useVault(): VaultContextType {
   const ctx = useContext(VaultContext);

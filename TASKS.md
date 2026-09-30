@@ -121,13 +121,23 @@ Expired sessions now show an explicit state. Failed or offline server revocation
 keeps the session available for a sign-out retry. Web checks pass at merge.
 
 ## ZK-105 — Safely link and restore encrypted vault bootstrap
-State: BACKLOG
+State: DONE (PR open / review pending)
 Priority: P1
 Dependencies: ZK-104
 Ticket: [docs/tickets/ZK-105.md](docs/tickets/ZK-105.md)
 Acceptance: encrypted bootstrap upload and second-device restore; mismatch,
 wrong account, and interrupted retry never overwrite a vault.
 Verification: web gates, protocol tests, and redacted two-browser evidence.
+Implementation note: Safe linking and remote bootstrap restoration implemented
+in `apps/web/src/auth/vault-link.ts`. Only encrypted bootstrap envelopes and
+permitted KDF/version parameters are transmitted; plaintexts, passphrases, raw keys,
+and recovery keys are strictly excluded and guarded by `assertNoPlaintextSecrets`.
+Mismatched vaults, wrong-account states, and existing conflicting local vaults fail
+non-destructively without silent overwrite. Network interruption and 409 conflict
+retries preserve local state deterministically. Vault state machine, `AuthControls`,
+and `UnlockScreen` provide link/restore UI flows. 126 automated web tests pass,
+including end-to-end multi-thread Web Worker bootstrap restoration and unlocking.
+All repository-wide Rust/web quality gates pass cleanly.
 
 ## ZK-106 — Durable browser ciphertext synchronization
 State: BACKLOG
