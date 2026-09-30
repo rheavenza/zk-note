@@ -13,6 +13,7 @@ import { useVault } from "../context/VaultContext.js";
 import { useAuth } from "../context/AuthContext.js";
 import { AuthControls } from "./AuthControls.js";
 import { restoreVaultFromAccount } from "../auth/vault-link.js";
+import { normalizeServerOrigin } from "../auth/session.js";
 
 export interface UnlockScreenProps {
   children?: React.ReactNode;
@@ -528,6 +529,19 @@ export const UnlockScreen: React.FC<UnlockScreenProps> = ({
             </div>
           )}
 
+          {vaultLink && auth.isAuthenticated && (
+            normalizeServerOrigin(auth.serverOrigin) !== normalizeServerOrigin(vaultLink.serverOrigin) ||
+            auth.session?.accountId !== vaultLink.accountId
+          ) && (
+            <div role="alert" style={{ ...errorAlertStyle, marginBottom: 16 }}>
+              <span>
+                {normalizeServerOrigin(auth.serverOrigin) !== normalizeServerOrigin(vaultLink.serverOrigin)
+                  ? `⚠️ Connected to '${auth.serverOrigin}', but this browser was linked to server '${vaultLink.serverOrigin}'.`
+                  : `⚠️ Signed in as '${auth.session?.accountId}', but this browser was linked to account '${vaultLink.accountId}'.`}
+              </span>
+            </div>
+          )}
+
           {auth.isAuthenticated && (
             <div
               style={{
@@ -652,15 +666,20 @@ export const UnlockScreen: React.FC<UnlockScreenProps> = ({
           </p>
           {vaultLink && (
             <p style={{ margin: "8px 0 0 0", fontSize: "12px", color: "#6b7280" }}>
-              Linked to account: <strong>{vaultLink.accountId}</strong>
+              Linked to account: <strong>{vaultLink.accountId}</strong> on <strong>{vaultLink.serverOrigin}</strong>
             </p>
           )}
         </div>
 
-        {vaultLink && auth.isAuthenticated && auth.session?.accountId !== vaultLink.accountId && (
+        {vaultLink && auth.isAuthenticated && (
+          normalizeServerOrigin(auth.serverOrigin) !== normalizeServerOrigin(vaultLink.serverOrigin) ||
+          auth.session?.accountId !== vaultLink.accountId
+        ) && (
           <div role="alert" style={{ ...errorAlertStyle, marginBottom: 16 }}>
             <span>
-              ⚠️ Signed in as '{auth.session?.accountId}', but this vault belongs to account '{vaultLink.accountId}'.
+              {normalizeServerOrigin(auth.serverOrigin) !== normalizeServerOrigin(vaultLink.serverOrigin)
+                ? `⚠️ Connected to '${auth.serverOrigin}', but this vault is linked to server '${vaultLink.serverOrigin}'.`
+                : `⚠️ Signed in as '${auth.session?.accountId}', but this vault belongs to account '${vaultLink.accountId}'.`}
             </span>
           </div>
         )}

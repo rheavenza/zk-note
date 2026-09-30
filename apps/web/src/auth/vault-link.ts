@@ -65,6 +65,16 @@ export class WrongAccountError extends VaultLinkError {
   }
 }
 
+export class OriginMismatchError extends VaultLinkError {
+  constructor(public readonly linkedOrigin: string, public readonly currentOrigin: string) {
+    super(
+      `This vault is already linked to server '${linkedOrigin}'. Current server is '${currentOrigin}'. Switch to the linked server to access this vault.`,
+      "ORIGIN_MISMATCH"
+    );
+    this.name = "OriginMismatchError";
+  }
+}
+
 export class MismatchedVaultError extends VaultLinkError {
   constructor(message?: string) {
     super(
@@ -251,6 +261,7 @@ export function writeVaultLink(
 ): void {
   try {
     if (link) {
+      assertNoPlaintextSecrets(link);
       storage.setItem(
         VAULT_LINK_STORAGE_KEY,
         JSON.stringify({
@@ -262,8 +273,12 @@ export function writeVaultLink(
     } else {
       storage.removeItem(VAULT_LINK_STORAGE_KEY);
     }
-  } catch {
-    // Ignore storage errors
+  } catch (err) {
+    if (err instanceof VaultLinkError) throw err;
+    throw new VaultLinkError(
+      "Failed to persist vault link association to storage.",
+      "STORAGE_ERROR"
+    );
   }
 }
 
@@ -273,7 +288,13 @@ export function writeVaultLink(
 export function clearVaultLink(storage: Pick<Storage, "removeItem">): void {
   try {
     storage.removeItem(VAULT_LINK_STORAGE_KEY);
-  } catch {}
+  } catch (err) {
+    if (err instanceof VaultLinkError) throw err;
+    throw new VaultLinkError(
+      "Failed to clear vault link association from storage.",
+      "STORAGE_ERROR"
+    );
+  }
 }
 
 /**
@@ -387,10 +408,15 @@ export async function linkLocalVaultToAccount(
 
   const origin = normalizeServerOrigin(serverOrigin);
 
-  // 1. Wrong-account check
+  // 1. Wrong-account and server origin mismatch checks
   const existingLink = readVaultLink(storage);
-  if (existingLink && existingLink.accountId !== accountId) {
-    throw new WrongAccountError(existingLink.accountId, accountId);
+  if (existingLink) {
+    if (normalizeServerOrigin(existingLink.serverOrigin) !== origin) {
+      throw new OriginMismatchError(existingLink.serverOrigin, origin);
+    }
+    if (existingLink.accountId !== accountId) {
+      throw new WrongAccountError(existingLink.accountId, accountId);
+    }
   }
 
   // 2. Fetch remote bootstrap to inspect existing state
@@ -454,18 +480,35 @@ export interface RestoreVaultOptions {
 
 /**
  * Restores the remote encrypted vault bootstrap to the browser.
- * Fails closed and non-destructively if a differing local vault already exists.
+ * Fails closed and non-destructively if a differing local vault already exists,
+ * or if the browser is already associated with a different account or server.
  */
 export async function restoreVaultFromAccount(
   options: RestoreVaultOptions
 ): Promise<{ bootstrap: VaultBootstrapData; link: VaultLinkRecord }> {
   const { serverOrigin, token, accountId, localBootstrap } = options;
   const storage =
-    options.storage || (typeof window !== "undefined" ? window.localStorage : null);
+    options.storage ||
+    (typeof window !== "undefined" ? window.localStorage : (typeof localStorage !== "undefined" ? localStorage : null));
+
+  if (!storage) {
+    throw new VaultLinkError("Storage is not available for vault restoration.", "STORAGE_UNAVAILABLE");
+  }
 
   const origin = normalizeServerOrigin(serverOrigin);
 
-  // 1. If local vault exists, check non-destructive rules
+  // 1. Wrong-account and origin-mismatch check on existing persisted link
+  const existingLink = readVaultLink(storage);
+  if (existingLink) {
+    if (normalizeServerOrigin(existingLink.serverOrigin) !== origin) {
+      throw new OriginMismatchError(existingLink.serverOrigin, origin);
+    }
+    if (existingLink.accountId !== accountId) {
+      throw new WrongAccountError(existingLink.accountId, accountId);
+    }
+  }
+
+  // 2. If local vault exists, check non-destructive rules
   if (localBootstrap) {
     const remote = await fetchRemoteBootstrap(origin, token);
     if (!remote) {
@@ -480,16 +523,14 @@ export async function restoreVaultFromAccount(
         serverOrigin: origin,
         linkedAt: new Date().toISOString(),
       };
-      if (storage) {
-        writeVaultLink(storage, linkRecord);
-      }
+      writeVaultLink(storage, linkRecord);
       return { bootstrap: localBootstrap, link: linkRecord };
     }
     // Differs! Refuse to overwrite local vault.
     throw new ExistingLocalVaultError();
   }
 
-  // 2. Local vault is null (UNINITIALIZED). Fetch remote bootstrap.
+  // 3. Local vault is null (UNINITIALIZED). Fetch remote bootstrap.
   const remote = await fetchRemoteBootstrap(origin, token);
   if (!remote) {
     throw new VaultLinkError(
@@ -505,9 +546,7 @@ export async function restoreVaultFromAccount(
     linkedAt: new Date().toISOString(),
   };
 
-  if (storage) {
-    writeVaultLink(storage, linkRecord);
-  }
+  writeVaultLink(storage, linkRecord);
 
   return { bootstrap: restoredBootstrap, link: linkRecord };
 }

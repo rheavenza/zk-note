@@ -135,9 +135,15 @@ and recovery keys are strictly excluded and guarded by `assertNoPlaintextSecrets
 Mismatched vaults, wrong-account states, and existing conflicting local vaults fail
 non-destructively without silent overwrite. Network interruption and 409 conflict
 retries preserve local state deterministically. Vault state machine, `AuthControls`,
-and `UnlockScreen` provide link/restore UI flows. 126 automated web tests pass,
-including end-to-end multi-thread Web Worker bootstrap restoration and unlocking.
-All repository-wide Rust/web quality gates pass cleanly.
+and `UnlockScreen` provide link/restore UI flows. Addressed PR #10 review findings:
+enforced full `(serverOrigin, accountId)` identity validation with `OriginMismatchError`
+and `WrongAccountError` across both link and restore flows; enforced existing link checks
+in uninitialized and initialized restore; made storage persistence fail-closed across
+`writeVaultLink`, `clearVaultLink`, and `persistBootstrap` so state machine transitions
+never falsely report success on storage write failure; added web quality gates and build
+job to GitHub Actions CI workflow. 137 automated web tests pass, including end-to-end
+multi-thread Web Worker bootstrap restoration and unlocking. All repository-wide
+Rust and web quality gates pass cleanly.
 
 ## ZK-106 — Durable browser ciphertext synchronization
 State: BACKLOG

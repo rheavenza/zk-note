@@ -2,6 +2,7 @@ import React, { useEffect, useState } from "react";
 import { useAuth } from "../context/AuthContext.js";
 import { useVaultOptional } from "../context/VaultContext.js";
 import { linkLocalVaultToAccount, restoreVaultFromAccount } from "../auth/vault-link.js";
+import { normalizeServerOrigin } from "../auth/session.js";
 
 export interface AuthControlsProps {
   initialOpen?: boolean;
@@ -102,7 +103,11 @@ export const AuthControls: React.FC<AuthControlsProps> = ({ initialOpen = false 
         {vault && (bootstrap ? (
           <div style={{ marginTop: 10, padding: 8, background: "#f9fafb", border: "1px solid #e5e7eb", borderRadius: 4 }}>
             {vaultLink ? (
-              vaultLink.accountId === auth.session?.accountId ? (
+              normalizeServerOrigin(vaultLink.serverOrigin) !== normalizeServerOrigin(auth.serverOrigin) ? (
+                <p role="alert" style={{ margin: 0, color: "#b91c1c", fontWeight: 600 }}>
+                  ⚠️ Vault linked to different server: {vaultLink.serverOrigin}
+                </p>
+              ) : vaultLink.accountId === auth.session?.accountId ? (
                 <p style={{ margin: 0, color: "#166534", fontWeight: 600 }}>✓ Vault linked to this account</p>
               ) : (
                 <p role="alert" style={{ margin: 0, color: "#b91c1c", fontWeight: 600 }}>
@@ -125,6 +130,17 @@ export const AuthControls: React.FC<AuthControlsProps> = ({ initialOpen = false 
           </div>
         ) : (
           <div style={{ marginTop: 10, padding: 8, background: "#f9fafb", border: "1px solid #e5e7eb", borderRadius: 4 }}>
+            {vaultLink && (
+              normalizeServerOrigin(vaultLink.serverOrigin) !== normalizeServerOrigin(auth.serverOrigin) ? (
+                <p role="alert" style={{ margin: "0 0 6px 0", color: "#b91c1c", fontWeight: 600 }}>
+                  ⚠️ Browser linked to different server: {vaultLink.serverOrigin}
+                </p>
+              ) : vaultLink.accountId !== auth.session?.accountId ? (
+                <p role="alert" style={{ margin: "0 0 6px 0", color: "#b91c1c", fontWeight: 600 }}>
+                  ⚠️ Browser linked to different account: {vaultLink.accountId}
+                </p>
+              ) : null
+            )}
             <p style={{ margin: "0 0 6px 0", color: "#4b5563" }}>No local vault on this browser.</p>
             <button
               type="button"

@@ -14,12 +14,14 @@ import {
   restoreVaultFromAccount,
   assertNoPlaintextSecrets,
   WrongAccountError,
+  OriginMismatchError,
+  VaultLinkError,
   MismatchedVaultError,
   ExistingLocalVaultError,
   VAULT_LINK_STORAGE_KEY,
 } from "../src/auth/vault-link.js";
 import { AuthProvider } from "../src/context/AuthContext.js";
-import { VaultProvider, VaultStore } from "../src/context/VaultContext.js";
+import { VaultProvider, VaultStore, persistBootstrap } from "../src/context/VaultContext.js";
 import { AuthControls } from "../src/components/AuthControls.js";
 import { UnlockScreen } from "../src/components/UnlockScreen.js";
 import { IndexedDbStorage } from "../src/storage/indexeddb.js";
@@ -93,6 +95,28 @@ function createMockStorage(): Storage {
     },
     key: (i: number) => Array.from(map.keys())[i] ?? null,
     length: map.size,
+  };
+}
+
+function createThrowingStorage(failingMethod: "setItem" | "removeItem" | "both" = "setItem"): Storage {
+  const map = new Map<string, string>();
+  return {
+    getItem: (k: string) => map.get(k) ?? null,
+    setItem: (k: string, v: string) => {
+      if (failingMethod === "setItem" || failingMethod === "both") {
+        throw new Error("QuotaExceededError: LocalStorage quota exceeded");
+      }
+      map.set(k, v);
+    },
+    removeItem: (k: string) => {
+      if (failingMethod === "removeItem" || failingMethod === "both") {
+        throw new Error("StorageError: Failed to remove item");
+      }
+      map.delete(k);
+    },
+    clear: () => map.clear(),
+    key: (_i: number) => null,
+    length: 0,
   };
 }
 
@@ -598,3 +622,348 @@ test("UI rendering: UnlockScreen renders Restore option when uninitialized and a
     storage.deleteDatabase().catch(() => {});
   }
 });
+
+test("linkLocalVaultToAccount: origin mismatch stops non-destructively", async () => {
+  const storage = createMockStorage();
+  writeVaultLink(storage, {
+    accountId: "acc-user",
+    serverOrigin: "https://server-a.com",
+    linkedAt: "2026-09-30T00:00:00Z",
+  });
+
+  await assert.rejects(
+    linkLocalVaultToAccount({
+      serverOrigin: "https://server-b.com",
+      token: "tok",
+      accountId: "acc-user",
+      localBootstrap: sampleBootstrapData,
+      storage,
+    }),
+    (err: any) => err instanceof OriginMismatchError && err.code === "ORIGIN_MISMATCH"
+  );
+
+  // Link record remains untouched on server-a
+  const link = readVaultLink(storage);
+  assert.equal(link?.serverOrigin, "https://server-a.com");
+  assert.equal(link?.accountId, "acc-user");
+});
+
+test("restoreVaultFromAccount: origin mismatch stops non-destructively (with localBootstrap)", async () => {
+  const storage = createMockStorage();
+  writeVaultLink(storage, {
+    accountId: "acc-user",
+    serverOrigin: "https://server-a.com",
+    linkedAt: "2026-09-30T00:00:00Z",
+  });
+
+  await assert.rejects(
+    restoreVaultFromAccount({
+      serverOrigin: "https://server-b.com",
+      token: "tok",
+      accountId: "acc-user",
+      localBootstrap: sampleBootstrapData,
+      storage,
+    }),
+    (err: any) => err instanceof OriginMismatchError && err.code === "ORIGIN_MISMATCH"
+  );
+
+  // Existing link remains untouched
+  const link = readVaultLink(storage);
+  assert.equal(link?.serverOrigin, "https://server-a.com");
+});
+
+test("restoreVaultFromAccount: origin mismatch stops non-destructively when uninitialized (null localBootstrap)", async () => {
+  const storage = createMockStorage();
+  writeVaultLink(storage, {
+    accountId: "acc-user",
+    serverOrigin: "https://server-a.com",
+    linkedAt: "2026-09-30T00:00:00Z",
+  });
+
+  // Even without a local bootstrap, the existing link to server-a protects against server-b restore
+  await assert.rejects(
+    restoreVaultFromAccount({
+      serverOrigin: "https://server-b.com",
+      token: "tok",
+      accountId: "acc-user",
+      localBootstrap: null,
+      storage,
+    }),
+    (err: any) => err instanceof OriginMismatchError && err.code === "ORIGIN_MISMATCH"
+  );
+
+  const link = readVaultLink(storage);
+  assert.equal(link?.serverOrigin, "https://server-a.com");
+});
+
+test("restoreVaultFromAccount: wrong account stops non-destructively (with localBootstrap)", async () => {
+  const storage = createMockStorage();
+  writeVaultLink(storage, {
+    accountId: "acc-alpha",
+    serverOrigin: "https://notes.example.com",
+    linkedAt: "2026-09-30T00:00:00Z",
+  });
+
+  await assert.rejects(
+    restoreVaultFromAccount({
+      serverOrigin: "https://notes.example.com",
+      token: "tok",
+      accountId: "acc-beta",
+      localBootstrap: sampleBootstrapData,
+      storage,
+    }),
+    (err: any) => err instanceof WrongAccountError && err.code === "WRONG_ACCOUNT"
+  );
+
+  const link = readVaultLink(storage);
+  assert.equal(link?.accountId, "acc-alpha");
+});
+
+test("restoreVaultFromAccount: wrong account stops non-destructively when uninitialized (null localBootstrap)", async () => {
+  const storage = createMockStorage();
+  writeVaultLink(storage, {
+    accountId: "acc-alpha",
+    serverOrigin: "https://notes.example.com",
+    linkedAt: "2026-09-30T00:00:00Z",
+  });
+
+  await assert.rejects(
+    restoreVaultFromAccount({
+      serverOrigin: "https://notes.example.com",
+      token: "tok",
+      accountId: "acc-beta",
+      localBootstrap: null,
+      storage,
+    }),
+    (err: any) => err instanceof WrongAccountError && err.code === "WRONG_ACCOUNT"
+  );
+
+  const link = readVaultLink(storage);
+  assert.equal(link?.accountId, "acc-alpha");
+});
+
+test("writeVaultLink and clearVaultLink fail closed on storage exception", () => {
+  const throwingStorage = createThrowingStorage("both");
+
+  assert.throws(
+    () =>
+      writeVaultLink(throwingStorage, {
+        accountId: "acc-test",
+        serverOrigin: "https://notes.example.com",
+        linkedAt: "2026-09-30T00:00:00Z",
+      }),
+    (err: any) => err instanceof VaultLinkError && err.code === "STORAGE_ERROR"
+  );
+
+  assert.throws(
+    () => clearVaultLink(throwingStorage),
+    (err: any) => err instanceof VaultLinkError && err.code === "STORAGE_ERROR"
+  );
+});
+
+test("persistBootstrap: throws observable error when storage write fails", () => {
+  const throwingStorage = createThrowingStorage("setItem");
+
+  assert.throws(
+    () => persistBootstrap(sampleBootstrapData, throwingStorage),
+    /Failed to persist vault bootstrap to storage/
+  );
+});
+
+test("linkLocalVaultToAccount: fails closed when storage write throws", async () => {
+  const throwingStorage = createThrowingStorage("setItem");
+  const oldFetch = globalThis.fetch;
+
+  globalThis.fetch = (async (url: string, init?: any) => {
+    if (url.endsWith("/v1/vault/bootstrap")) {
+      if (init?.method === "POST") {
+        return { status: 201, ok: true, json: async () => sampleBootstrapDto };
+      }
+      return { status: 404, ok: false, json: async () => ({ code: "OBJECT_NOT_FOUND" }) };
+    }
+    throw new Error("Unexpected");
+  }) as unknown as typeof fetch;
+
+  try {
+    await assert.rejects(
+      linkLocalVaultToAccount({
+        serverOrigin: "https://notes.example.com",
+        token: "tok",
+        accountId: "acc-test",
+        localBootstrap: sampleBootstrapData,
+        storage: throwingStorage,
+      }),
+      (err: any) => err instanceof VaultLinkError && err.code === "STORAGE_ERROR"
+    );
+  } finally {
+    globalThis.fetch = oldFetch;
+  }
+});
+
+test("restoreVaultFromAccount: fails closed when storage write throws", async () => {
+  const throwingStorage = createThrowingStorage("setItem");
+  const oldFetch = globalThis.fetch;
+
+  globalThis.fetch = (async (url: string) => {
+    if (url.endsWith("/v1/vault/bootstrap")) {
+      return { status: 200, ok: true, json: async () => sampleBootstrapDto };
+    }
+    throw new Error("Unexpected");
+  }) as unknown as typeof fetch;
+
+  try {
+    await assert.rejects(
+      restoreVaultFromAccount({
+        serverOrigin: "https://notes.example.com",
+        token: "tok",
+        accountId: "acc-test",
+        localBootstrap: null,
+        storage: throwingStorage,
+      }),
+      (err: any) => err instanceof VaultLinkError && err.code === "STORAGE_ERROR"
+    );
+  } finally {
+    globalThis.fetch = oldFetch;
+  }
+});
+
+test("VaultStore: restoreFromRemote and setVaultLink fail closed on storage write failure without transitioning state", () => {
+  const throwingStorage = createThrowingStorage("setItem");
+  const client = createMockClient();
+  const storage = new IndexedDbStorage("test_fail_store_db");
+
+  const store = new VaultStore(client, storage, null, undefined, null, throwingStorage);
+
+  assert.equal(store.getState().vaultState, "UNINITIALIZED");
+  assert.equal(store.getState().bootstrap, null);
+  assert.equal(store.getState().vaultLink, null);
+
+  // restoreFromRemote must throw because storage.setItem throws
+  assert.throws(
+    () =>
+      store.restoreFromRemote(sampleBootstrapData, {
+        accountId: "acc-test",
+        serverOrigin: "https://notes.example.com",
+        linkedAt: "2026-09-30T00:00:00Z",
+      }),
+    /Failed to persist vault bootstrap to storage/
+  );
+
+  // Crucial check: state must NOT transition to LOCKED! Must remain UNINITIALIZED.
+  assert.equal(store.getState().vaultState, "UNINITIALIZED");
+  assert.equal(store.getState().bootstrap, null);
+  assert.equal(store.getState().vaultLink, null);
+
+  // setVaultLink must throw because storage.setItem throws
+  assert.throws(
+    () =>
+      store.setVaultLink({
+        accountId: "acc-test",
+        serverOrigin: "https://notes.example.com",
+        linkedAt: "2026-09-30T00:00:00Z",
+      }),
+    (err: any) => err instanceof VaultLinkError && err.code === "STORAGE_ERROR"
+  );
+
+  // Crucial check: vaultLink must NOT be updated in snapshot
+  assert.equal(store.getState().vaultLink, null);
+
+  store.dispose();
+});
+
+test("UI rendering: AuthControls and UnlockScreen render origin mismatch warnings", () => {
+  const client = createMockClient();
+  const storage = new IndexedDbStorage("test_ui_mismatch_db");
+
+  try {
+    // AuthControls with server origin mismatch
+    const htmlAuth = renderToString(
+      <AuthProvider
+        serverUrl="https://server-b.com"
+        initialSession={{
+          token: "tok",
+          accountId: "acc-test",
+          sessionId: "sess",
+          expiresAt: "2099-01-01T00:00:00Z",
+        }}
+      >
+        <VaultProvider
+          client={client}
+          storage={storage}
+          initialBootstrap={sampleBootstrapData}
+          initialVaultLink={{
+            accountId: "acc-test",
+            serverOrigin: "https://server-a.com",
+            linkedAt: "2026-09-30T00:00:00Z",
+          }}
+        >
+          <AuthControls initialOpen={true} />
+        </VaultProvider>
+      </AuthProvider>
+    );
+    assert.match(htmlAuth, /Vault linked to different server/);
+
+    // UnlockScreen with server origin mismatch in locked state
+    const htmlUnlockLocked = renderToString(
+      <AuthProvider
+        serverUrl="https://server-b.com"
+        initialSession={{
+          token: "tok",
+          accountId: "acc-test",
+          sessionId: "sess",
+          expiresAt: "2099-01-01T00:00:00Z",
+        }}
+      >
+        <VaultProvider
+          client={client}
+          storage={storage}
+          initialBootstrap={sampleBootstrapData}
+          initialVaultLink={{
+            accountId: "acc-test",
+            serverOrigin: "https://server-a.com",
+            linkedAt: "2026-09-30T00:00:00Z",
+          }}
+        >
+          <UnlockScreen />
+        </VaultProvider>
+      </AuthProvider>
+    );
+    assert.match(
+      htmlUnlockLocked,
+      /Connected to (?:'|&#x27;)https:\/\/server-b\.com(?:'|&#x27;), but this vault is linked to server (?:'|&#x27;)https:\/\/server-a\.com(?:'|&#x27;)/
+    );
+
+    // UnlockScreen with server origin mismatch in uninitialized state
+    const htmlUnlockUninit = renderToString(
+      <AuthProvider
+        serverUrl="https://server-b.com"
+        initialSession={{
+          token: "tok",
+          accountId: "acc-test",
+          sessionId: "sess",
+          expiresAt: "2099-01-01T00:00:00Z",
+        }}
+      >
+        <VaultProvider
+          client={client}
+          storage={storage}
+          initialBootstrap={null}
+          initialVaultLink={{
+            accountId: "acc-test",
+            serverOrigin: "https://server-a.com",
+            linkedAt: "2026-09-30T00:00:00Z",
+          }}
+        >
+          <UnlockScreen />
+        </VaultProvider>
+      </AuthProvider>
+    );
+    assert.match(
+      htmlUnlockUninit,
+      /Connected to (?:'|&#x27;)https:\/\/server-b\.com(?:'|&#x27;), but this browser was linked to server (?:'|&#x27;)https:\/\/server-a\.com(?:'|&#x27;)/
+    );
+  } finally {
+    storage.deleteDatabase().catch(() => {});
+  }
+});
+
