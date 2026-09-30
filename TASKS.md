@@ -147,6 +147,19 @@ Acceptance: truthful sync UI and complete two-browser link, restore, edit,
 delete, offline retry, and conflict flows.
 Verification: web/Rust gates and redacted browser-level end-to-end evidence.
 
+## ZK-108 — Username/password authentication alongside passkeys
+State: READY
+Priority: P1
+Dependencies: ZK-104
+Source: https://github.com/rheavenza/zk-note/issues/9
+Ticket: [docs/tickets/ZK-108.md](docs/tickets/ZK-108.md)
+Acceptance: separate server-account username/password auth with vetted Argon2id
+verification, native/Worker protocol parity, brute-force protection, browser UI,
+and unchanged zero-knowledge/session-revocation guarantees.
+Verification: full Rust/web gates, shared native/Worker contract, browser auth
+tests, password non-persistence/non-logging checks, and Worker Argon2 runtime
+validation. Keep this work separate from ZK-105/ZK-106 sync PRs.
+
 ---
 
 # M0 — Repository and architecture foundation
