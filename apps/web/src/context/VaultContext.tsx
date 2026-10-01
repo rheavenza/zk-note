@@ -169,10 +169,18 @@ export class VaultStore {
     if (initialVaultLink !== undefined) {
       this.vaultLink = initialVaultLink;
     } else {
-      this.vaultLink =
-        this.localStore
-          ? readVaultLink(this.localStore)
-          : null;
+      try {
+        this.vaultLink =
+          this.localStore
+            ? readVaultLink(this.localStore)
+            : null;
+      } catch (err) {
+        this.vaultLink = null;
+        this.error =
+          err instanceof Error
+            ? err.message
+            : "Failed to read vault link association from storage.";
+      }
     }
 
     if (initialBootstrap !== undefined && initialBootstrap !== null) {

@@ -75,6 +75,13 @@ export class OriginMismatchError extends VaultLinkError {
   }
 }
 
+export class CorruptedVaultLinkError extends VaultLinkError {
+  constructor(message = "Corrupted vault link association in storage.") {
+    super(message, "CORRUPT_VAULT_LINK");
+    this.name = "CorruptedVaultLinkError";
+  }
+}
+
 export class MismatchedVaultError extends VaultLinkError {
   constructor(message?: string) {
     super(
@@ -233,23 +240,66 @@ export function areBootstrapsEqual(
 
 /**
  * Reads the vault link association from local storage.
+ * Fails closed on storage errors, invalid JSON, missing fields, or invalid origin URLs.
+ * Returns null strictly when the storage key is absent (unlinked browser).
  */
 export function readVaultLink(storage: Pick<Storage, "getItem">): VaultLinkRecord | null {
+  let raw: string | null;
   try {
-    const raw = storage.getItem(VAULT_LINK_STORAGE_KEY);
-    if (!raw) return null;
-    const parsed = JSON.parse(raw);
-    if (parsed && typeof parsed.accountId === "string" && typeof parsed.serverOrigin === "string") {
-      return {
-        accountId: parsed.accountId,
-        serverOrigin: normalizeServerOrigin(parsed.serverOrigin),
-        linkedAt: typeof parsed.linkedAt === "string" ? parsed.linkedAt : new Date().toISOString(),
-      };
-    }
-  } catch {
-    // Ignore storage parse errors
+    raw = storage.getItem(VAULT_LINK_STORAGE_KEY);
+  } catch (err) {
+    if (err instanceof VaultLinkError) throw err;
+    throw new VaultLinkError(
+      "Failed to read vault link association from storage.",
+      "STORAGE_ERROR"
+    );
   }
-  return null;
+
+  // Legitimate unlinked case: key is absent
+  if (raw === null || raw === undefined) {
+    return null;
+  }
+
+  // If key is present, it MUST be valid JSON with valid accountId and serverOrigin
+  let parsed: any;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new CorruptedVaultLinkError("Corrupted vault link association in storage: invalid JSON.");
+  }
+
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new CorruptedVaultLinkError(
+      "Corrupted vault link association in storage: expected object."
+    );
+  }
+
+  if (typeof parsed.accountId !== "string" || !parsed.accountId.trim()) {
+    throw new CorruptedVaultLinkError(
+      "Corrupted vault link association in storage: missing or invalid account ID."
+    );
+  }
+
+  if (typeof parsed.serverOrigin !== "string" || !parsed.serverOrigin.trim()) {
+    throw new CorruptedVaultLinkError(
+      "Corrupted vault link association in storage: missing or invalid server origin."
+    );
+  }
+
+  let origin: string;
+  try {
+    origin = normalizeServerOrigin(parsed.serverOrigin);
+  } catch {
+    throw new CorruptedVaultLinkError(
+      "Corrupted vault link association in storage: invalid server origin URL."
+    );
+  }
+
+  return {
+    accountId: parsed.accountId,
+    serverOrigin: origin,
+    linkedAt: typeof parsed.linkedAt === "string" ? parsed.linkedAt : new Date().toISOString(),
+  };
 }
 
 /**

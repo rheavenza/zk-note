@@ -141,7 +141,9 @@ and `WrongAccountError` across both link and restore flows; enforced existing li
 in uninitialized and initialized restore; made storage persistence fail-closed across
 `writeVaultLink`, `clearVaultLink`, and `persistBootstrap` so state machine transitions
 never falsely report success on storage write failure; added web quality gates and build
-job to GitHub Actions CI workflow. 137 automated web tests pass, including end-to-end
+job to GitHub Actions CI workflow; made `readVaultLink` fail closed on storage read exceptions
+(`STORAGE_ERROR`) and corrupt link records (`CORRUPT_VAULT_LINK`) before any network dispatch,
+strictly reserving `null` for key absence. 142 automated web tests pass, including end-to-end
 multi-thread Web Worker bootstrap restoration and unlocking. All repository-wide
 Rust and web quality gates pass cleanly.
 

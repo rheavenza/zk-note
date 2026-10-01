@@ -15,6 +15,7 @@ import {
   assertNoPlaintextSecrets,
   WrongAccountError,
   OriginMismatchError,
+  CorruptedVaultLinkError,
   VaultLinkError,
   MismatchedVaultError,
   ExistingLocalVaultError,
@@ -98,18 +99,23 @@ function createMockStorage(): Storage {
   };
 }
 
-function createThrowingStorage(failingMethod: "setItem" | "removeItem" | "both" = "setItem"): Storage {
+function createThrowingStorage(failingMethod: "getItem" | "setItem" | "removeItem" | "both" | "all" = "setItem"): Storage {
   const map = new Map<string, string>();
   return {
-    getItem: (k: string) => map.get(k) ?? null,
+    getItem: (k: string) => {
+      if (failingMethod === "getItem" || failingMethod === "all") {
+        throw new Error("SecurityError: Access to localStorage is denied");
+      }
+      return map.get(k) ?? null;
+    },
     setItem: (k: string, v: string) => {
-      if (failingMethod === "setItem" || failingMethod === "both") {
+      if (failingMethod === "setItem" || failingMethod === "both" || failingMethod === "all") {
         throw new Error("QuotaExceededError: LocalStorage quota exceeded");
       }
       map.set(k, v);
     },
     removeItem: (k: string) => {
-      if (failingMethod === "removeItem" || failingMethod === "both") {
+      if (failingMethod === "removeItem" || failingMethod === "both" || failingMethod === "all") {
         throw new Error("StorageError: Failed to remove item");
       }
       map.delete(k);
@@ -194,6 +200,183 @@ test("readVaultLink, writeVaultLink, and clearVaultLink manage association witho
 
   clearVaultLink(storage);
   assert.equal(readVaultLink(storage), null);
+});
+
+test("readVaultLink: fails closed when getItem throws with STORAGE_ERROR", () => {
+  const throwingStorage = createThrowingStorage("getItem");
+
+  assert.throws(
+    () => readVaultLink(throwingStorage),
+    (err: any) => err instanceof VaultLinkError && err.code === "STORAGE_ERROR"
+  );
+});
+
+test("readVaultLink: fails closed on corrupted/malformed stored link data", () => {
+  const storage = createMockStorage();
+
+  // Invalid JSON
+  storage.setItem(VAULT_LINK_STORAGE_KEY, "{ not-valid-json");
+  assert.throws(
+    () => readVaultLink(storage),
+    (err: any) => err instanceof CorruptedVaultLinkError && err.code === "CORRUPT_VAULT_LINK"
+  );
+
+  // Not an object (e.g. array or primitive)
+  storage.setItem(VAULT_LINK_STORAGE_KEY, "[\"account-1\", \"https://example.com\"]");
+  assert.throws(
+    () => readVaultLink(storage),
+    (err: any) => err instanceof CorruptedVaultLinkError && err.code === "CORRUPT_VAULT_LINK"
+  );
+
+  // Missing accountId
+  storage.setItem(VAULT_LINK_STORAGE_KEY, JSON.stringify({ serverOrigin: "https://notes.example.com" }));
+  assert.throws(
+    () => readVaultLink(storage),
+    (err: any) => err instanceof CorruptedVaultLinkError && err.code === "CORRUPT_VAULT_LINK"
+  );
+
+  // Missing serverOrigin
+  storage.setItem(VAULT_LINK_STORAGE_KEY, JSON.stringify({ accountId: "acc-1" }));
+  assert.throws(
+    () => readVaultLink(storage),
+    (err: any) => err instanceof CorruptedVaultLinkError && err.code === "CORRUPT_VAULT_LINK"
+  );
+
+  // Invalid serverOrigin URL (e.g. malformed URL or URL containing path)
+  storage.setItem(VAULT_LINK_STORAGE_KEY, JSON.stringify({ accountId: "acc-1", serverOrigin: "not a valid url" }));
+  assert.throws(
+    () => readVaultLink(storage),
+    (err: any) => err instanceof CorruptedVaultLinkError && err.code === "CORRUPT_VAULT_LINK"
+  );
+
+  storage.setItem(VAULT_LINK_STORAGE_KEY, JSON.stringify({ accountId: "acc-1", serverOrigin: "https://notes.example.com/subpath" }));
+  assert.throws(
+    () => readVaultLink(storage),
+    (err: any) => err instanceof CorruptedVaultLinkError && err.code === "CORRUPT_VAULT_LINK"
+  );
+});
+
+test("linkLocalVaultToAccount: fails closed before network activity when storage read throws or link is corrupted", async () => {
+  const oldFetch = globalThis.fetch;
+  let fetchCalled = false;
+  globalThis.fetch = (async () => {
+    fetchCalled = true;
+    throw new Error("Network must not be called when storage read fails");
+  }) as unknown as typeof fetch;
+
+  try {
+    // 1. Storage read throws
+    const throwingStorage = createThrowingStorage("getItem");
+    await assert.rejects(
+      linkLocalVaultToAccount({
+        serverOrigin: "https://notes.example.com",
+        token: "tok",
+        accountId: "acc-1",
+        localBootstrap: sampleBootstrapData,
+        storage: throwingStorage,
+      }),
+      (err: any) => err instanceof VaultLinkError && err.code === "STORAGE_ERROR"
+    );
+    assert.equal(fetchCalled, false, "Fetch must not be called when getItem throws");
+
+    // 2. Storage has corrupted data
+    const corruptStorage = createMockStorage();
+    corruptStorage.setItem(VAULT_LINK_STORAGE_KEY, "{ malformed");
+    await assert.rejects(
+      linkLocalVaultToAccount({
+        serverOrigin: "https://notes.example.com",
+        token: "tok",
+        accountId: "acc-1",
+        localBootstrap: sampleBootstrapData,
+        storage: corruptStorage,
+      }),
+      (err: any) => err instanceof CorruptedVaultLinkError && err.code === "CORRUPT_VAULT_LINK"
+    );
+    assert.equal(fetchCalled, false, "Fetch must not be called when link is corrupted");
+  } finally {
+    globalThis.fetch = oldFetch;
+  }
+});
+
+test("restoreVaultFromAccount: fails closed before network activity when storage read throws or link is corrupted", async () => {
+  const oldFetch = globalThis.fetch;
+  let fetchCalled = false;
+  globalThis.fetch = (async () => {
+    fetchCalled = true;
+    throw new Error("Network must not be called when storage read fails");
+  }) as unknown as typeof fetch;
+
+  try {
+    // 1. Storage read throws (both with localBootstrap and null)
+    const throwingStorage = createThrowingStorage("getItem");
+    await assert.rejects(
+      restoreVaultFromAccount({
+        serverOrigin: "https://notes.example.com",
+        token: "tok",
+        accountId: "acc-1",
+        localBootstrap: sampleBootstrapData,
+        storage: throwingStorage,
+      }),
+      (err: any) => err instanceof VaultLinkError && err.code === "STORAGE_ERROR"
+    );
+    assert.equal(fetchCalled, false);
+
+    await assert.rejects(
+      restoreVaultFromAccount({
+        serverOrigin: "https://notes.example.com",
+        token: "tok",
+        accountId: "acc-1",
+        localBootstrap: null,
+        storage: throwingStorage,
+      }),
+      (err: any) => err instanceof VaultLinkError && err.code === "STORAGE_ERROR"
+    );
+    assert.equal(fetchCalled, false);
+
+    // 2. Storage has corrupted data
+    const corruptStorage = createMockStorage();
+    corruptStorage.setItem(VAULT_LINK_STORAGE_KEY, "invalid-json");
+    await assert.rejects(
+      restoreVaultFromAccount({
+        serverOrigin: "https://notes.example.com",
+        token: "tok",
+        accountId: "acc-1",
+        localBootstrap: sampleBootstrapData,
+        storage: corruptStorage,
+      }),
+      (err: any) => err instanceof CorruptedVaultLinkError && err.code === "CORRUPT_VAULT_LINK"
+    );
+    assert.equal(fetchCalled, false);
+
+    await assert.rejects(
+      restoreVaultFromAccount({
+        serverOrigin: "https://notes.example.com",
+        token: "tok",
+        accountId: "acc-1",
+        localBootstrap: null,
+        storage: corruptStorage,
+      }),
+      (err: any) => err instanceof CorruptedVaultLinkError && err.code === "CORRUPT_VAULT_LINK"
+    );
+    assert.equal(fetchCalled, false);
+  } finally {
+    globalThis.fetch = oldFetch;
+  }
+});
+
+test("VaultStore: captures error when stored vault link read fails on init", () => {
+  const corruptStorage = createMockStorage();
+  corruptStorage.setItem(VAULT_LINK_STORAGE_KEY, "invalid-json");
+
+  const client = createMockClient();
+  const storage = new IndexedDbStorage("test_corrupt_link_db");
+
+  const store = new VaultStore(client, storage, null, undefined, undefined, corruptStorage);
+
+  assert.equal(store.getState().vaultLink, null);
+  assert.match(store.getState().error || "", /Corrupted vault link association/);
+
+  store.dispose();
 });
 
 test("linkLocalVaultToAccount: first upload uploads only encrypted bootstrap and allowed metadata", async () => {
