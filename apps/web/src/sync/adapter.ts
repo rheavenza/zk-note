@@ -301,7 +301,15 @@ export class BrowserSyncAdapter implements SyncServerAdapter {
     this.accountId = options.accountId.trim();
     this.identity = `${this.serverOrigin}::${this.accountId}`;
     this.token = options.token.trim();
-    this.fetchFn = options.fetchFn || (typeof globalThis !== "undefined" ? globalThis.fetch : (fetch as any));
+    // Native `fetch` is `this`-sensitive in browsers: invoking it as an object
+    // method ("this.fetchFn(...)") throws "Illegal invocation", which would be
+    // misclassified as a network failure. Bind it to the global object so the
+    // adapter's method-style calls behave like a bare `fetch(...)`.
+    const nativeFetch =
+      typeof globalThis !== "undefined" && typeof globalThis.fetch === "function"
+        ? globalThis.fetch
+        : undefined;
+    this.fetchFn = options.fetchFn || (nativeFetch ? nativeFetch.bind(globalThis) : (fetch as any));
     this.linkStorage = options.linkStorage;
     this.workerClient = options.workerClient;
   }
