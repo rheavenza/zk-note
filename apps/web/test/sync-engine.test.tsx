@@ -1991,7 +1991,14 @@ function setupDomEnvironment(customStorage?: Storage) {
       firstChild: null,
       style: {},
       className: "",
-      textContent: "",
+      _textContent: "",
+      get textContent(): string {
+        if (target._textContent) return target._textContent;
+        return children.map((c) => (c ? c.textContent || "" : "")).join("");
+      },
+      set textContent(v: string) {
+        target._textContent = v;
+      },
       innerHTML: "",
       value: "",
       removeChild(c: any) {
@@ -2420,6 +2427,56 @@ test("worker isolation: delayed LOCK_VAULT response prevents GET_STATUS race dur
     assert.equal(activeMountedDb, expectedScopedDb, "App must transition to target scoped DB once locked");
     assert.equal(mockWorker.getIsUnlocked(), false, "Worker must be locked after transition");
     assert.equal(statusObservedWhileUnlocked, false, "New identity must never observe unlocked status during identity switch");
+  } finally {
+    await harness.unmount();
+  }
+});
+
+test("corrupted vault link blocks App with error screen and prevents selecting DEFAULT_DB_NAME or scoped DB", async () => {
+  const mockStorageMap = new Map<string, string>();
+  mockStorageMap.set("zk_vault_link", "not-valid-json{");
+
+  const customStorage: Storage = {
+    getItem: (k: string) => mockStorageMap.get(k) ?? null,
+    setItem: (k: string, v: string) => mockStorageMap.set(k, String(v)),
+    removeItem: (k: string) => mockStorageMap.delete(k),
+    clear: () => mockStorageMap.clear(),
+    key: (i: number) => Array.from(mockStorageMap.keys())[i] ?? null,
+    length: mockStorageMap.size,
+  };
+
+  let activeMountedDb = "";
+  const harness = await mountTestApp(
+    <App
+      serverUrl={SERVER_ORIGIN}
+      initialSession={{
+        sessionId: "sess-corrupt",
+        token: "tok-corrupt",
+        accountId: "user-corrupt",
+        deviceId: "dev-corrupt",
+        expiresAt: new Date(Date.now() + 3600000).toISOString(),
+      }}
+      onMountedStateChange={(state) => {
+        activeMountedDb = state.dbName;
+      }}
+    >
+      <div id="test-observer">should-not-mount</div>
+    </App>,
+    { localStorage: customStorage }
+  );
+
+  try {
+    await harness.settle();
+
+    // App MUST NOT have mounted VaultProvider or selected any DB (activeMountedDb is empty)
+    assert.equal(activeMountedDb, "", "Corrupted link must not mount VaultProvider or select DB");
+
+    // Harness container must display blocking error screen
+    assert.ok(
+      harness.container.textContent.includes("Vault Link Error") ||
+      harness.container.innerHTML.includes("Vault Link Error"),
+      "App must display blocking Vault Link Error screen"
+    );
   } finally {
     await harness.unmount();
   }

@@ -78,19 +78,38 @@ export const AppInner: React.FC<AppInnerProps> = ({
 }) => {
   const { serverOrigin, session } = useAuth();
 
-  const [currentLink, setCurrentLink] = React.useState<VaultLinkRecord | null>(() => {
+  const [linkState, setLinkState] = React.useState<{
+    link: VaultLinkRecord | null;
+    error: string | null;
+  }>(() => {
+    if (typeof window === "undefined" || !window.localStorage) {
+      return { link: null, error: null };
+    }
     try {
-      return typeof window !== "undefined" && window.localStorage
-        ? readVaultLink(window.localStorage)
-        : null;
-    } catch {
-      return null;
+      return { link: readVaultLink(window.localStorage), error: null };
+    } catch (err: any) {
+      return {
+        link: null,
+        error: err?.message || "Failed to read vault link association from storage.",
+      };
     }
   });
 
   React.useEffect(() => {
     const handler = (e: any) => {
-      setCurrentLink(e.detail || null);
+      try {
+        if (typeof window !== "undefined" && window.localStorage) {
+          const l = readVaultLink(window.localStorage);
+          setLinkState({ link: l, error: null });
+        } else {
+          setLinkState({ link: e.detail || null, error: null });
+        }
+      } catch (err: any) {
+        setLinkState({
+          link: null,
+          error: err?.message || "Failed to read vault link association from storage.",
+        });
+      }
     };
     if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
       window.addEventListener("zk:vault-link-changed", handler);
@@ -100,23 +119,24 @@ export const AppInner: React.FC<AppInnerProps> = ({
   }, []);
 
   const isLinkedToCurrentSession = React.useMemo(() => {
-    if (!currentLink || !session?.accountId || !serverOrigin) return false;
+    if (!linkState.link || !session?.accountId || !serverOrigin) return false;
     try {
       return (
-        currentLink.accountId === session.accountId &&
-        normalizeServerOrigin(currentLink.serverOrigin) === normalizeServerOrigin(serverOrigin)
+        linkState.link.accountId === session.accountId &&
+        normalizeServerOrigin(linkState.link.serverOrigin) === normalizeServerOrigin(serverOrigin)
       );
     } catch {
       return false;
     }
-  }, [currentLink, session?.accountId, serverOrigin]);
+  }, [linkState.link, session?.accountId, serverOrigin]);
 
   const targetDbName = React.useMemo(() => {
+    if (linkState.error) return null;
     if (propStorage) return propStorage.getDatabaseName();
     return isLinkedToCurrentSession
       ? getScopedDatabaseName(DEFAULT_DB_NAME, serverOrigin, session?.accountId)
       : DEFAULT_DB_NAME;
-  }, [propStorage, isLinkedToCurrentSession, serverOrigin, session?.accountId]);
+  }, [propStorage, linkState.error, isLinkedToCurrentSession, serverOrigin, session?.accountId]);
 
   const [migrationError, setMigrationError] = React.useState<string | null>(null);
   const [retryNonce, setRetryNonce] = React.useState(0);
@@ -126,10 +146,13 @@ export const AppInner: React.FC<AppInnerProps> = ({
     dbName: string;
     storage: IndexedDbStorage;
     client: VaultWorkerClient;
-  }>(() => {
+  } | null>(() => {
     if (propStorage) {
       const cl = client || createDefaultWorkerClient();
       return { dbName: propStorage.getDatabaseName(), storage: propStorage, client: cl };
+    }
+    if (linkState.error) {
+      return null;
     }
     const initialDbName = DEFAULT_DB_NAME;
     const st = new IndexedDbStorage(initialDbName);
@@ -139,7 +162,8 @@ export const AppInner: React.FC<AppInnerProps> = ({
 
   // When targetDbName changes or retry is triggered, gate mounting/switching until worker lock completes
   React.useEffect(() => {
-    if (targetDbName === mountedState.dbName && !migrationError) {
+    if (!targetDbName) return undefined;
+    if (targetDbName === mountedState?.dbName && !migrationError) {
       return undefined;
     }
 
@@ -147,7 +171,7 @@ export const AppInner: React.FC<AppInnerProps> = ({
     const switchIdentity = async () => {
       setMigrationError(null);
       try {
-        if (typeof mountedState.client.lockVault === "function") {
+        if (mountedState?.client && typeof mountedState.client.lockVault === "function") {
           await mountedState.client.lockVault();
         }
       } catch {
@@ -183,11 +207,45 @@ export const AppInner: React.FC<AppInnerProps> = ({
     return () => {
       isCancelled = true;
     };
-  }, [targetDbName, mountedState.dbName, mountedState.client, propStorage, client, retryNonce]);
+  }, [targetDbName, mountedState?.dbName, mountedState?.client, propStorage, client, retryNonce]);
 
   React.useEffect(() => {
-    onMountedStateChange?.(mountedState);
+    if (mountedState) {
+      onMountedStateChange?.(mountedState);
+    }
   }, [mountedState, onMountedStateChange]);
+
+  if (linkState.error) {
+    return (
+      <div className="flex h-screen items-center justify-center bg-gray-50 dark:bg-gray-900 p-6">
+        <div className="max-w-md w-full bg-white dark:bg-gray-800 rounded-lg shadow-lg p-6 text-center space-y-4">
+          <h2 className="text-lg font-semibold text-red-600 dark:text-red-400">Vault Link Error</h2>
+          <p className="text-sm text-gray-600 dark:text-gray-300">
+            {linkState.error}
+          </p>
+          <button
+            type="button"
+            onClick={() => {
+              try {
+                if (typeof window !== "undefined" && window.localStorage) {
+                  const l = readVaultLink(window.localStorage);
+                  setLinkState({ link: l, error: null });
+                }
+              } catch (err: any) {
+                setLinkState({
+                  link: null,
+                  error: err?.message || "Failed to read vault link association from storage.",
+                });
+              }
+            }}
+            className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded text-sm font-medium"
+          >
+            Retry
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   if (migrationError) {
     return (
@@ -213,7 +271,7 @@ export const AppInner: React.FC<AppInnerProps> = ({
   }
 
   // If transition is pending, do not render old or new VaultProvider to prevent async race
-  if (targetDbName !== mountedState.dbName) {
+  if (!mountedState || targetDbName !== mountedState.dbName) {
     return (
       <div className="flex h-screen items-center justify-center bg-gray-50 dark:bg-gray-900">
         <div className="text-sm text-gray-500">Switching vault identity...</div>
