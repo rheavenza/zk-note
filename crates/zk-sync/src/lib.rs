@@ -11,10 +11,11 @@ pub mod orchestrator;
 pub mod pull;
 pub mod push;
 pub mod queue;
+pub mod state_machine;
 
-pub use adapter::{
-    validate_no_plaintext_secrets, MockSyncAdapter, NativeHttpSyncAdapter, SyncServerAdapter,
-};
+#[cfg(feature = "native-adapter")]
+pub use adapter::NativeHttpSyncAdapter;
+pub use adapter::{validate_no_plaintext_secrets, MockSyncAdapter, SyncServerAdapter};
 pub use conflict::{
     evaluate_guarded_lww, generate_merge_candidate, record_conflict, resolve_conflict,
     ConflictPolicy, ConflictResolutionResult, ConflictResolutionStrategy, GuardedLwwOutcome,
@@ -39,6 +40,11 @@ pub use push::{
     push_pending_changes, PushError, PushItemConflict, PushItemSuccess, PushOptions, PushReport,
 };
 pub use queue::{PendingMutationQueue, QueueError};
+pub use state_machine::{
+    PullSummary, PushSummary, StateMachineReport, SyncAction, SyncPhase, SyncStateMachine,
+    SyncStateMachineOptions,
+};
+
 pub use zk_core as core;
 pub use zk_crypto as crypto;
 pub use zk_protocol as protocol;

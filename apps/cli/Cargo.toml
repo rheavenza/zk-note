@@ -21,8 +21,8 @@ serde_json = { workspace = true }
 zk-core = { workspace = true }
 zk-crypto = { workspace = true }
 zk-protocol = { workspace = true }
-zk-storage = { workspace = true }
-zk-sync = { workspace = true }
+zk-storage = { workspace = true, features = ["sqlite"] }
+zk-sync = { workspace = true, features = ["native-adapter"] }
 uuid = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }

@@ -47,6 +47,7 @@ const DUMMY_ENVELOPE: EncryptedEnvelopeDto = {
 function createMockSyncWorkerClient() {
   const client: Partial<VaultWorkerClient> = {
     getStatus: async () => ({ isUnlocked: true, sessionInitialized: true }),
+    lockVault: async () => ({ success: true as const }),
     onLock: () => () => {},
     dispose: () => {},
   };

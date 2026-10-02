@@ -148,13 +148,46 @@ multi-thread Web Worker bootstrap restoration and unlocking. All repository-wide
 Rust and web quality gates pass cleanly.
 
 ## ZK-106 — Durable browser ciphertext synchronization
-State: BACKLOG
+State: DONE (PR open / review pending)
 Priority: P1
 Dependencies: ZK-105
 Ticket: [docs/tickets/ZK-106.md](docs/tickets/ZK-106.md)
 Acceptance: authenticated push/pull, stable mutation IDs, CAS conflicts,
 tombstones, durable cursor, locked ciphertext pull, and account isolation.
 Verification: web gates, Rust sync/server tests, crash/retry and conflict tests.
+Implementation note: Implemented `BrowserSyncAdapter` in `apps/web/src/sync/adapter.ts`
+and wired it into `SyncProvider` (`apps/web/src/context/SyncContext.tsx`).
+Pushes encrypted mutations to `POST /v1/sync/push` and pulls remote changes from
+`GET /v1/sync/pull` in sequence order. All network payloads are strictly validated
+against plaintext/secret leakage (`validateNoPlaintextSecrets` enforces SEC-001/SEC-002/SEC-003).
+Mutations maintain stable idempotency IDs (`mutation_id`), `expected_revision`, and
+survive browser restarts with `resetInFlightMutations()`. Push honors CAS revision
+rules: stale edits and delete-vs-edit produce actionable `ConflictRecord`s without
+silent overwrites. Pull durably stores encrypted objects before advancing the sync cursor.
+Sync safely operates while the vault is locked (stores ciphertext only, zero decryption or
+search indexing). Scoped database and sync state isolation enforce strict `(serverOrigin, accountId)`
+boundaries (`OriginMismatchError` / `WrongAccountError`). Addressed PR #11 review findings:
+1) Moved sync state machine, queue transitions, conflict gating, cursor sequencing, and retry loops
+into the shared Rust core (`crates/zk-sync/src/state_machine.rs`) and exposed `WasmSyncStateMachine` via
+`zk-wasm`, ensuring the shared core strictly owns all sync state machine logic.
+2) Ensured non-conflict push error/retry queue transitions are emitted exclusively by the shared Rust
+state machine (`handle_push_transient_error` -> `ResetMutationToPending`, `handle_push_fatal_error` ->
+`MarkMutationFailed`). Updated state machine to fail the sync phase on transient failures, preventing false
+advancement of `last_sync_at`.
+3) Made pre-auth data migration from default to scoped storage fail closed and retriable: separated migration
+into explicit `migrateFromDefault()`, removed automatic drain from raw `getDb()`, and added retry UI in `App.tsx`.
+4) Gated scoped database adoption and migration strictly on a verified `(serverOrigin, accountId)` vault link,
+preventing unlinked or wrong-account sessions from prematurely adopting scoped DBs or draining default notes.
+5) Prevented unlocked worker key contamination and async races during identity switches: gated mounting
+of the new `VaultProvider` until `client.lockVault()` completes.
+6) Eliminated scoped database naming collisions by using bijective byte-level hex encoding of
+`(serverOrigin, accountId)`.
+7) Enforced fail-closed conflict handling in WASM and TypeScript (SEC-010): propagated crypto errors
+rather than catching and falling back to client-side approximations. Differentiated `"MUTATION_REPLAY_MISMATCH"`.
+8) Ensured push-side 401/403, 429, and 5xx errors are classified as retryable transient errors (`isRetryablePushError`), emitting `ResetMutationToPending` via the shared state machine so unsynced edits remain safely in the queue as `Pending` and are never stranded as `Failed`.
+9) Decoupled local vault storage selection from `isLinkedToCurrentSession`. Persisted vault link (`zk_vault_link`) controls local vault selection, preserving offline access to local encrypted notes in the scoped DB across logout, session expiry, and account switching. Authentication strictly gates server synchronization.
+10) Added comprehensive regression tests across all lifecycle and failure scenarios (177/177 web tests passing).
+All repository-wide Rust and web quality gates pass cleanly.
 
 ## ZK-107 — Web sync flow and deployment acceptance
 State: BACKLOG

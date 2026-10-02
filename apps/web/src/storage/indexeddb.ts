@@ -21,13 +21,46 @@ import {
   EncryptedEnvelopeDto,
 } from "./models.js";
 
+import { normalizeServerOrigin } from "../auth/session.js";
+
 export const DB_SCHEMA_VERSION = 2;
 export const DEFAULT_DB_NAME = "zk_notes_db";
+
+function stringToHex(str: string): string {
+  const bytes = new TextEncoder().encode(str);
+  let hex = "";
+  for (const b of bytes) {
+    hex += b.toString(16).padStart(2, "0");
+  }
+  return hex;
+}
+
+/**
+ * Returns a deterministic, collision-safe database name scoped to (serverOrigin, accountId)
+ * using bijective byte-level hex encoding to prevent origin collisions (ZK-106).
+ */
+export function getScopedDatabaseName(
+  baseName: string = DEFAULT_DB_NAME,
+  serverOrigin?: string | null,
+  accountId?: string | null
+): string {
+  if (!serverOrigin || !accountId) return baseName;
+  try {
+    const originPart = stringToHex(normalizeServerOrigin(serverOrigin));
+    const accountPart = stringToHex(accountId.trim());
+    return `${baseName}_${originPart}_${accountPart}`;
+  } catch {
+    const originPart = stringToHex(serverOrigin.trim());
+    const accountPart = stringToHex(accountId.trim());
+    return `${baseName}_${originPart}_${accountPart}`;
+  }
+}
 
 export class IndexedDbStorage {
   private dbName: string;
   private idbFactory: IDBFactory;
   private dbPromise: Promise<IDBDatabase> | null = null;
+  private migrationPromise: Promise<boolean> | null = null;
 
   constructor(dbName = DEFAULT_DB_NAME, idbFactory?: IDBFactory) {
     this.dbName = dbName;
@@ -44,9 +77,23 @@ export class IndexedDbStorage {
   }
 
   /**
+   * Returns the database name for this storage instance.
+   */
+  public getDatabaseName(): string {
+    return this.dbName;
+  }
+
+  /**
    * Opens or initializes the IndexedDB database.
    */
   public async getDb(): Promise<IDBDatabase> {
+    return this.getRawDb();
+  }
+
+  /**
+   * Opens or returns the raw IDBDatabase instance without running migration hooks.
+   */
+  public async getRawDb(): Promise<IDBDatabase> {
     if (this.dbPromise) {
       return this.dbPromise;
     }
@@ -69,6 +116,140 @@ export class IndexedDbStorage {
     });
 
     return this.dbPromise;
+  }
+
+  /**
+   * Durably migrates pre-auth notes from DEFAULT_DB_NAME to this account-scoped database.
+   * Gated explicitly on vault linking, fails closed on errors, and allows retrying.
+   */
+  public async migrateFromDefault(): Promise<boolean> {
+    if (this.dbName === DEFAULT_DB_NAME) {
+      return false;
+    }
+    if (!this.migrationPromise) {
+      this.migrationPromise = (async () => {
+        const defaultStorage = new IndexedDbStorage(DEFAULT_DB_NAME, this.idbFactory);
+        return await this.migrateFrom(defaultStorage);
+      })().catch((err) => {
+        this.migrationPromise = null;
+        throw err;
+      });
+    }
+    return this.migrationPromise;
+  }
+
+  /**
+   * Durably copies all encrypted objects, mutations, base versions, conflicts, and blobs
+   * from sourceStorage to this storage, then clears the source storage.
+   */
+  public async migrateFrom(sourceStorage: IndexedDbStorage): Promise<boolean> {
+    if (sourceStorage.getDatabaseName() === this.dbName) {
+      return false;
+    }
+
+    const sourceDb = await sourceStorage.getRawDb();
+    const targetDb = await this.getRawDb();
+
+    // Check if source has any data to migrate
+    const sourceHasData = await new Promise<boolean>((resolve, reject) => {
+      const tx = sourceDb.transaction(
+        ["objects", "mutations", "conflicts"],
+        "readonly"
+      );
+      let count = 0;
+      tx.objectStore("objects").count().onsuccess = (e: any) => {
+        count += e.target.result || 0;
+      };
+      tx.objectStore("mutations").count().onsuccess = (e: any) => {
+        count += e.target.result || 0;
+      };
+      tx.objectStore("conflicts").count().onsuccess = (e: any) => {
+        count += e.target.result || 0;
+      };
+      tx.oncomplete = () => resolve(count > 0);
+      tx.onerror = () => reject(tx.error);
+    });
+
+    if (!sourceHasData) {
+      return false;
+    }
+
+    // Read all records from source
+    const readStore = async (storeName: string): Promise<any[]> => {
+      return new Promise((resolve, reject) => {
+        const tx = sourceDb.transaction(storeName, "readonly");
+        const store = tx.objectStore(storeName);
+        const req = store.getAll();
+        req.onsuccess = () => resolve(req.result || []);
+        req.onerror = () => reject(req.error);
+      });
+    };
+
+    const objects = await readStore("objects");
+    const mutations = await readStore("mutations");
+    const baseVersions = await readStore("base_versions");
+    const conflicts = await readStore("conflicts");
+    const blobs = sourceDb.objectStoreNames.contains("blobs")
+      ? await readStore("blobs")
+      : [];
+
+    // Write all records to target
+    await new Promise<void>((resolve, reject) => {
+      const storeNames = ["objects", "mutations", "base_versions", "conflicts"];
+      if (targetDb.objectStoreNames.contains("blobs")) {
+        storeNames.push("blobs");
+      }
+      const tx = targetDb.transaction(storeNames, "readwrite");
+
+      const objStore = tx.objectStore("objects");
+      for (const obj of objects) {
+        objStore.put(obj);
+      }
+      const mutStore = tx.objectStore("mutations");
+      for (const m of mutations) {
+        mutStore.put(m);
+      }
+      const bvStore = tx.objectStore("base_versions");
+      for (const bv of baseVersions) {
+        bvStore.put(bv);
+      }
+      const confStore = tx.objectStore("conflicts");
+      for (const c of conflicts) {
+        confStore.put(c);
+      }
+      if (targetDb.objectStoreNames.contains("blobs")) {
+        const blobStore = tx.objectStore("blobs");
+        for (const b of blobs) {
+          blobStore.put(b);
+        }
+      }
+
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+
+    // Clear migrated data from source storage
+    await sourceStorage.clearAllData();
+    return true;
+  }
+
+  /**
+   * Clears objects, mutations, base_versions, conflicts, and blobs in this storage.
+   */
+  public async clearAllData(): Promise<void> {
+    const db = await this.getRawDb();
+    await new Promise<void>((resolve, reject) => {
+      const storeNames = ["objects", "mutations", "base_versions", "conflicts"];
+      if (db.objectStoreNames.contains("blobs")) {
+        storeNames.push("blobs");
+      }
+      const tx = db.transaction(storeNames, "readwrite");
+      for (const name of storeNames) {
+        tx.objectStore(name).clear();
+      }
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
   }
 
   private initializeSchema(db: IDBDatabase, _oldVersion: number): void {
@@ -238,13 +419,14 @@ export class IndexedDbStorage {
 
       req.onsuccess = () => {
         const mutations: PendingMutation[] = req.result || [];
+        const pending = mutations.filter((m) => m.status === MutationStatus.Pending);
         // FIFO order: sort by created_at ascending, breaking ties with expected_revision
-        mutations.sort((a, b) => {
+        pending.sort((a, b) => {
           const cmp = a.created_at.localeCompare(b.created_at);
           if (cmp !== 0) return cmp;
           return a.expected_revision - b.expected_revision;
         });
-        resolve(mutations);
+        resolve(pending);
       };
       req.onerror = () => reject(req.error);
     });
@@ -290,14 +472,16 @@ export class IndexedDbStorage {
   public async updateMutationStatus(
     mutationId: string,
     status: MutationStatus,
-    retryCount: number
+    retryCount?: number
   ): Promise<void> {
     const mutation = await this.getMutation(mutationId);
     if (!mutation) {
       throw new Error(`Mutation ${mutationId} not found`);
     }
     mutation.status = status;
-    mutation.retry_count = retryCount;
+    if (retryCount !== undefined) {
+      mutation.retry_count = retryCount;
+    }
     await this.enqueueMutation(mutation);
   }
 
@@ -306,6 +490,30 @@ export class IndexedDbStorage {
     return mutations.filter(
       (m) => m.status === MutationStatus.Pending || m.status === MutationStatus.InFlight
     ).length;
+  }
+
+  /**
+   * Resets all mutations currently stuck in InFlight status back to Pending (ZK-041/ZK-106).
+   * Ensures interrupted push operations from crashes/restarts can be safely retried.
+   */
+  public async resetInFlightMutations(): Promise<number> {
+    const db = await this.getDb();
+    const allMutations: PendingMutation[] = await new Promise((resolve, reject) => {
+      const tx = db.transaction("mutations", "readonly");
+      const store = tx.objectStore("mutations");
+      const req = store.getAll();
+      req.onsuccess = () => resolve(req.result || []);
+      req.onerror = () => reject(req.error);
+    });
+
+    let resetCount = 0;
+    for (const m of allMutations) {
+      if (m.status === MutationStatus.InFlight) {
+        await this.updateMutationStatus(m.mutation_id, MutationStatus.Pending, m.retry_count);
+        resetCount++;
+      }
+    }
+    return resetCount;
   }
 
   // ==========================================================================
@@ -423,12 +631,12 @@ export class IndexedDbStorage {
   // SyncStateStore Implementation
   // ==========================================================================
 
-  public async getSyncState(): Promise<SyncState> {
+  public async getSyncState(identity = "singleton"): Promise<SyncState> {
     const db = await this.getDb();
     return new Promise((resolve, reject) => {
       const tx = db.transaction("sync_state", "readonly");
       const store = tx.objectStore("sync_state");
-      const req = store.get("singleton");
+      const req = store.get(identity);
 
       req.onsuccess = () => {
         if (req.result && req.result.state) {
@@ -445,19 +653,19 @@ export class IndexedDbStorage {
     });
   }
 
-  public async setSyncCursor(cursor: number): Promise<void> {
-    const current = await this.getSyncState();
+  public async setSyncCursor(cursor: number, identity = "singleton"): Promise<void> {
+    const current = await this.getSyncState(identity);
     current.sync_cursor = cursor;
-    await this.setSyncState(current);
+    await this.setSyncState(current, identity);
   }
 
-  public async setSyncState(state: SyncState): Promise<void> {
+  public async setSyncState(state: SyncState, identity = "singleton"): Promise<void> {
     const db = await this.getDb();
     return new Promise((resolve, reject) => {
       const tx = db.transaction("sync_state", "readwrite");
       const store = tx.objectStore("sync_state");
       const req = store.put({
-        key: "singleton",
+        key: identity,
         state,
       });
 

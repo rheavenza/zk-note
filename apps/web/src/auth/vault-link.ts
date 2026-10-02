@@ -323,6 +323,13 @@ export function writeVaultLink(
     } else {
       storage.removeItem(VAULT_LINK_STORAGE_KEY);
     }
+    if (typeof window !== "undefined" && typeof window.dispatchEvent === "function") {
+      try {
+        window.dispatchEvent(new CustomEvent("zk:vault-link-changed", { detail: link }));
+      } catch {
+        // Ignore in environments where CustomEvent might be restricted
+      }
+    }
   } catch (err) {
     if (err instanceof VaultLinkError) throw err;
     throw new VaultLinkError(
@@ -338,6 +345,13 @@ export function writeVaultLink(
 export function clearVaultLink(storage: Pick<Storage, "removeItem">): void {
   try {
     storage.removeItem(VAULT_LINK_STORAGE_KEY);
+    if (typeof window !== "undefined" && typeof window.dispatchEvent === "function") {
+      try {
+        window.dispatchEvent(new CustomEvent("zk:vault-link-changed", { detail: null }));
+      } catch {
+        // Ignore
+      }
+    }
   } catch (err) {
     if (err instanceof VaultLinkError) throw err;
     throw new VaultLinkError(

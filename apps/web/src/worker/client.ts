@@ -297,6 +297,19 @@ export class VaultWorkerClient {
     return this.sendRequest("SEARCH", { query });
   }
 
+  public async recordConflict(
+    mutationJson: string,
+    conflictJson: string,
+    baseEnvelopeJson?: string | null
+  ): Promise<string> {
+    const res = await this.sendRequest("RECORD_CONFLICT", {
+      mutationJson,
+      conflictJson,
+      baseEnvelopeJson: baseEnvelopeJson ?? null,
+    });
+    return res.conflictRecordJson;
+  }
+
   /**
    * Terminates or cancels any pending requests.
    */

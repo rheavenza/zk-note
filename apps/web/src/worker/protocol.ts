@@ -180,6 +180,13 @@ export interface RequestPayloadMap {
   DECRYPT_ATTACHMENT_MANIFEST: DecryptAttachmentManifestPayload;
   GENERATE_ATTACHMENT_KEY: void;
   COMPUTE_CONTENT_HASH: ComputeContentHashPayload;
+  RECORD_CONFLICT: RecordConflictPayload;
+}
+
+export interface RecordConflictPayload {
+  mutationJson: string;
+  conflictJson: string;
+  baseEnvelopeJson?: string | null;
 }
 
 export interface ResponseDataMap {
@@ -204,6 +211,7 @@ export interface ResponseDataMap {
   };
   GENERATE_ATTACHMENT_KEY: { attachmentKeyBase64: string };
   COMPUTE_CONTENT_HASH: { hash: string };
+  RECORD_CONFLICT: { conflictRecordJson: string };
 }
 
 export type WorkerRequestType = keyof RequestPayloadMap;

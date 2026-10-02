@@ -2767,6 +2767,8 @@ dependencies = [
  "zk-core",
  "zk-crypto",
  "zk-protocol",
+ "zk-storage",
+ "zk-sync",
 ]
 
 [[package]]

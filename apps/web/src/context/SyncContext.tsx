@@ -15,7 +15,12 @@ import React, {
   useSyncExternalStore,
 } from "react";
 import { useVault } from "./VaultContext.js";
+import { useAuth } from "./AuthContext.js";
 import { IndexedDbStorage } from "../storage/indexeddb.js";
+import {
+  BrowserSyncAdapter,
+  type SyncServerAdapter,
+} from "../sync/adapter.js";
 
 export type SyncStatus =
   | "local only"
@@ -44,11 +49,6 @@ export interface SyncContextType extends SyncStateSnapshot {
   store: SyncStore;
 }
 
-export interface SyncServerAdapter {
-  pushMutations?: (storage: IndexedDbStorage) => Promise<void>;
-  pullChanges?: (storage: IndexedDbStorage) => Promise<void>;
-}
-
 /**
  * Sanitizes sync error messages to ensure zero sensitive note details or tokens leak (SEC-001, SEC-003).
  */
@@ -57,7 +57,16 @@ export function sanitizeSyncErrorMessage(raw: string): string {
   if (lower.includes("network") || lower.includes("fetch") || lower.includes("offline")) {
     return "Network connection failed. Changes queued locally.";
   }
-  if (lower.includes("auth") || lower.includes("unauthorized") || lower.includes("401")) {
+  if (lower.includes("wrong_account") || lower.includes("linked to account") || lower.includes("different account")) {
+    return "This vault is linked to a different account. Sign in to the linked account to synchronize.";
+  }
+  if (lower.includes("origin_mismatch") || lower.includes("linked to server") || lower.includes("different server")) {
+    return "This vault is linked to a different server. Switch to the linked server to synchronize.";
+  }
+  if (lower.includes("not_linked") || lower.includes("not linked")) {
+    return "Vault must be linked to an account to synchronize.";
+  }
+  if (lower.includes("auth") || lower.includes("unauthorized") || lower.includes("401") || lower.includes("403")) {
     return "Authentication required to synchronize.";
   }
   if (lower.includes("conflict") || lower.includes("409")) {
@@ -175,6 +184,11 @@ export class SyncStore {
     this.notify();
   }
 
+  public setServerAdapter(serverAdapter?: SyncServerAdapter): void {
+    (this as any).serverAdapter = serverAdapter;
+    this.notify();
+  }
+
   public setOfflineMode(offline: boolean): void {
     this.isManualOffline = offline;
     this.notify();
@@ -196,9 +210,12 @@ export class SyncStore {
       this.conflictCount = conflicts.length;
 
       // 3. Check last sync time from sync state store
-      const syncState = await this.storage.getSyncState();
+      const identity = (this.serverAdapter as any)?.identity;
+      const syncState = await this.storage.getSyncState(identity);
       if (syncState && syncState.last_sync_at) {
         this.lastSyncAt = new Date(syncState.last_sync_at);
+      } else {
+        this.lastSyncAt = null;
       }
       this.notify();
     } catch {
@@ -207,7 +224,7 @@ export class SyncStore {
   }
 
   public async syncNow(): Promise<void> {
-    if (!this.serverAdapter?.pushMutations || !this.serverAdapter?.pullChanges) {
+    if (!this.serverAdapter?.pushMutations && !this.serverAdapter?.sync) {
       this.error = "Server synchronization is not configured. Notes remain local.";
       this.notify();
       return;
@@ -225,18 +242,29 @@ export class SyncStore {
     this.notify();
 
     try {
-      await this.serverAdapter.pushMutations(this.storage);
-      await this.serverAdapter.pullChanges(this.storage);
+      if (this.serverAdapter.sync) {
+        await this.serverAdapter.sync(this.storage);
+      } else {
+        if (this.serverAdapter.pushMutations) {
+          await this.serverAdapter.pushMutations(this.storage);
+        }
+        if (this.serverAdapter.pullChanges) {
+          await this.serverAdapter.pullChanges(this.storage);
+        }
 
-      const now = new Date();
-      const existingState = await this.storage.getSyncState();
-      await this.storage.setSyncState({
-        sync_cursor: existingState ? existingState.sync_cursor : 0,
-        last_sync_at: now.toISOString(),
-        device_id: existingState ? existingState.device_id : null,
-      });
+        const now = new Date();
+        const identity = (this.serverAdapter as any)?.identity;
+        const existingState = await this.storage.getSyncState(identity);
+        await this.storage.setSyncState(
+          {
+            sync_cursor: existingState ? existingState.sync_cursor : 0,
+            last_sync_at: now.toISOString(),
+            device_id: existingState ? existingState.device_id : null,
+          },
+          identity
+        );
+      }
 
-      this.lastSyncAt = now;
       await this.refreshStatus();
     } catch (err: any) {
       const rawMessage = err instanceof Error ? err.message : String(err);
@@ -262,15 +290,51 @@ export interface SyncProviderProps {
 
 export const SyncProvider: React.FC<SyncProviderProps> = ({
   store: propStore,
-  serverAdapter,
+  serverAdapter: propServerAdapter,
   children,
 }) => {
-  const { storage, vaultState } = useVault();
+  const { storage, vaultState, vaultLink, client } = useVault();
+  const { session, serverOrigin, isAuthenticated } = useAuth();
+
+  const activeAdapter = useMemo(() => {
+    if (propServerAdapter) return propServerAdapter;
+    if (
+      isAuthenticated &&
+      session?.token &&
+      session.accountId &&
+      vaultLink &&
+      vaultLink.accountId === session.accountId &&
+      vaultLink.serverOrigin === serverOrigin
+    ) {
+      return new BrowserSyncAdapter({
+        serverOrigin,
+        token: session.token,
+        accountId: session.accountId,
+        workerClient: client,
+      });
+    }
+    return undefined;
+  }, [
+    propServerAdapter,
+    isAuthenticated,
+    session?.token,
+    session?.accountId,
+    vaultLink,
+    serverOrigin,
+    client,
+  ]);
 
   const store = useMemo(
-    () => propStore || new SyncStore(storage, serverAdapter),
-    [propStore, storage, serverAdapter]
+    () => propStore || new SyncStore(storage, activeAdapter),
+    [propStore, storage]
   );
+
+  useEffect(() => {
+    if (!propStore) {
+      store.setServerAdapter(activeAdapter);
+      store.refreshStatus();
+    }
+  }, [store, activeAdapter, propStore]);
 
   useEffect(() => {
     return () => {

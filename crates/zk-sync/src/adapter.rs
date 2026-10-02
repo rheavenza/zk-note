@@ -7,15 +7,19 @@
 //! - Authentication tokens and credentials are automatically abstracted without manual header handling.
 
 use crate::error::SyncNetworkError;
+#[cfg(feature = "native-adapter")]
 use reqwest::header::{HeaderValue, AUTHORIZATION, CONTENT_TYPE};
+#[cfg(feature = "native-adapter")]
 use reqwest::{Client, Method, Response, StatusCode};
+#[cfg(feature = "native-adapter")]
 use serde::de::DeserializeOwned;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+#[cfg(feature = "native-adapter")]
 use zk_protocol::auth::{AuthToken, REDACTED_TOKEN};
-use zk_protocol::constants::{
-    ERROR_MUTATION_REPLAY_MISMATCH, ERROR_REVISION_CONFLICT, ERROR_SYNC_CURSOR_INVALID,
-};
+use zk_protocol::constants::ERROR_REVISION_CONFLICT;
+#[cfg(feature = "native-adapter")]
+use zk_protocol::constants::{ERROR_MUTATION_REPLAY_MISMATCH, ERROR_SYNC_CURSOR_INVALID};
 use zk_protocol::sync::{ConflictResponse, PullChangesResponse, PushRequest, PushResponse};
 use zk_protocol::vault::VaultBootstrap;
 
@@ -84,6 +88,7 @@ pub trait SyncServerAdapter: Send + Sync {
 }
 
 /// Standard server error JSON structure.
+#[cfg(feature = "native-adapter")]
 #[derive(Debug, serde::Deserialize)]
 struct ServerErrorJson {
     code: Option<String>,
@@ -91,6 +96,7 @@ struct ServerErrorJson {
 }
 
 /// Concrete native HTTP synchronization adapter using `reqwest`.
+#[cfg(feature = "native-adapter")]
 #[derive(Clone)]
 pub struct NativeHttpSyncAdapter {
     base_url: String,
@@ -98,6 +104,7 @@ pub struct NativeHttpSyncAdapter {
     client: Client,
 }
 
+#[cfg(feature = "native-adapter")]
 impl std::fmt::Debug for NativeHttpSyncAdapter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let has_token = self
@@ -112,6 +119,7 @@ impl std::fmt::Debug for NativeHttpSyncAdapter {
     }
 }
 
+#[cfg(feature = "native-adapter")]
 impl NativeHttpSyncAdapter {
     /// Constructs a new [`NativeHttpSyncAdapter`] targeting `base_url` with optional initial auth token.
     pub fn new(
@@ -270,6 +278,7 @@ impl NativeHttpSyncAdapter {
     }
 }
 
+#[cfg(feature = "native-adapter")]
 impl SyncServerAdapter for NativeHttpSyncAdapter {
     async fn get_vault_bootstrap(&self) -> Result<Option<VaultBootstrap>, SyncNetworkError> {
         let req = self.prepare_request(Method::GET, "/v1/vault/bootstrap");
