@@ -170,16 +170,21 @@ boundaries (`OriginMismatchError` / `WrongAccountError`). Addressed PR #11 revie
 1) Moved sync state machine, queue transitions, conflict gating, cursor sequencing, and retry loops
 into the shared Rust core (`crates/zk-sync/src/state_machine.rs`) and exposed `WasmSyncStateMachine` via
 `zk-wasm`, ensuring the shared core strictly owns all sync state machine logic.
-2) Added durable pre-auth data migration from default IndexedDB to scoped storage upon link/login,
-preventing unlinked local notes from vanishing or bleeding across accounts.
-3) Prevented unlocked worker key contamination across account/server switches by triggering
-`client.lockVault()` upon storage/identity changes.
-4) Eliminated scoped database naming collisions by using bijective byte-level hex encoding of
+2) Ensured non-conflict push error/retry queue transitions are emitted exclusively by the shared Rust
+state machine (`handle_push_transient_error` -> `ResetMutationToPending`, `handle_push_fatal_error` ->
+`MarkMutationFailed`). Updated state machine to fail the sync phase on transient failures, preventing false
+advancement of `last_sync_at`.
+3) Made pre-auth data migration from default to scoped storage fail closed and retriable: separated migration
+into explicit `migrateFromDefault()`, removed automatic drain from raw `getDb()`, and added retry UI in `App.tsx`.
+4) Gated scoped database adoption and migration strictly on a verified `(serverOrigin, accountId)` vault link,
+preventing unlinked or wrong-account sessions from prematurely adopting scoped DBs or draining default notes.
+5) Prevented unlocked worker key contamination and async races during identity switches: gated mounting
+of the new `VaultProvider` until `client.lockVault()` completes.
+6) Eliminated scoped database naming collisions by using bijective byte-level hex encoding of
 `(serverOrigin, accountId)`.
-5) Enforced fail-closed conflict handling in WASM and TypeScript (SEC-010): propagated crypto errors
-rather than catching and falling back to client-side approximations.
-6) Corrected wire constant to `"MUTATION_REPLAY_MISMATCH"`.
-7) Added automated regression tests for all lifecycle scenarios (170/170 web tests passing).
+7) Enforced fail-closed conflict handling in WASM and TypeScript (SEC-010): propagated crypto errors
+rather than catching and falling back to client-side approximations. Differentiated `"MUTATION_REPLAY_MISMATCH"`.
+8) Added comprehensive regression tests across all lifecycle and failure scenarios (174/174 web tests passing).
 All repository-wide Rust and web quality gates pass cleanly.
 
 ## ZK-107 — Web sync flow and deployment acceptance

@@ -60,7 +60,7 @@ export class IndexedDbStorage {
   private dbName: string;
   private idbFactory: IDBFactory;
   private dbPromise: Promise<IDBDatabase> | null = null;
-  private migrationPromise: Promise<void> | null = null;
+  private migrationPromise: Promise<boolean> | null = null;
 
   constructor(dbName = DEFAULT_DB_NAME, idbFactory?: IDBFactory) {
     this.dbName = dbName;
@@ -85,20 +85,9 @@ export class IndexedDbStorage {
 
   /**
    * Opens or initializes the IndexedDB database.
-   * For account-scoped databases, ensures existing pre-auth notes from DEFAULT_DB_NAME
-   * are durably migrated on first access.
    */
   public async getDb(): Promise<IDBDatabase> {
-    const db = await this.getRawDb();
-
-    if (this.dbName !== DEFAULT_DB_NAME) {
-      if (!this.migrationPromise) {
-        this.migrationPromise = this.ensureMigratedFromDefault();
-      }
-      await this.migrationPromise;
-    }
-
-    return db;
+    return this.getRawDb();
   }
 
   /**
@@ -129,13 +118,24 @@ export class IndexedDbStorage {
     return this.dbPromise;
   }
 
-  private async ensureMigratedFromDefault(): Promise<void> {
-    try {
-      const defaultStorage = new IndexedDbStorage(DEFAULT_DB_NAME, this.idbFactory);
-      await this.migrateFrom(defaultStorage);
-    } catch {
-      // Ignore migration errors if default storage does not exist or cannot be opened
+  /**
+   * Durably migrates pre-auth notes from DEFAULT_DB_NAME to this account-scoped database.
+   * Gated explicitly on vault linking, fails closed on errors, and allows retrying.
+   */
+  public async migrateFromDefault(): Promise<boolean> {
+    if (this.dbName === DEFAULT_DB_NAME) {
+      return false;
     }
+    if (!this.migrationPromise) {
+      this.migrationPromise = (async () => {
+        const defaultStorage = new IndexedDbStorage(DEFAULT_DB_NAME, this.idbFactory);
+        return await this.migrateFrom(defaultStorage);
+      })().catch((err) => {
+        this.migrationPromise = null;
+        throw err;
+      });
+    }
+    return this.migrationPromise;
   }
 
   /**

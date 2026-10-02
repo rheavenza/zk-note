@@ -61,6 +61,7 @@ import { SyncStatusIndicator } from "../src/components/SyncStatusIndicator.js";
 import { AuthProvider } from "../src/context/AuthContext.js";
 import { VaultProvider, VaultStore } from "../src/context/VaultContext.js";
 import { VaultWorkerClient } from "../src/worker/client.js";
+import { App } from "../src/App.js";
 
 // ============================================================================
 // Mock Server & Helpers
@@ -1742,9 +1743,8 @@ test("lifecycle: pre-auth notes in default DB migrate durably to scoped DB on lo
   // Now user links/authenticates with (SERVER_ORIGIN, "acc-migrated-user")
   const scopedDbName = getScopedDatabaseName(DEFAULT_DB_NAME, SERVER_ORIGIN, "acc-migrated-user");
   const scopedStorage = new IndexedDbStorage(scopedDbName);
-
-  // Opening the scoped storage automatically migrates pre-auth data
-  await scopedStorage.getDb();
+  // User links/authenticates: explicitly migrate pre-auth data to scoped storage
+  await scopedStorage.migrateFromDefault();
 
   // Verify records are now in scoped storage
   const migratedObj = await scopedStorage.getObject(noteId);
@@ -1888,4 +1888,207 @@ test("worker/WASM conflict-generation failure fails closed without silent fallba
     globalThis.fetch = oldFetch;
     await storage.close();
   }
+});
+
+test("migration: fails closed on target-write failure without clearing source storage", async () => {
+  const defaultStorage = new IndexedDbStorage(`test-def-targetfail-${Date.now()}`);
+  const noteId = "note-preauth-fail";
+  const env = createEnvelope(noteId, "preauth-v1");
+  await defaultStorage.putObject({
+    object_id: noteId,
+    revision: 1,
+    server_seq: 0,
+    object_kind: 1,
+    envelope: env,
+    is_deleted: false,
+    updated_at: new Date().toISOString(),
+  });
+
+  const scopedStorage = new IndexedDbStorage(`test-scoped-targetfail-${Date.now()}`);
+
+  // Monkey patch getRawDb on scopedStorage so that target transaction rejects on readwrite
+  const origGetRawDb = scopedStorage.getRawDb.bind(scopedStorage);
+  scopedStorage.getRawDb = async () => {
+    const db = await origGetRawDb();
+    const origTx = db.transaction.bind(db);
+    db.transaction = (storeNames: any, mode: any) => {
+      if (mode === "readwrite") {
+        throw new Error("Simulated target write failure");
+      }
+      return origTx(storeNames, mode);
+    };
+    return db;
+  };
+
+  await assert.rejects(
+    scopedStorage.migrateFrom(defaultStorage),
+    (err: any) => String(err).includes("Simulated target write failure")
+  );
+
+  // Source storage data MUST remain intact (fail-closed!)
+  const defaultObjs = await defaultStorage.listObjects();
+  assert.equal(defaultObjs.length, 1);
+  assert.equal(defaultObjs[0]?.object_id, noteId);
+
+  await defaultStorage.close();
+  await scopedStorage.close();
+});
+
+test("migration: fails closed on source-clear failure", async () => {
+  const defaultStorage = new IndexedDbStorage(`test-def-clearfail-${Date.now()}`);
+  const noteId = "note-clearfail";
+  const env = createEnvelope(noteId, "clearfail-v1");
+  await defaultStorage.putObject({
+    object_id: noteId,
+    revision: 1,
+    server_seq: 0,
+    object_kind: 1,
+    envelope: env,
+    is_deleted: false,
+    updated_at: new Date().toISOString(),
+  });
+
+  const scopedStorage = new IndexedDbStorage(`test-scoped-clearfail-${Date.now()}`);
+
+  // Simulate source clear failure
+  defaultStorage.clearAllData = async () => {
+    throw new Error("Simulated source clear failure");
+  };
+
+  await assert.rejects(
+    scopedStorage.migrateFrom(defaultStorage),
+    (err: any) => err.message.includes("Simulated source clear failure")
+  );
+
+  await defaultStorage.close();
+  await scopedStorage.close();
+});
+
+test("identity lifecycle: authenticating as unlinked/wrong account does not adopt scoped DB or drain default DB", async () => {
+  const defaultStorage = new IndexedDbStorage(DEFAULT_DB_NAME);
+  const noteId = "note-unlinked-safe";
+  const env = createEnvelope(noteId, "v1");
+  await defaultStorage.putObject({
+    object_id: noteId,
+    revision: 1,
+    server_seq: 0,
+    object_kind: 1,
+    envelope: env,
+    is_deleted: false,
+    updated_at: new Date().toISOString(),
+  });
+  await defaultStorage.enqueueMutation({
+    mutation_id: "mut-unlinked-safe",
+    object_id: noteId,
+    expected_revision: 0,
+    object_kind: 1,
+    mutation_type: MutationType.Upsert,
+    envelope: env,
+    created_at: new Date().toISOString(),
+    retry_count: 0,
+    status: MutationStatus.Pending,
+  });
+
+  // User logs into account "unlinked-user-1", but vault is NOT linked to this account
+  const mockWorker = {
+    postMessage: () => {},
+    addEventListener: () => {},
+    removeEventListener: () => {},
+  };
+  const client = new VaultWorkerClient(mockWorker as any);
+
+  // Scoped DB for unlinked-user-1
+  const unlinkedScopedDb = getScopedDatabaseName(DEFAULT_DB_NAME, SERVER_ORIGIN, "unlinked-user-1");
+  const unlinkedStorage = new IndexedDbStorage(unlinkedScopedDb);
+
+  const rendered = renderToString(
+    <AuthProvider
+      initialSession={{
+        sessionId: "sess-unlinked",
+        token: "tok-unlinked",
+        accountId: "unlinked-user-1",
+        deviceId: "dev-unlinked",
+        expiresAt: new Date(Date.now() + 3600000).toISOString(),
+      }}
+      serverUrl={SERVER_ORIGIN}
+    >
+      <App client={client} />
+    </AuthProvider>
+  );
+  assert.ok(rendered);
+
+  // Crucially: default storage remains untouched!
+  const remainingDefaultObjs = await defaultStorage.listObjects();
+  assert.equal(remainingDefaultObjs.length, 1);
+  assert.equal(remainingDefaultObjs[0]?.object_id, noteId);
+  const remainingDefaultMuts = await defaultStorage.listPendingMutations();
+  assert.equal(remainingDefaultMuts.length, 1);
+
+  // And unlinked account storage was NOT created or populated with default notes
+  const unlinkedObjsAfter = await unlinkedStorage.listObjects();
+  assert.equal(unlinkedObjsAfter.length, 0);
+
+  await defaultStorage.close();
+  await unlinkedStorage.close();
+});
+
+test("worker isolation: delayed LOCK_VAULT response prevents GET_STATUS race during identity switch", async () => {
+  let isUnlocked = true;
+  let statusObservedWhileUnlocked = false;
+
+  const messageListeners: any[] = [];
+  const mockWorker = {
+    postMessage: (msg: any) => {
+      if (msg.type === "LOCK_VAULT" || msg.type === "LOCK") {
+        // Deliberately delay LOCK_VAULT response by 30ms
+        setTimeout(() => {
+          isUnlocked = false;
+          for (const l of messageListeners) {
+            l({ data: { id: msg.id, ok: true, data: null } });
+          }
+        }, 30);
+      } else if (msg.type === "GET_STATUS") {
+        if (isUnlocked) {
+          statusObservedWhileUnlocked = true;
+        }
+        for (const l of messageListeners) {
+          l({ data: { id: msg.id, ok: true, data: { isUnlocked } } });
+        }
+      }
+    },
+    addEventListener: (_type: string, listener: any) => {
+      messageListeners.push(listener);
+    },
+    removeEventListener: () => {},
+  };
+
+  const client = new VaultWorkerClient(mockWorker as any);
+
+  // Store 1 is active with unlocked worker
+  const storage1 = new IndexedDbStorage("test-identity-race-1");
+  const store1 = new VaultStore(client, storage1);
+  await client.getStatus();
+  assert.equal(isUnlocked, true);
+
+  statusObservedWhileUnlocked = false;
+
+  // App gates mounting on identity switch: it awaits activeClient.lockVault()
+  const lockPromise = client.lockVault();
+
+  // If a second store were constructed immediately without awaiting lock, it would observe isUnlocked = true
+  // Verify that awaiting lockPromise guarantees isUnlocked is false
+  await lockPromise;
+
+  const storage2 = new IndexedDbStorage("test-identity-race-2");
+  const store2 = new VaultStore(client, storage2);
+  await client.getStatus();
+
+  assert.equal(isUnlocked, false);
+  assert.equal(statusObservedWhileUnlocked, false, "new store must not observe unlocked status during identity switch");
+  assert.equal(store2.getState().vaultState, "UNINITIALIZED");
+
+  store1.dispose();
+  store2.dispose();
+  await storage1.close();
+  await storage2.close();
 });

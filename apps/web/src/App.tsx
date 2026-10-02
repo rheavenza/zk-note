@@ -11,7 +11,7 @@
  * 7. NotesWorkspace (split pane layout, toolbar, editor)
  */
 
-import React, { useMemo } from "react";
+import React from "react";
 import { VaultWorkerClient } from "./worker/client.js";
 import {
   IndexedDbStorage,
@@ -27,6 +27,8 @@ import { NotesProvider } from "./context/NotesContext.js";
 import { ErrorBoundary } from "./components/ErrorBoundary.js";
 import { UnlockScreen } from "./components/UnlockScreen.js";
 import { NotesWorkspace } from "./components/NotesWorkspace.js";
+import { readVaultLink, VaultLinkRecord } from "./auth/vault-link.js";
+import { normalizeServerOrigin } from "./auth/session.js";
 
 export interface AppProps {
   client?: VaultWorkerClient;
@@ -54,35 +56,152 @@ const AppInner: React.FC<{
   storage?: IndexedDbStorage;
 }> = ({ client, storage: propStorage }) => {
   const { serverOrigin, session } = useAuth();
-  const activeClient = useMemo(
-    () => client || createDefaultWorkerClient(),
-    [client]
-  );
 
-  const activeStorage = useMemo(() => {
-    if (propStorage) return propStorage;
-    const dbName = getScopedDatabaseName(
-      DEFAULT_DB_NAME,
-      serverOrigin,
-      session?.accountId
-    );
-    return new IndexedDbStorage(dbName);
-  }, [propStorage, serverOrigin, session?.accountId]);
-
-  const storageKey = activeStorage.getDatabaseName();
-
-  const lastStorageKeyRef = React.useRef<string>(storageKey);
-  if (lastStorageKeyRef.current !== storageKey) {
-    lastStorageKeyRef.current = storageKey;
-    activeClient.lockVault().catch(() => {});
-  }
+  const [currentLink, setCurrentLink] = React.useState<VaultLinkRecord | null>(() => {
+    try {
+      return typeof window !== "undefined" && window.localStorage
+        ? readVaultLink(window.localStorage)
+        : null;
+    } catch {
+      return null;
+    }
+  });
 
   React.useEffect(() => {
-    activeClient.lockVault().catch(() => {});
-  }, [storageKey, activeClient]);
+    const handler = (e: any) => {
+      setCurrentLink(e.detail || null);
+    };
+    if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
+      window.addEventListener("zk:vault-link-changed", handler);
+      return () => window.removeEventListener("zk:vault-link-changed", handler);
+    }
+    return undefined;
+  }, []);
+
+  const isLinkedToCurrentSession = React.useMemo(() => {
+    if (!currentLink || !session?.accountId || !serverOrigin) return false;
+    try {
+      return (
+        currentLink.accountId === session.accountId &&
+        normalizeServerOrigin(currentLink.serverOrigin) === normalizeServerOrigin(serverOrigin)
+      );
+    } catch {
+      return false;
+    }
+  }, [currentLink, session?.accountId, serverOrigin]);
+
+  const targetDbName = React.useMemo(() => {
+    if (propStorage) return propStorage.getDatabaseName();
+    return isLinkedToCurrentSession
+      ? getScopedDatabaseName(DEFAULT_DB_NAME, serverOrigin, session?.accountId)
+      : DEFAULT_DB_NAME;
+  }, [propStorage, isLinkedToCurrentSession, serverOrigin, session?.accountId]);
+
+  const [migrationError, setMigrationError] = React.useState<string | null>(null);
+  const [retryNonce, setRetryNonce] = React.useState(0);
+
+  // Track the active mounted state (dbName, storage, and worker client)
+  const [mountedState, setMountedState] = React.useState<{
+    dbName: string;
+    storage: IndexedDbStorage;
+    client: VaultWorkerClient;
+  }>(() => {
+    if (propStorage) {
+      const cl = client || createDefaultWorkerClient();
+      return { dbName: propStorage.getDatabaseName(), storage: propStorage, client: cl };
+    }
+    const initialDbName = DEFAULT_DB_NAME;
+    const st = new IndexedDbStorage(initialDbName);
+    const cl = client || createDefaultWorkerClient();
+    return { dbName: initialDbName, storage: st, client: cl };
+  });
+
+  // When targetDbName changes or retry is triggered, gate mounting/switching until worker lock completes
+  React.useEffect(() => {
+    if (targetDbName === mountedState.dbName && !migrationError) {
+      return undefined;
+    }
+
+    let isCancelled = false;
+    const switchIdentity = async () => {
+      setMigrationError(null);
+      try {
+        if (typeof mountedState.client.lockVault === "function") {
+          await mountedState.client.lockVault();
+        }
+      } catch {
+        // Proceed with clean client
+      }
+      if (isCancelled) return;
+
+      const newStorage = propStorage || new IndexedDbStorage(targetDbName);
+
+      if (targetDbName !== DEFAULT_DB_NAME) {
+        try {
+          await newStorage.migrateFromDefault();
+        } catch (err: any) {
+          if (!isCancelled) {
+            setMigrationError(err?.message || "Failed to migrate vault data");
+          }
+          return;
+        }
+      }
+      if (isCancelled) return;
+
+      const newClient = client || createDefaultWorkerClient();
+
+      setMountedState({
+        dbName: targetDbName,
+        storage: newStorage,
+        client: newClient,
+      });
+    };
+
+    void switchIdentity();
+
+    return () => {
+      isCancelled = true;
+    };
+  }, [targetDbName, mountedState.dbName, mountedState.client, propStorage, client, retryNonce]);
+
+  if (migrationError) {
+    return (
+      <div className="flex h-screen items-center justify-center bg-gray-50 dark:bg-gray-900 p-6">
+        <div className="max-w-md w-full bg-white dark:bg-gray-800 rounded-lg shadow-lg p-6 text-center space-y-4">
+          <h2 className="text-lg font-semibold text-red-600 dark:text-red-400">Vault Migration Failed</h2>
+          <p className="text-sm text-gray-600 dark:text-gray-300">
+            {migrationError}
+          </p>
+          <button
+            type="button"
+            onClick={() => {
+              setMigrationError(null);
+              setRetryNonce((n) => n + 1);
+            }}
+            className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded text-sm font-medium"
+          >
+            Retry Migration
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // If transition is pending, do not render old or new VaultProvider to prevent async race
+  if (targetDbName !== mountedState.dbName) {
+    return (
+      <div className="flex h-screen items-center justify-center bg-gray-50 dark:bg-gray-900">
+        <div className="text-sm text-gray-500">Switching vault identity...</div>
+      </div>
+    );
+  }
 
   return (
-    <VaultProvider key={storageKey} client={activeClient} storage={activeStorage}>
+    <VaultProvider
+      key={mountedState.dbName}
+      client={mountedState.client}
+      storage={mountedState.storage}
+    >
       <SyncProvider>
         <ConflictProvider>
           <SearchProvider>

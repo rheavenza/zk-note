@@ -299,6 +299,11 @@ impl SyncStateMachine {
         }
 
         // All pending mutations processed
+        if self.push.transient_failures > 0 {
+            self.phase = SyncPhase::Failed;
+            return vec![];
+        }
+
         if !self.push.accepted.is_empty() || self.always_followup_pull {
             self.phase = SyncPhase::PullingFollowup;
             vec![SyncAction::FetchPull {
@@ -429,12 +434,12 @@ impl SyncStateMachine {
         }
 
         self.push.transient_failures += 1;
-        let mut actions = vec![SyncAction::ResetMutationToPending {
+        let actions = vec![SyncAction::ResetMutationToPending {
             mutation_id: mutation_id.to_string(),
         }];
 
         self.mutation_index += 1;
-        actions.extend(self.step_push());
+        self.phase = SyncPhase::Failed;
         Ok(actions)
     }
 

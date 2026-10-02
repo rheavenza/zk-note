@@ -492,9 +492,16 @@ export class BrowserSyncAdapter implements SyncServerAdapter {
                   conflictRecord = JSON.parse(recordJson);
                 }
               } catch (recErr) {
-                await storage
-                  .updateMutationStatus(action.request.mutation_id, MutationStatus.Pending)
-                  .catch(() => {});
+                const nextActions = JSON.parse(
+                  sm.handle_push_transient_error(action.request.mutation_id)
+                );
+                actions.push(...nextActions);
+                while (actions.length > 0) {
+                  const nextAct = actions.shift();
+                  if (nextAct?.type === "ResetMutationToPending") {
+                    await storage.updateMutationStatus(nextAct.mutation_id, MutationStatus.Pending);
+                  }
+                }
                 throw recErr;
               }
 
@@ -503,12 +510,37 @@ export class BrowserSyncAdapter implements SyncServerAdapter {
                 sm.handle_push_conflict(action.request.mutation_id, JSON.stringify(conflictRecord))
               );
               actions.push(...nextActions);
+            } else if (
+              err.isRetryable ||
+              err.code === "NETWORK_ERROR" ||
+              err.name === "TypeError" ||
+              (err.message && err.message.includes("Network")) ||
+              (err.message && err.message.includes("fetch")) ||
+              (err.message && err.message.includes("lost")) ||
+              err.code === "MUTATION_REPLAY_MISMATCH"
+            ) {
+              const nextActions = JSON.parse(
+                sm.handle_push_transient_error(action.request.mutation_id)
+              );
+              actions.push(...nextActions);
+              while (actions.length > 0) {
+                const nextAct = actions.shift();
+                if (nextAct?.type === "ResetMutationToPending") {
+                  await storage.updateMutationStatus(nextAct.mutation_id, MutationStatus.Pending);
+                }
+              }
+              throw err;
             } else {
-              // Any non-revision-conflict error (network error, 409 replay mismatch, 500, etc.):
-              // Fail closed: reset in-flight mutation back to Pending so it can be retried / inspected (no data loss!)
-              await storage
-                .updateMutationStatus(action.request.mutation_id, MutationStatus.Pending)
-                .catch(() => {});
+              const nextActions = JSON.parse(
+                sm.handle_push_fatal_error(action.request.mutation_id, err.message || String(err))
+              );
+              actions.push(...nextActions);
+              while (actions.length > 0) {
+                const nextAct = actions.shift();
+                if (nextAct?.type === "MarkMutationFailed") {
+                  await storage.updateMutationStatus(nextAct.mutation_id, MutationStatus.Failed);
+                }
+              }
               throw err;
             }
           }
@@ -715,9 +747,16 @@ export class BrowserSyncAdapter implements SyncServerAdapter {
                   conflictRecord = JSON.parse(recordJson);
                 }
               } catch (recErr) {
-                await storage
-                  .updateMutationStatus(action.request.mutation_id, MutationStatus.Pending)
-                  .catch(() => {});
+                const nextActions = JSON.parse(
+                  sm.handle_push_transient_error(action.request.mutation_id)
+                );
+                actions.push(...nextActions);
+                while (actions.length > 0) {
+                  const nextAct = actions.shift();
+                  if (nextAct?.type === "ResetMutationToPending") {
+                    await storage.updateMutationStatus(nextAct.mutation_id, MutationStatus.Pending);
+                  }
+                }
                 throw recErr;
               }
 
@@ -726,12 +765,37 @@ export class BrowserSyncAdapter implements SyncServerAdapter {
                 sm.handle_push_conflict(action.request.mutation_id, JSON.stringify(conflictRecord))
               );
               actions.push(...nextActions);
+            } else if (
+              err.isRetryable ||
+              err.code === "NETWORK_ERROR" ||
+              err.name === "TypeError" ||
+              (err.message && err.message.includes("Network")) ||
+              (err.message && err.message.includes("fetch")) ||
+              (err.message && err.message.includes("lost")) ||
+              err.code === "MUTATION_REPLAY_MISMATCH"
+            ) {
+              const nextActions = JSON.parse(
+                sm.handle_push_transient_error(action.request.mutation_id)
+              );
+              actions.push(...nextActions);
+              while (actions.length > 0) {
+                const nextAct = actions.shift();
+                if (nextAct?.type === "ResetMutationToPending") {
+                  await storage.updateMutationStatus(nextAct.mutation_id, MutationStatus.Pending);
+                }
+              }
+              throw err;
             } else {
-              // Any non-revision-conflict error (network error, 409 replay mismatch, 500, etc.):
-              // Fail closed: reset in-flight mutation back to Pending so it can be retried / inspected (no data loss!)
-              await storage
-                .updateMutationStatus(action.request.mutation_id, MutationStatus.Pending)
-                .catch(() => {});
+              const nextActions = JSON.parse(
+                sm.handle_push_fatal_error(action.request.mutation_id, err.message || String(err))
+              );
+              actions.push(...nextActions);
+              while (actions.length > 0) {
+                const nextAct = actions.shift();
+                if (nextAct?.type === "MarkMutationFailed") {
+                  await storage.updateMutationStatus(nextAct.mutation_id, MutationStatus.Failed);
+                }
+              }
               throw err;
             }
           }
