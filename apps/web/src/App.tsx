@@ -19,7 +19,7 @@ import {
   DEFAULT_DB_NAME,
 } from "./storage/indexeddb.js";
 import { VaultProvider } from "./context/VaultContext.js";
-import { AuthProvider, useAuth } from "./context/AuthContext.js";
+import { AuthProvider } from "./context/AuthContext.js";
 import { SyncProvider } from "./context/SyncContext.js";
 import { ConflictProvider } from "./context/ConflictContext.js";
 import { SearchProvider } from "./context/SearchContext.js";
@@ -28,7 +28,6 @@ import { ErrorBoundary } from "./components/ErrorBoundary.js";
 import { UnlockScreen } from "./components/UnlockScreen.js";
 import { NotesWorkspace } from "./components/NotesWorkspace.js";
 import { readVaultLink, VaultLinkRecord } from "./auth/vault-link.js";
-import { normalizeServerOrigin } from "./auth/session.js";
 import { WebAuthnSession } from "./auth/webauthn.js";
 
 export interface AppInnerProps {
@@ -76,8 +75,6 @@ export const AppInner: React.FC<AppInnerProps> = ({
   onMountedStateChange,
   children,
 }) => {
-  const { serverOrigin, session } = useAuth();
-
   const [linkState, setLinkState] = React.useState<{
     link: VaultLinkRecord | null;
     error: string | null;
@@ -118,25 +115,13 @@ export const AppInner: React.FC<AppInnerProps> = ({
     return undefined;
   }, []);
 
-  const isLinkedToCurrentSession = React.useMemo(() => {
-    if (!linkState.link || !session?.accountId || !serverOrigin) return false;
-    try {
-      return (
-        linkState.link.accountId === session.accountId &&
-        normalizeServerOrigin(linkState.link.serverOrigin) === normalizeServerOrigin(serverOrigin)
-      );
-    } catch {
-      return false;
-    }
-  }, [linkState.link, session?.accountId, serverOrigin]);
-
   const targetDbName = React.useMemo(() => {
     if (linkState.error) return null;
     if (propStorage) return propStorage.getDatabaseName();
-    return isLinkedToCurrentSession
-      ? getScopedDatabaseName(DEFAULT_DB_NAME, serverOrigin, session?.accountId)
+    return linkState.link
+      ? getScopedDatabaseName(DEFAULT_DB_NAME, linkState.link.serverOrigin, linkState.link.accountId)
       : DEFAULT_DB_NAME;
-  }, [propStorage, linkState.error, isLinkedToCurrentSession, serverOrigin, session?.accountId]);
+  }, [propStorage, linkState.error, linkState.link]);
 
   const [migrationError, setMigrationError] = React.useState<string | null>(null);
   const [retryNonce, setRetryNonce] = React.useState(0);
@@ -154,7 +139,9 @@ export const AppInner: React.FC<AppInnerProps> = ({
     if (linkState.error) {
       return null;
     }
-    const initialDbName = DEFAULT_DB_NAME;
+    const initialDbName = linkState.link
+      ? getScopedDatabaseName(DEFAULT_DB_NAME, linkState.link.serverOrigin, linkState.link.accountId)
+      : DEFAULT_DB_NAME;
     const st = new IndexedDbStorage(initialDbName);
     const cl = client || createDefaultWorkerClient();
     return { dbName: initialDbName, storage: st, client: cl };

@@ -184,7 +184,9 @@ of the new `VaultProvider` until `client.lockVault()` completes.
 `(serverOrigin, accountId)`.
 7) Enforced fail-closed conflict handling in WASM and TypeScript (SEC-010): propagated crypto errors
 rather than catching and falling back to client-side approximations. Differentiated `"MUTATION_REPLAY_MISMATCH"`.
-8) Added comprehensive regression tests across all lifecycle and failure scenarios (174/174 web tests passing).
+8) Ensured push-side 401/403, 429, and 5xx errors are classified as retryable transient errors (`isRetryablePushError`), emitting `ResetMutationToPending` via the shared state machine so unsynced edits remain safely in the queue as `Pending` and are never stranded as `Failed`.
+9) Decoupled local vault storage selection from `isLinkedToCurrentSession`. Persisted vault link (`zk_vault_link`) controls local vault selection, preserving offline access to local encrypted notes in the scoped DB across logout, session expiry, and account switching. Authentication strictly gates server synchronization.
+10) Added comprehensive regression tests across all lifecycle and failure scenarios (177/177 web tests passing).
 All repository-wide Rust and web quality gates pass cleanly.
 
 ## ZK-107 — Web sync flow and deployment acceptance

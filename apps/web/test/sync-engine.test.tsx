@@ -2481,3 +2481,204 @@ test("corrupted vault link blocks App with error screen and prevents selecting D
     await harness.unmount();
   }
 });
+
+test("push failure on 401/403, 429, and 5xx resets mutation to Pending and does not mark Failed", async () => {
+  const originalFetch = globalThis.fetch;
+  const storage = new IndexedDbStorage(`test-push-retryability-${Date.now()}`);
+  const mockStore = createMockStorage();
+  writeVaultLink(mockStore, {
+    serverOrigin: SERVER_ORIGIN,
+    accountId: ACCOUNT_ID,
+    linkedAt: new Date().toISOString(),
+  });
+
+  const noteId = "note-retryable-1";
+  const env = createEnvelope(noteId, "v1");
+
+  const adapter = new BrowserSyncAdapter({
+    serverOrigin: SERVER_ORIGIN,
+    token: AUTH_TOKEN,
+    accountId: ACCOUNT_ID,
+    linkStorage: mockStore,
+  });
+
+  try {
+    for (const statusCode of [401, 403, 429, 500, 503]) {
+      // Enqueue fresh pending mutation
+      const mutId = `mut-status-${statusCode}`;
+      await storage.enqueueMutation({
+        mutation_id: mutId,
+        object_id: noteId,
+        expected_revision: 0,
+        object_kind: 1,
+        mutation_type: MutationType.Upsert,
+        envelope: env,
+        created_at: new Date().toISOString(),
+        retry_count: 0,
+        status: MutationStatus.Pending,
+      });
+
+      // Mock fetch returning the given HTTP status
+      globalThis.fetch = (async () => {
+        return new Response(JSON.stringify({ error: `Simulated HTTP ${statusCode}` }), {
+          status: statusCode,
+          headers: { "Content-Type": "application/json" },
+        });
+      }) as any;
+
+      // pushMutations must reject with error
+      await assert.rejects(adapter.pushMutations(storage));
+
+      // CRITICAL: The mutation MUST be reset to Pending (never marked Failed!)
+      const pending = await storage.listPendingMutations();
+      const mut = pending.find((m) => m.mutation_id === mutId);
+      assert.ok(mut, `Mutation ${mutId} must remain in pending queue after HTTP ${statusCode}`);
+      assert.equal(mut.status, MutationStatus.Pending, `Mutation status must be Pending after HTTP ${statusCode}`);
+
+      // Clean up for next iteration
+      await storage.removeMutation(mutId);
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+    await storage.close();
+  }
+});
+
+test("persisted vault link selects scoped DB regardless of session; logout/expiry/wrong account preserves local vault", async () => {
+  const scopedDbName = getScopedDatabaseName(DEFAULT_DB_NAME, SERVER_ORIGIN, "alice-linked");
+  const scopedStorage = new IndexedDbStorage(scopedDbName);
+  const noteId = "note-alice-preservation";
+  const env = createEnvelope(noteId, "v1");
+
+  // Pre-populate Alice's scoped storage with a note
+  await scopedStorage.putObject({
+    object_id: noteId,
+    revision: 1,
+    server_seq: 1,
+    object_kind: 1,
+    envelope: env,
+    is_deleted: false,
+    updated_at: new Date().toISOString(),
+  });
+
+  const mockStorageMap = new Map<string, string>();
+  const linkRecord = {
+    serverOrigin: SERVER_ORIGIN,
+    accountId: "alice-linked",
+    linkedAt: new Date().toISOString(),
+  };
+  mockStorageMap.set("zk_vault_link", JSON.stringify(linkRecord));
+
+  const customStorage: Storage = {
+    getItem: (k: string) => mockStorageMap.get(k) ?? null,
+    setItem: (k: string, v: string) => mockStorageMap.set(k, String(v)),
+    removeItem: (k: string) => mockStorageMap.delete(k),
+    clear: () => mockStorageMap.clear(),
+    key: (i: number) => Array.from(mockStorageMap.keys())[i] ?? null,
+    length: mockStorageMap.size,
+  };
+
+  let activeMountedDb = "";
+  // 1. Initial mount with NO session (logged out)
+  const harness = await mountTestApp(
+    <App
+      serverUrl={SERVER_ORIGIN}
+      initialSession={null}
+      onMountedStateChange={(state) => {
+        activeMountedDb = state.dbName;
+      }}
+    >
+      <div id="test-observer">logged-out</div>
+    </App>,
+    { localStorage: customStorage }
+  );
+
+  try {
+    await harness.settle();
+
+    // App MUST select scoped DB even when completely logged out!
+    assert.equal(
+      activeMountedDb,
+      scopedDbName,
+      "Persisted vault link must select scoped DB even when logged out"
+    );
+
+    // Alice's note is present and visible
+    const objsLoggedOut = await scopedStorage.listObjects();
+    assert.equal(objsLoggedOut.length, 1);
+    assert.equal(objsLoggedOut[0]?.object_id, noteId);
+
+    // 2. User logs in with matching account
+    await harness.update(
+      <App
+        serverUrl={SERVER_ORIGIN}
+        initialSession={{
+          sessionId: "sess-alice",
+          token: "tok-alice",
+          accountId: "alice-linked",
+          deviceId: "dev-alice",
+          expiresAt: new Date(Date.now() + 3600000).toISOString(),
+        }}
+        onMountedStateChange={(state) => {
+          activeMountedDb = state.dbName;
+        }}
+      >
+        <div id="test-observer">logged-in-alice</div>
+      </App>
+    );
+    await harness.settle();
+    assert.equal(activeMountedDb, scopedDbName);
+
+    // 3. User logs out (session becomes null / expired)
+    await harness.update(
+      <App
+        serverUrl={SERVER_ORIGIN}
+        initialSession={null}
+        onMountedStateChange={(state) => {
+          activeMountedDb = state.dbName;
+        }}
+      >
+        <div id="test-observer">logged-out-again</div>
+      </App>
+    );
+    await harness.settle();
+    assert.equal(
+      activeMountedDb,
+      scopedDbName,
+      "Logging out must not switch away to default DB"
+    );
+
+    // 4. Logging into another account (e.g. bob)
+    await harness.update(
+      <App
+        serverUrl={SERVER_ORIGIN}
+        initialSession={{
+          sessionId: "sess-bob",
+          token: "tok-bob",
+          accountId: "bob-different",
+          deviceId: "dev-bob",
+          expiresAt: new Date(Date.now() + 3600000).toISOString(),
+        }}
+        onMountedStateChange={(state) => {
+          activeMountedDb = state.dbName;
+        }}
+      >
+        <div id="test-observer">logged-in-bob</div>
+      </App>
+    );
+    await harness.settle();
+    assert.equal(
+      activeMountedDb,
+      scopedDbName,
+      "Logging into another account must not switch local vault away from linked scoped DB"
+    );
+
+    // Encrypted local notes remain completely intact in scoped storage throughout all auth transitions
+    const finalObjs = await scopedStorage.listObjects();
+    assert.equal(finalObjs.length, 1);
+    assert.equal(finalObjs[0]?.object_id, noteId);
+  } finally {
+    await harness.unmount();
+    await scopedStorage.close();
+  }
+});

@@ -131,6 +131,8 @@ export interface SyncReport {
 // ============================================================================
 
 export class SyncError extends Error {
+  public isRetryable?: boolean;
+  public status?: number;
   constructor(message: string, public readonly code: string) {
     super(message);
     this.name = "SyncError";
@@ -138,10 +140,66 @@ export class SyncError extends Error {
 }
 
 export class UnauthorizedSyncError extends SyncError {
+  public override readonly isRetryable = true;
+  public override readonly status = 401;
   constructor(message = "Authentication required to synchronize.") {
     super(message, "UNAUTHORIZED");
     this.name = "UnauthorizedSyncError";
+    this.isRetryable = true;
+    this.status = 401;
   }
+}
+
+/**
+ * Determines whether a push error represents a retryable or transient network, auth,
+ * rate-limit, or server-side failure.
+ *
+ * In accordance with SEC-007, SEC-009, and the project north star (preventing data loss):
+ * 401/403 (session expired/unauthorized), 429 (rate-limited), 5xx (server outage/gateway error),
+ * network/timeout failures, and replay mismatches MUST NOT mark an unsynced mutation as Failed.
+ * They must be handled as transient errors, resetting the mutation to Pending so that it
+ * remains safely in the durable retry queue.
+ */
+export function isRetryablePushError(err: any): boolean {
+  if (!err) return false;
+  if (err.isRetryable === true) return true;
+  if (err instanceof UnauthorizedSyncError) return true;
+  if (
+    err.code === "UNAUTHORIZED" ||
+    err.code === "HTTP_401" ||
+    err.code === "HTTP_403" ||
+    err.code === "HTTP_429" ||
+    err.code === "RATE_LIMITED" ||
+    err.code === "TOO_MANY_REQUESTS" ||
+    err.code === "NETWORK_ERROR" ||
+    err.code === "MUTATION_REPLAY_MISMATCH" ||
+    err.code === "ERROR_MUTATION_REPLAY_MISMATCH"
+  ) {
+    return true;
+  }
+  if (typeof err.code === "string" && /^HTTP_(401|403|429|5\d\d)$/.test(err.code)) {
+    return true;
+  }
+  if (
+    typeof err.status === "number" &&
+    (err.status === 401 || err.status === 403 || err.status === 429 || err.status >= 500)
+  ) {
+    return true;
+  }
+  if (err.name === "TypeError") return true;
+  const msg = String(err.message || "").toLowerCase();
+  if (
+    msg.includes("network") ||
+    msg.includes("fetch") ||
+    msg.includes("lost") ||
+    msg.includes("timeout") ||
+    msg.includes("authentication required") ||
+    msg.includes("rate limit") ||
+    msg.includes("econnrefused")
+  ) {
+    return true;
+  }
+  return false;
 }
 
 export class RevisionConflictError extends SyncError {
@@ -331,14 +389,20 @@ export class BrowserSyncAdapter implements SyncServerAdapter {
     }
 
     if (res.status === 401 || res.status === 403) {
-      throw new UnauthorizedSyncError("Authentication required to synchronize.");
+      const authErr = new UnauthorizedSyncError("Authentication required to synchronize.");
+      (authErr as any).status = res.status;
+      (authErr as any).isRetryable = true;
+      throw authErr;
     }
 
     const errJson = await res.json().catch(() => ({}));
-    throw new SyncError(
+    const err = new SyncError(
       errJson.message || `Push failed with status HTTP ${res.status}`,
       errJson.code || `HTTP_${res.status}`
     );
+    (err as any).status = res.status;
+    (err as any).isRetryable = res.status === 429 || res.status >= 500;
+    throw err;
   }
 
   /**
@@ -510,15 +574,7 @@ export class BrowserSyncAdapter implements SyncServerAdapter {
                 sm.handle_push_conflict(action.request.mutation_id, JSON.stringify(conflictRecord))
               );
               actions.push(...nextActions);
-            } else if (
-              err.isRetryable ||
-              err.code === "NETWORK_ERROR" ||
-              err.name === "TypeError" ||
-              (err.message && err.message.includes("Network")) ||
-              (err.message && err.message.includes("fetch")) ||
-              (err.message && err.message.includes("lost")) ||
-              err.code === "MUTATION_REPLAY_MISMATCH"
-            ) {
+            } else if (isRetryablePushError(err)) {
               const nextActions = JSON.parse(
                 sm.handle_push_transient_error(action.request.mutation_id)
               );
@@ -765,15 +821,7 @@ export class BrowserSyncAdapter implements SyncServerAdapter {
                 sm.handle_push_conflict(action.request.mutation_id, JSON.stringify(conflictRecord))
               );
               actions.push(...nextActions);
-            } else if (
-              err.isRetryable ||
-              err.code === "NETWORK_ERROR" ||
-              err.name === "TypeError" ||
-              (err.message && err.message.includes("Network")) ||
-              (err.message && err.message.includes("fetch")) ||
-              (err.message && err.message.includes("lost")) ||
-              err.code === "MUTATION_REPLAY_MISMATCH"
-            ) {
+            } else if (isRetryablePushError(err)) {
               const nextActions = JSON.parse(
                 sm.handle_push_transient_error(action.request.mutation_id)
               );
