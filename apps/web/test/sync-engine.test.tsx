@@ -1297,7 +1297,7 @@ test("Sync Now no longer reports 'server synchronization is not configured' once
   const mockStore = createMockStorage();
 
   try {
-    // 1. Unlinked state: syncNow reports "Server synchronization is not configured"
+    // 1. Unlinked state: syncNow reports that the vault is not linked to an account
     let syncRef: ReturnType<typeof useSync> | null = null;
     const Consumer: React.FC = () => {
       syncRef = useSync();
@@ -1316,7 +1316,8 @@ test("Sync Now no longer reports 'server synchronization is not configured' once
 
     let sync = syncRef as unknown as ReturnType<typeof useSync>;
     await sync.syncNow();
-    assert.equal(sync.error, "Server synchronization is not configured. Notes remain local.");
+    assert.equal(sync.error, "This vault is not linked to an account. Notes remain on this device.");
+    assert.equal(sync.status, "error");
 
     // 2. Link vault to account
     const linkRecord: VaultLinkRecord = {
@@ -2680,5 +2681,54 @@ test("persisted vault link selects scoped DB regardless of session; logout/expir
   } finally {
     await harness.unmount();
     await scopedStorage.close();
+  }
+});
+
+test("BrowserSyncAdapter binds the global fetch so method-style calls work in a real browser", async () => {
+  // Chrome throws "Illegal invocation" when the native `fetch` is invoked as an
+  // object method (`this.fetchFn(...)`), which the adapter would misreport as a
+  // network failure. The adapter must therefore bind it to the global object.
+  const mockStore = createMockStorage();
+  writeVaultLink(mockStore, {
+    serverOrigin: SERVER_ORIGIN,
+    accountId: ACCOUNT_ID,
+    linkedAt: new Date().toISOString(),
+  });
+
+  const originalFetch = globalThis.fetch;
+  let observedThis: unknown = undefined;
+  function thisSensitiveFetch(
+    this: unknown,
+    _url: RequestInfo | URL,
+    _init?: RequestInit
+  ): Promise<Response> {
+    observedThis = this;
+    if (this !== globalThis) {
+      return Promise.reject(
+        new TypeError("Failed to execute 'fetch' on 'Window': Illegal invocation")
+      );
+    }
+    return Promise.resolve(
+      new Response(JSON.stringify({ changes: [], next_cursor: 0, has_more: false }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      })
+    );
+  }
+  (globalThis as { fetch: unknown }).fetch = thisSensitiveFetch;
+
+  try {
+    const adapter = new BrowserSyncAdapter({
+      serverOrigin: SERVER_ORIGIN,
+      token: AUTH_TOKEN,
+      accountId: ACCOUNT_ID,
+      linkStorage: mockStore,
+    });
+
+    const result = await adapter.fetchPullChanges(0, 50);
+    assert.equal(observedThis, globalThis, "native fetch must be invoked with the global `this`");
+    assert.deepEqual(result.changes, []);
+  } finally {
+    globalThis.fetch = originalFetch;
   }
 });

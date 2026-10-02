@@ -1,11 +1,14 @@
 /**
- * Sync Status Indicator Component (ZK-067).
+ * Sync Status Indicator Component (ZK-067, ZK-107).
  *
  * Requirements:
- * - Accurately displays the 6 required sync states:
+ * - Accurately and truthfully displays every sync state:
+ *   - "local only"       (vault not linked to any account)
+ *   - "sign in to sync"  (linked, but no matching authenticated session)
+ *   - "not synced yet"   (linked + signed in, no server round trip completed)
  *   - "offline"
  *   - "syncing"
- *   - "synced"
+ *   - "synced"           (only after a real server round trip)
  *   - "pending changes"
  *   - "conflict"
  *   - "error"
@@ -57,6 +60,14 @@ export const SyncStatusIndicator: React.FC<SyncStatusIndicatorProps> = ({
       case "local only":
         return {
           icon: "◯", label: "local only", bg: "#f3f4f6", text: "#4b5563", border: "#d1d5db",
+        };
+      case "sign in to sync":
+        return {
+          icon: "🔑", label: "sign in to sync", bg: "#eef2ff", text: "#4338ca", border: "#c7d2fe",
+        };
+      case "not synced yet":
+        return {
+          icon: "⬆", label: "not synced yet", bg: "#eff6ff", text: "#1d4ed8", border: "#bfdbfe",
         };
       case "offline":
         return {
@@ -111,6 +122,39 @@ export const SyncStatusIndicator: React.FC<SyncStatusIndicatorProps> = ({
 
   const config = getStatusConfig(status);
 
+  /**
+   * Truthful, zero-knowledge explanation of what the current state means for the
+   * user's data. Never claims server synchronization that has not happened.
+   */
+  const getStatusExplanation = (s: SyncStatus): string => {
+    switch (s) {
+      case "local only":
+        return pendingCount > 0
+          ? `This vault is not linked to an account. ${pendingCount} encrypted local change${pendingCount === 1 ? "" : "s"} are stored on this device only, with no server copy.`
+          : "This vault is not linked to an account. Notes are encrypted and stored on this device only.";
+      case "sign in to sync":
+        return pendingCount > 0
+          ? `This vault is linked to an account and ${pendingCount} local change${pendingCount === 1 ? "" : "s"} are waiting to upload. Sign in to the linked account to synchronize them.`
+          : "This vault is linked to an account, but no matching signed-in session is active. Notes stay available locally and sync is disabled until you sign in to the linked account.";
+      case "not synced yet":
+        return "Linked and signed in, but no server synchronization has completed yet. Run Sync Now to upload this vault.";
+      case "offline":
+        return pendingCount > 0
+          ? `Offline. ${pendingCount} change${pendingCount === 1 ? "" : "s"} are saved on this device and will upload when the connection returns.`
+          : "Offline. Notes are saved on this device only and are not being synchronized.";
+      case "syncing":
+        return "Uploading and downloading encrypted changes with the server.";
+      case "synced":
+        return "The last server round trip completed successfully. Local changes made offline will return to pending until they are uploaded.";
+      case "pending changes":
+        return `${pendingCount} encrypted change${pendingCount === 1 ? "" : "s"} are saved on this device and waiting to upload. They are not yet on the server.`;
+      case "conflict":
+        return "A remote change conflicts with a local edit. Your local edit is preserved until you resolve the conflict.";
+      case "error":
+        return "The last synchronization attempt failed. Your notes remain safe on this device.";
+    }
+  };
+
   const handleTogglePopover = () => {
     if (showPopoverOnClick) {
       setIsPopoverOpen((prev) => !prev);
@@ -148,7 +192,7 @@ export const SyncStatusIndicator: React.FC<SyncStatusIndicatorProps> = ({
       >
         <span style={{ fontSize: "11px" }}>{config.icon}</span>
         <span className="zk-sync-label">{config.label}</span>
-        {status === "pending changes" && pendingCount > 0 && (
+        {(status === "pending changes" || status === "offline") && pendingCount > 0 && (
           <span style={badgeCountStyle}>{`(${pendingCount})`}</span>
         )}
         {status === "conflict" && conflictCount > 0 && (
@@ -199,6 +243,14 @@ export const SyncStatusIndicator: React.FC<SyncStatusIndicatorProps> = ({
                 {config.icon} {config.label}
               </span>
             </div>
+
+            {/* Truthful state explanation (zero note content, SEC-001/SEC-003) */}
+            <p
+              style={{ margin: "0 0 12px 0", fontSize: "12px", lineHeight: 1.5, color: "#4b5563" }}
+              data-testid="sync-status-explanation"
+            >
+              {getStatusExplanation(status)}
+            </p>
 
             {/* Sanitized Metrics (Zero note content) */}
             <div style={metricsContainerStyle}>

@@ -16,14 +16,32 @@ import React, {
 } from "react";
 import { useVault } from "./VaultContext.js";
 import { useAuth } from "./AuthContext.js";
+import { normalizeServerOrigin } from "../auth/session.js";
 import { IndexedDbStorage } from "../storage/indexeddb.js";
 import {
   BrowserSyncAdapter,
   type SyncServerAdapter,
 } from "../sync/adapter.js";
 
+/**
+ * Truthful synchronization states (ZK-107).
+ *
+ * - "local only":        the vault is not linked to any account; nothing leaves this device.
+ * - "sign in to sync":   the vault is linked, but no authenticated session matches the link.
+ * - "not synced yet":    linked and authenticated, but no server round trip has completed yet.
+ * - "offline":           the browser or the user reports no connectivity.
+ * - "pending changes":   encrypted local changes are queued and have not been uploaded.
+ * - "syncing":           a server round trip is in flight.
+ * - "synced":            ONLY set after a server round trip completes successfully.
+ * - "error":             the last synchronization attempt failed.
+ * - "conflict":          one or more conflicts require an explicit decision.
+ *
+ * "synced" must never be reached from local persistence alone (ZK-107 acceptance A).
+ */
 export type SyncStatus =
   | "local only"
+  | "sign in to sync"
+  | "not synced yet"
   | "offline"
   | "syncing"
   | "synced"
@@ -39,6 +57,12 @@ export interface SyncStateSnapshot {
   conflictCount: number;
   lastSyncAt: Date | null;
   error: string | null;
+  /** True when a persisted vault link ties this browser to an account. */
+  linked: boolean;
+  /** True when an authenticated, link-matching server adapter is wired up. */
+  syncConfigured: boolean;
+  /** True only when at least one full server round trip has completed for this identity. */
+  hasCompletedSync: boolean;
 }
 
 export interface SyncContextType extends SyncStateSnapshot {
@@ -47,6 +71,16 @@ export interface SyncContextType extends SyncStateSnapshot {
   clearError: () => void;
   refreshStatus: () => Promise<void>;
   store: SyncStore;
+}
+
+/**
+ * Link context describing whether this browser's vault is associated with an account.
+ * The identity is used to read the durable sync cursor/timestamp for the correct
+ * account-scoped database, even while no authenticated adapter is active.
+ */
+export interface SyncLinkContext {
+  linked: boolean;
+  identity?: string;
 }
 
 /**
@@ -93,6 +127,8 @@ export class SyncStore {
   private conflictCount = 0;
   private lastSyncAt: Date | null = null;
   private error: string | null = null;
+  private linked = false;
+  private syncIdentity?: string;
   private listeners = new Set<() => void>();
   private snapshot: SyncStateSnapshot;
 
@@ -104,7 +140,11 @@ export class SyncStore {
       this.isNetworkOnline = navigator.onLine;
     }
 
-    this.snapshot = {
+    this.snapshot = this.buildSnapshot();
+  }
+
+  private buildSnapshot(): SyncStateSnapshot {
+    return {
       status: this.getStatus(),
       isOnline: this.getIsOnline(),
       isSyncing: this.isSyncing,
@@ -112,19 +152,14 @@ export class SyncStore {
       conflictCount: this.conflictCount,
       lastSyncAt: this.lastSyncAt,
       error: this.error,
+      linked: this.linked,
+      syncConfigured: this.isSyncConfigured(),
+      hasCompletedSync: this.lastSyncAt !== null,
     };
   }
 
   private updateSnapshot(): void {
-    this.snapshot = {
-      status: this.getStatus(),
-      isOnline: this.getIsOnline(),
-      isSyncing: this.isSyncing,
-      pendingCount: this.pendingCount,
-      conflictCount: this.conflictCount,
-      lastSyncAt: this.lastSyncAt,
-      error: this.error,
-    };
+    this.snapshot = this.buildSnapshot();
   }
 
   public getState(): SyncStateSnapshot {
@@ -153,14 +188,36 @@ export class SyncStore {
     return this.isNetworkOnline && !this.isManualOffline;
   }
 
+  /** True when a usable authenticated server adapter is wired up (ZK-107 acceptance A4). */
+  public isSyncConfigured(): boolean {
+    const adapter = this.serverAdapter;
+    if (!adapter) return false;
+    return Boolean(adapter.sync || adapter.pushMutations || adapter.pullChanges);
+  }
+
+  public isLinked(): boolean {
+    return this.linked;
+  }
+
+  /**
+   * Derives the truthful display status.
+   *
+   * Precedence is deliberate: conflicts and connectivity are facts that outrank a
+   * stale success/failure banner, and "synced" is reachable only when a full server
+   * round trip has recorded `last_sync_at` for the active identity.
+   */
   public getStatus(): SyncStatus {
     if (this.conflictCount > 0) return "conflict";
-    if (this.error !== null) return "error";
     if (!this.getIsOnline()) return "offline";
+    if (this.error !== null) return "error";
     if (this.isSyncing) return "syncing";
-    if (this.pendingCount > 0) return "pending changes";
-    if (!this.serverAdapter?.pushMutations || !this.serverAdapter?.pullChanges) return "local only";
-    return "synced";
+    if (this.isSyncConfigured()) {
+      // Only a vault with a real upload target can have "pending" changes.
+      if (this.pendingCount > 0) return "pending changes";
+      return this.lastSyncAt !== null ? "synced" : "not synced yet";
+    }
+    // No usable adapter: local work is not "pending" against any server.
+    return this.linked ? "sign in to sync" : "local only";
   }
 
   public getPendingCount(): number {
@@ -189,6 +246,16 @@ export class SyncStore {
     this.notify();
   }
 
+  /**
+   * Records whether this browser's vault is linked to an account, and under which
+   * identity its durable sync state (cursor + `last_sync_at`) is stored.
+   */
+  public setLinkContext(context?: SyncLinkContext): void {
+    this.linked = context?.linked ?? false;
+    this.syncIdentity = context?.identity;
+    this.notify();
+  }
+
   public setOfflineMode(offline: boolean): void {
     this.isManualOffline = offline;
     this.notify();
@@ -209,14 +276,14 @@ export class SyncStore {
       const conflicts = await this.storage.listConflicts(false);
       this.conflictCount = conflicts.length;
 
-      // 3. Check last sync time from sync state store
-      const identity = (this.serverAdapter as any)?.identity;
+      // 3. Read the durable sync timestamp for the linked identity. When no identity is
+      //    known the default ("singleton") record of the selected database is used; the
+      //    "synced" status additionally requires a configured adapter, so a stale value
+      //    can never by itself present local-only state as server-synchronized.
+      const identity = (this.serverAdapter as any)?.identity || this.syncIdentity;
       const syncState = await this.storage.getSyncState(identity);
-      if (syncState && syncState.last_sync_at) {
-        this.lastSyncAt = new Date(syncState.last_sync_at);
-      } else {
-        this.lastSyncAt = null;
-      }
+      this.lastSyncAt =
+        syncState && syncState.last_sync_at ? new Date(syncState.last_sync_at) : null;
       this.notify();
     } catch {
       // Ignore storage polling errors
@@ -224,8 +291,11 @@ export class SyncStore {
   }
 
   public async syncNow(): Promise<void> {
-    if (!this.serverAdapter?.pushMutations && !this.serverAdapter?.sync) {
-      this.error = "Server synchronization is not configured. Notes remain local.";
+    if (!this.isSyncConfigured()) {
+      // No authenticated adapter that matches the vault link: never claim success.
+      this.error = this.linked
+        ? "Sign in to the account this vault is linked to before synchronizing."
+        : "This vault is not linked to an account. Notes remain on this device.";
       this.notify();
       return;
     }
@@ -241,19 +311,22 @@ export class SyncStore {
     this.isSyncing = true;
     this.notify();
 
+    // Guarded by isSyncConfigured() above.
+    const adapter = this.serverAdapter!;
+
     try {
-      if (this.serverAdapter.sync) {
-        await this.serverAdapter.sync(this.storage);
+      if (adapter.sync) {
+        await adapter.sync(this.storage);
       } else {
-        if (this.serverAdapter.pushMutations) {
-          await this.serverAdapter.pushMutations(this.storage);
+        if (adapter.pushMutations) {
+          await adapter.pushMutations(this.storage);
         }
-        if (this.serverAdapter.pullChanges) {
-          await this.serverAdapter.pullChanges(this.storage);
+        if (adapter.pullChanges) {
+          await adapter.pullChanges(this.storage);
         }
 
         const now = new Date();
-        const identity = (this.serverAdapter as any)?.identity;
+        const identity = (adapter as { identity?: string }).identity;
         const existingState = await this.storage.getSyncState(identity);
         await this.storage.setSyncState(
           {
@@ -324,6 +397,24 @@ export const SyncProvider: React.FC<SyncProviderProps> = ({
     client,
   ]);
 
+  // The identity that owns this browser's durable sync state. It is derived from the
+  // persisted vault link (not the transient session), so cursor and last-sync timestamp
+  // survive logout, expiry, and wrong-account sign-in.
+  const linkedIdentity = useMemo(() => {
+    if (!vaultLink) return undefined;
+    return `${normalizeServerOrigin(vaultLink.serverOrigin)}::${vaultLink.accountId}`;
+  }, [vaultLink]);
+
+  const activeAdapterIdentity = (activeAdapter as { identity?: string } | undefined)?.identity;
+
+  const linkContext = useMemo<SyncLinkContext>(
+    () => ({
+      linked: Boolean(vaultLink),
+      identity: activeAdapterIdentity || linkedIdentity,
+    }),
+    [vaultLink, activeAdapterIdentity, linkedIdentity]
+  );
+
   const store = useMemo(
     () => propStore || new SyncStore(storage, activeAdapter),
     [propStore, storage]
@@ -332,9 +423,10 @@ export const SyncProvider: React.FC<SyncProviderProps> = ({
   useEffect(() => {
     if (!propStore) {
       store.setServerAdapter(activeAdapter);
+      store.setLinkContext(linkContext);
       store.refreshStatus();
     }
-  }, [store, activeAdapter, propStore]);
+  }, [store, activeAdapter, linkContext, propStore]);
 
   useEffect(() => {
     return () => {
@@ -390,6 +482,15 @@ export const SyncProvider: React.FC<SyncProviderProps> = ({
       get error() {
         return store.getError();
       },
+      get linked() {
+        return store.isLinked();
+      },
+      get syncConfigured() {
+        return store.isSyncConfigured();
+      },
+      get hasCompletedSync() {
+        return store.getState().hasCompletedSync;
+      },
       syncNow: () => store.syncNow(),
       setOfflineMode: (off: boolean) => store.setOfflineMode(off),
       clearError: () => store.clearError(),
@@ -402,23 +503,30 @@ export const SyncProvider: React.FC<SyncProviderProps> = ({
   return <SyncContext.Provider value={value}>{children}</SyncContext.Provider>;
 };
 
+/**
+ * Without a provider there is no evidence of any server synchronization, so the
+ * only truthful state is local-only (never "synced"). Kept as a module-level
+ * constant so consumers do not see a new object identity on every render.
+ */
+const NO_SYNC_CONTEXT: SyncContextType = {
+  status: "local only",
+  isOnline: true,
+  isSyncing: false,
+  pendingCount: 0,
+  conflictCount: 0,
+  lastSyncAt: null,
+  error: null,
+  linked: false,
+  syncConfigured: false,
+  hasCompletedSync: false,
+  syncNow: async () => {},
+  setOfflineMode: () => {},
+  clearError: () => {},
+  refreshStatus: async () => {},
+  store: null as any,
+};
+
 export function useSync(): SyncContextType {
   const ctx = useContext(SyncContext);
-  if (!ctx) {
-    return {
-      status: "synced",
-      isOnline: true,
-      isSyncing: false,
-      pendingCount: 0,
-      conflictCount: 0,
-      lastSyncAt: null,
-      error: null,
-      syncNow: async () => {},
-      setOfflineMode: () => {},
-      clearError: () => {},
-      refreshStatus: async () => {},
-      store: null as any,
-    };
-  }
-  return ctx;
+  return ctx || NO_SYNC_CONTEXT;
 }

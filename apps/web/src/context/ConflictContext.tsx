@@ -14,9 +14,11 @@
 
 import React, {
   createContext,
+  useCallback,
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useSyncExternalStore,
 } from "react";
 import { useVault } from "./VaultContext.js";
@@ -531,20 +533,29 @@ export const ConflictProvider: React.FC<ConflictProviderProps> = ({
   const notes = useNotes();
   const sync = useSync();
 
-  const handleResolved = useMemo(() => {
-    return async () => {
-      try {
-        if (notes && typeof notes.reloadNotes === "function") {
-          await notes.reloadNotes();
-        }
-        if (sync && typeof sync.refreshStatus === "function") {
-          await sync.refreshStatus();
-        }
-      } catch {
-        // Ignore background refresh errors
+  // Read the latest contexts through refs so `handleResolved` keeps a stable
+  // identity. If it changed on every render, the ConflictStore below would be
+  // recreated constantly and its `activeConflicts` snapshot would be discarded
+  // before it could ever reach the UI (ZK-107: conflicts must stay visible).
+  const notesRef = useRef(notes);
+  notesRef.current = notes;
+  const syncRef = useRef(sync);
+  syncRef.current = sync;
+
+  const handleResolved = useCallback(async () => {
+    try {
+      const latestNotes = notesRef.current;
+      if (latestNotes && typeof latestNotes.reloadNotes === "function") {
+        await latestNotes.reloadNotes();
       }
-    };
-  }, [notes, sync]);
+      const latestSync = syncRef.current;
+      if (latestSync && typeof latestSync.refreshStatus === "function") {
+        await latestSync.refreshStatus();
+      }
+    } catch {
+      // Ignore background refresh errors
+    }
+  }, []);
 
   const store = useMemo(
     () => propStore || new ConflictStore(client, storage, handleResolved),
