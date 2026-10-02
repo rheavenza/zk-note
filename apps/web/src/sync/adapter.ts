@@ -26,8 +26,11 @@ import {
   StoredEncryptedObject,
   MutationType,
   MutationStatus,
+  PendingMutation,
   ConflictRecord,
 } from "../storage/models.js";
+import { VaultWorkerClient } from "../worker/client.js";
+import * as zk from "zk-wasm";
 
 // ============================================================================
 // Protocol DTO Types
@@ -181,6 +184,7 @@ export interface BrowserSyncAdapterOptions {
   accountId: string;
   fetchFn?: typeof fetch;
   linkStorage?: Pick<Storage, "getItem">;
+  workerClient?: VaultWorkerClient;
 }
 
 // ============================================================================
@@ -191,6 +195,7 @@ export class BrowserSyncAdapter implements SyncServerAdapter {
   public readonly serverOrigin: string;
   public readonly accountId: string;
   public readonly identity: string;
+  public readonly workerClient?: VaultWorkerClient;
   private readonly token: string;
   private readonly fetchFn: typeof fetch;
   private readonly linkStorage?: Pick<Storage, "getItem">;
@@ -212,6 +217,7 @@ export class BrowserSyncAdapter implements SyncServerAdapter {
     this.token = options.token.trim();
     this.fetchFn = options.fetchFn || (typeof globalThis !== "undefined" ? globalThis.fetch : (fetch as any));
     this.linkStorage = options.linkStorage;
+    this.workerClient = options.workerClient;
   }
 
   /**
@@ -273,9 +279,27 @@ export class BrowserSyncAdapter implements SyncServerAdapter {
     }
 
     if (res.status === 409) {
-      const conflictJson = (await res.json().catch(() => ({}))) as ConflictResponseDto;
-      validateNoPlaintextSecrets(conflictJson);
-      throw new RevisionConflictError(conflictJson);
+      const errJson = (await res.json().catch(() => ({}))) as any;
+      validateNoPlaintextSecrets(errJson);
+      const codeStr = String(errJson.code || "").toUpperCase();
+      const errStr = String(errJson.error || "").toUpperCase();
+      if (codeStr === "ERROR_MUTATION_REPLAY_MISMATCH" || errStr === "ERROR_MUTATION_REPLAY_MISMATCH") {
+        throw new SyncError(
+          errJson.message || `Mutation replay mismatch for mutation_id '${request.mutation_id}'`,
+          "ERROR_MUTATION_REPLAY_MISMATCH"
+        );
+      }
+      if (
+        (errStr === "ERROR_REVISION_CONFLICT" || errStr === "REVISION_CONFLICT") &&
+        typeof errJson.current_revision === "number" &&
+        errJson.current_envelope
+      ) {
+        throw new RevisionConflictError(errJson as ConflictResponseDto);
+      }
+      throw new SyncError(
+        errJson.message || "Conflict response from server",
+        errJson.code || errJson.error || "HTTP_409"
+      );
     }
 
     if (res.status === 401 || res.status === 403) {
@@ -369,11 +393,19 @@ export class BrowserSyncAdapter implements SyncServerAdapter {
       conflicts: [],
     };
 
+    const conflictedObjects = new Set<string>();
+
     for (const mutation of pendingMutations) {
       if (
         mutation.status !== MutationStatus.Pending &&
         mutation.status !== MutationStatus.InFlight
       ) {
+        continue;
+      }
+
+      // If an earlier mutation for this object encountered a conflict,
+      // skip pushing subsequent edits for this object to prevent pushing stale dependent revisions (SEC-006).
+      if (conflictedObjects.has(mutation.object_id)) {
         continue;
       }
 
@@ -418,38 +450,64 @@ export class BrowserSyncAdapter implements SyncServerAdapter {
       } catch (err) {
         if (err instanceof RevisionConflictError) {
           // Stale edit or delete-vs-edit CAS conflict (SEC-006 / SEC-008):
-          // Record actionable conflict and remove stale mutation from pending queue
-          await storage.removeMutation(mutation.mutation_id);
+          conflictedObjects.add(mutation.object_id);
 
-          const baseEnvelope = await storage.getBaseVersion(
-            mutation.object_id,
-            mutation.expected_revision
-          );
+          try {
+            // 1. Fetch base version first
+            const baseEnvelope = await storage.getBaseVersion(
+              mutation.object_id,
+              mutation.expected_revision
+            );
 
-          const conflictId =
-            typeof crypto !== "undefined" && crypto.randomUUID
-              ? crypto.randomUUID()
-              : `conf-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+            // 2. Generate conflict record using the shared Rust core (via Web Worker or WASM)
+            let conflictRecord: ConflictRecord;
+            if (this.workerClient) {
+              try {
+                const recordJson = await this.workerClient.recordConflict(
+                  JSON.stringify(mutation),
+                  JSON.stringify(err.conflict),
+                  baseEnvelope ? JSON.stringify(baseEnvelope) : null
+                );
+                conflictRecord = JSON.parse(recordJson);
+              } catch {
+                conflictRecord = buildLocalConflictRecord(
+                  mutation,
+                  err.conflict,
+                  baseEnvelope
+                );
+              }
+            } else {
+              conflictRecord = buildLocalConflictRecord(
+                mutation,
+                err.conflict,
+                baseEnvelope
+              );
+            }
 
-          const conflictRecord: ConflictRecord = {
-            conflict_id: conflictId,
-            object_id: mutation.object_id,
-            object_kind: mutation.object_kind,
-            base_revision: mutation.expected_revision,
-            remote_revision: err.conflict.current_revision,
-            base_envelope: baseEnvelope || null,
-            local_envelope: mutation.envelope,
-            remote_envelope: err.conflict.current_envelope,
-            candidate_envelope: null,
-            resolved: false,
-            remote_is_deleted: Boolean(err.conflict.is_deleted),
-            local_is_deleted: mutation.mutation_type === MutationType.Delete,
-            created_at: new Date().toISOString(),
-            resolved_at: null,
-          };
+            // 3. Durably commit conflict record to storage FIRST
+            await storage.putConflict(conflictRecord);
 
-          await storage.putConflict(conflictRecord);
-          report.conflicts.push(conflictRecord);
+            // 4. In accordance with Rust zk-sync push_pending_changes:
+            // Leave the local mutation recoverable in the queue (marked Pending)
+            // instead of premature deletion, so the user can resolve or recover it.
+            await storage.updateMutationStatus(
+              mutation.mutation_id,
+              MutationStatus.Pending,
+              mutation.retry_count
+            );
+
+            report.conflicts.push(conflictRecord);
+          } catch (storageErr) {
+            // Fail closed: ensure mutation is not left in InFlight state if conflict recording fails
+            await storage
+              .updateMutationStatus(
+                mutation.mutation_id,
+                MutationStatus.Pending,
+                mutation.retry_count
+              )
+              .catch(() => {});
+            throw storageErr;
+          }
         } else {
           // Reset back to Pending status so it can be retried on reconnect
           await storage.updateMutationStatus(
@@ -586,4 +644,49 @@ export class BrowserSyncAdapter implements SyncServerAdapter {
   ): Promise<PullReport> {
     return this.pullChangesToStorage(storage, linkStorage);
   }
+}
+
+/**
+ * Builds a ConflictRecord using the shared Rust core wasm export if available,
+ * or constructs the exact ConflictRecord conforming to zk-storage models (ZK-053).
+ */
+export function buildLocalConflictRecord(
+  mutation: PendingMutation,
+  conflict: ConflictResponseDto,
+  baseEnvelope?: EncryptedEnvelopeDto | null
+): ConflictRecord {
+  try {
+    if (typeof (zk as any).build_conflict_record === "function") {
+      const json = (zk as any).build_conflict_record(
+        JSON.stringify(mutation),
+        JSON.stringify(conflict),
+        baseEnvelope ? JSON.stringify(baseEnvelope) : null
+      );
+      return JSON.parse(json);
+    }
+  } catch {
+    // If wasm is uninitialized on main thread, fallback to direct typed structure
+  }
+
+  const conflictId =
+    typeof crypto !== "undefined" && crypto.randomUUID
+      ? crypto.randomUUID()
+      : `conf-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+
+  return {
+    conflict_id: conflictId,
+    object_id: mutation.object_id,
+    object_kind: mutation.object_kind,
+    base_revision: mutation.expected_revision,
+    remote_revision: conflict.current_revision,
+    base_envelope: baseEnvelope || null,
+    local_envelope: mutation.envelope,
+    remote_envelope: conflict.current_envelope,
+    candidate_envelope: null,
+    resolved: false,
+    remote_is_deleted: Boolean(conflict.is_deleted),
+    local_is_deleted: mutation.mutation_type === MutationType.Delete,
+    created_at: new Date().toISOString(),
+    resolved_at: null,
+  };
 }

@@ -12,9 +12,9 @@ pub mod pull;
 pub mod push;
 pub mod queue;
 
-pub use adapter::{
-    validate_no_plaintext_secrets, MockSyncAdapter, NativeHttpSyncAdapter, SyncServerAdapter,
-};
+#[cfg(feature = "native-adapter")]
+pub use adapter::NativeHttpSyncAdapter;
+pub use adapter::{validate_no_plaintext_secrets, MockSyncAdapter, SyncServerAdapter};
 pub use conflict::{
     evaluate_guarded_lww, generate_merge_candidate, record_conflict, resolve_conflict,
     ConflictPolicy, ConflictResolutionResult, ConflictResolutionStrategy, GuardedLwwOutcome,

@@ -333,6 +333,25 @@ export class VaultHandler {
         return { hash };
       }
 
+      case "RECORD_CONFLICT": {
+        const payload = request.payload;
+        let conflictRecordJson: string;
+        if (this.session && this.session.is_unlocked()) {
+          conflictRecordJson = this.session.record_conflict(
+            payload.mutationJson,
+            payload.conflictJson,
+            payload.baseEnvelopeJson || undefined
+          );
+        } else {
+          conflictRecordJson = zk.build_conflict_record(
+            payload.mutationJson,
+            payload.conflictJson,
+            payload.baseEnvelopeJson || undefined
+          );
+        }
+        return { conflictRecordJson };
+      }
+
       default: {
         throw new Error(`Unknown request type: ${(request as any).type}`);
       }

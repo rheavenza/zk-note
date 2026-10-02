@@ -67,6 +67,13 @@ export class IndexedDbStorage {
   }
 
   /**
+   * Returns the database name for this storage instance.
+   */
+  public getDatabaseName(): string {
+    return this.dbName;
+  }
+
+  /**
    * Opens or initializes the IndexedDB database.
    */
   public async getDb(): Promise<IDBDatabase> {

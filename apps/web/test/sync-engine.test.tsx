@@ -42,7 +42,11 @@ import {
   WrongAccountError,
   OriginMismatchError,
 } from "../src/auth/vault-link.js";
-import { IndexedDbStorage } from "../src/storage/indexeddb.js";
+import {
+  IndexedDbStorage,
+  getScopedDatabaseName,
+  DEFAULT_DB_NAME,
+} from "../src/storage/indexeddb.js";
 import {
   MutationType,
   MutationStatus,
@@ -707,11 +711,10 @@ test("stale edit CAS conflict creates actionable conflict record", async () => {
     assert.equal(conflicts[0]?.object_id, noteId);
     assert.equal(conflicts[0]?.base_revision, 1);
     assert.equal(conflicts[0]?.remote_revision, 2);
-    assert.deepEqual(conflicts[0]?.local_envelope, localEnvelope);
-
-    // Pending mutation is cleared so it won't spin forever
+    // Pending mutation is retained for recovery (matching Rust push_pending_changes)
     const pending = await storage.listPendingMutations();
-    assert.equal(pending.length, 0);
+    assert.equal(pending.length, 1);
+    assert.equal(pending[0]?.mutation_id, "mut-stale-1");
   } finally {
     globalThis.fetch = oldFetch;
     await storage.close();
@@ -1353,6 +1356,335 @@ test("Sync Now no longer reports 'server synchronization is not configured' once
     // The error "Server synchronization is not configured" MUST NOT appear
     assert.notEqual(sync.error, "Server synchronization is not configured. Notes remain local.");
     assert.equal(sync.status, "synced");
+  } finally {
+    globalThis.fetch = oldFetch;
+    await storage.close();
+  }
+});
+
+test("HTTP 409 replay mismatch fails closed, preserves mutation, does not record revision conflict", async () => {
+  const oldFetch = globalThis.fetch;
+  const storage = new IndexedDbStorage(`test-e2e-409-mismatch-${Date.now()}`);
+  const mockStore = createMockStorage();
+  writeVaultLink(mockStore, {
+    serverOrigin: SERVER_ORIGIN,
+    accountId: ACCOUNT_ID,
+    linkedAt: new Date().toISOString(),
+  });
+
+  try {
+    globalThis.fetch = async (input: RequestInfo | URL, _init?: RequestInit): Promise<Response> => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.endsWith("/v1/sync/push")) {
+        return new Response(
+          JSON.stringify({
+            code: "ERROR_MUTATION_REPLAY_MISMATCH",
+            message: "Mutation replay mismatch: mutation_id already accepted with different payload",
+          }),
+          { status: 409, headers: { "Content-Type": "application/json" } }
+        );
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    };
+
+    const adapter = new BrowserSyncAdapter({
+      serverOrigin: SERVER_ORIGIN,
+      token: AUTH_TOKEN,
+      accountId: ACCOUNT_ID,
+      linkStorage: mockStore,
+    });
+
+    const noteId = "note-mismatch-1";
+    const env = createEnvelope(noteId, "v1");
+    await storage.enqueueMutation({
+      mutation_id: "mut-mismatch-1",
+      object_id: noteId,
+      expected_revision: 0,
+      object_kind: 1,
+      mutation_type: MutationType.Upsert,
+      envelope: env,
+      created_at: new Date().toISOString(),
+      retry_count: 0,
+      status: MutationStatus.Pending,
+    });
+
+    // Push must fail closed with ERROR_MUTATION_REPLAY_MISMATCH
+    await assert.rejects(
+      adapter.pushMutations(storage),
+      (err: any) =>
+        err instanceof SyncError &&
+        err.code === "ERROR_MUTATION_REPLAY_MISMATCH" &&
+        err.message.includes("replay mismatch")
+    );
+
+    // Mutation MUST remain intact in storage for recovery/audit
+    const pending = await storage.listPendingMutations();
+    assert.equal(pending.length, 1);
+    assert.equal(pending[0]?.mutation_id, "mut-mismatch-1");
+    assert.equal(pending[0]?.status, MutationStatus.Pending);
+
+    // No bogus conflict record was created
+    const conflicts = await storage.listConflicts(false);
+    assert.equal(conflicts.length, 0);
+  } finally {
+    globalThis.fetch = oldFetch;
+    await storage.close();
+  }
+});
+
+test("multi-edit offline scenario: two sequential local edits encounter newer remote revision", async () => {
+  const server = new MockSyncServer();
+  const oldFetch = globalThis.fetch;
+  globalThis.fetch = server.handleFetch as unknown as typeof fetch;
+
+  const storage = new IndexedDbStorage(`test-e2e-multiedit-${Date.now()}`);
+  const mockStore = createMockStorage();
+  writeVaultLink(mockStore, {
+    serverOrigin: SERVER_ORIGIN,
+    accountId: ACCOUNT_ID,
+    linkedAt: new Date().toISOString(),
+  });
+
+  try {
+    const adapter = new BrowserSyncAdapter({
+      serverOrigin: SERVER_ORIGIN,
+      token: AUTH_TOKEN,
+      accountId: ACCOUNT_ID,
+      linkStorage: mockStore,
+    });
+
+    const noteId = "note-multiedit-1";
+    // Remote is already at revision 3
+    server.objects.set(noteId, {
+      revision: 3,
+      server_seq: 7,
+      is_deleted: false,
+      envelope: createEnvelope(noteId, "remote-rev3"),
+      object_kind: 1,
+    });
+    server.currentSeq = 7;
+
+    // Client made 2 offline edits in sequence:
+    // Edit 1: expected_revision 1 -> 2
+    // Edit 2: expected_revision 2 -> 3
+    const env1 = createEnvelope(noteId, "local-offline-edit1");
+    const env2 = createEnvelope(noteId, "local-offline-edit2");
+
+    await storage.enqueueMutation({
+      mutation_id: "mut-edit-1",
+      object_id: noteId,
+      expected_revision: 1,
+      object_kind: 1,
+      mutation_type: MutationType.Upsert,
+      envelope: env1,
+      created_at: new Date(Date.now() - 5000).toISOString(),
+      retry_count: 0,
+      status: MutationStatus.Pending,
+    });
+
+    await storage.enqueueMutation({
+      mutation_id: "mut-edit-2",
+      object_id: noteId,
+      expected_revision: 2,
+      object_kind: 1,
+      mutation_type: MutationType.Upsert,
+      envelope: env2,
+      created_at: new Date().toISOString(),
+      retry_count: 0,
+      status: MutationStatus.Pending,
+    });
+
+    // Push pending mutations
+    const report = await adapter.pushMutations(storage);
+
+    // First mutation conflicted with server revision 3
+    assert.equal(report.conflicts.length, 1);
+    assert.equal(report.accepted.length, 0);
+
+    // Crucially: subsequent mutation mut-edit-2 was NOT pushed against stale state
+    assert.equal(server.objects.get(noteId)?.revision, 3);
+    assert.deepEqual(server.objects.get(noteId)?.envelope, createEnvelope(noteId, "remote-rev3"));
+
+    // Conflict record accurately reflects the conflict on edit 1 vs remote revision 3
+    const conflicts = await storage.listConflicts(false);
+    assert.equal(conflicts.length, 1);
+    assert.equal(conflicts[0]?.object_id, noteId);
+    assert.equal(conflicts[0]?.base_revision, 1);
+    assert.equal(conflicts[0]?.remote_revision, 3);
+
+    // Both mutations remain intact in local storage queue (none prematurely deleted)
+    const pending = await storage.listPendingMutations();
+    assert.equal(pending.length, 2);
+    assert.equal(pending[0]?.mutation_id, "mut-edit-1");
+    assert.equal(pending[1]?.mutation_id, "mut-edit-2");
+  } finally {
+    globalThis.fetch = oldFetch;
+    await storage.close();
+  }
+});
+
+test("multi-identity physical isolation: two identities in same browser do not leak objects, mutations, or conflicts", async () => {
+  const origin = "https://sync.example.com";
+  const aliceAccount = "acc-alice";
+  const bobAccount = "acc-bob";
+
+  const aliceDbName = getScopedDatabaseName(DEFAULT_DB_NAME, origin, aliceAccount);
+  const bobDbName = getScopedDatabaseName(DEFAULT_DB_NAME, origin, bobAccount);
+
+  assert.notEqual(aliceDbName, bobDbName);
+
+  const storageAlice = new IndexedDbStorage(aliceDbName);
+  const storageBob = new IndexedDbStorage(bobDbName);
+
+  try {
+    // 1. Populate Alice's isolated storage
+    const aliceNoteId = "note-alice-secret";
+    const aliceEnv = createEnvelope(aliceNoteId, "alice-v1");
+
+    await storageAlice.putObject({
+      object_id: aliceNoteId,
+      object_kind: 1,
+      revision: 1,
+      server_seq: 1,
+      is_deleted: false,
+      envelope: aliceEnv,
+      updated_at: new Date().toISOString(),
+    });
+
+    await storageAlice.enqueueMutation({
+      mutation_id: "mut-alice-1",
+      object_id: aliceNoteId,
+      expected_revision: 0,
+      object_kind: 1,
+      mutation_type: MutationType.Upsert,
+      envelope: aliceEnv,
+      created_at: new Date().toISOString(),
+      retry_count: 0,
+      status: MutationStatus.Pending,
+    });
+
+    await storageAlice.putConflict({
+      conflict_id: "conf-alice-1",
+      object_id: aliceNoteId,
+      object_kind: 1,
+      base_revision: 0,
+      remote_revision: 1,
+      base_envelope: null,
+      local_envelope: aliceEnv,
+      remote_envelope: aliceEnv,
+      candidate_envelope: null,
+      resolved: false,
+      remote_is_deleted: false,
+      local_is_deleted: false,
+      created_at: new Date().toISOString(),
+      resolved_at: null,
+    });
+
+    await storageAlice.setSyncState(
+      { sync_cursor: 42, last_sync_at: "2026-10-02T10:00:00Z", device_id: "dev-alice" },
+      `${origin}::${aliceAccount}`
+    );
+
+    // 2. Verify Bob's storage is completely pristine and isolated
+    const bobObjects = await storageBob.listObjects();
+    assert.equal(bobObjects.length, 0);
+
+    const bobMutations = await storageBob.listPendingMutations();
+    assert.equal(bobMutations.length, 0);
+
+    const bobConflicts = await storageBob.listConflicts(false);
+    assert.equal(bobConflicts.length, 0);
+
+    const bobSyncState = await storageBob.getSyncState(`${origin}::${bobAccount}`);
+    assert.equal(bobSyncState?.sync_cursor, 0);
+    assert.equal(bobSyncState?.last_sync_at, null);
+
+    // 3. Populate Bob's storage and verify Alice does not see Bob's data
+    const bobNoteId = "note-bob-private";
+    const bobEnv = createEnvelope(bobNoteId, "bob-v1");
+
+    await storageBob.putObject({
+      object_id: bobNoteId,
+      object_kind: 1,
+      revision: 1,
+      server_seq: 2,
+      is_deleted: false,
+      envelope: bobEnv,
+      updated_at: new Date().toISOString(),
+    });
+
+    const aliceObjects = await storageAlice.listObjects();
+    assert.equal(aliceObjects.length, 1);
+    assert.equal(aliceObjects[0]?.object_id, aliceNoteId);
+  } finally {
+    await storageAlice.close();
+    await storageBob.close();
+  }
+});
+
+test("conflict handling data-loss window: mutation is never removed before conflict record commits", async () => {
+  const server = new MockSyncServer();
+  const oldFetch = globalThis.fetch;
+  globalThis.fetch = server.handleFetch as unknown as typeof fetch;
+
+  const storage = new IndexedDbStorage(`test-e2e-dataloss-${Date.now()}`);
+  const mockStore = createMockStorage();
+  writeVaultLink(mockStore, {
+    serverOrigin: SERVER_ORIGIN,
+    accountId: ACCOUNT_ID,
+    linkedAt: new Date().toISOString(),
+  });
+
+  try {
+    const adapter = new BrowserSyncAdapter({
+      serverOrigin: SERVER_ORIGIN,
+      token: AUTH_TOKEN,
+      accountId: ACCOUNT_ID,
+      linkStorage: mockStore,
+    });
+
+    const noteId = "note-dataloss-1";
+    server.objects.set(noteId, {
+      revision: 2,
+      server_seq: 1,
+      is_deleted: false,
+      envelope: createEnvelope(noteId, "remote-rev2"),
+      object_kind: 1,
+    });
+    server.currentSeq = 1;
+
+    const localEnv = createEnvelope(noteId, "local-rev1");
+    await storage.enqueueMutation({
+      mutation_id: "mut-dataloss-1",
+      object_id: noteId,
+      expected_revision: 0,
+      object_kind: 1,
+      mutation_type: MutationType.Upsert,
+      envelope: localEnv,
+      created_at: new Date().toISOString(),
+      retry_count: 0,
+      status: MutationStatus.Pending,
+    });
+
+    // Simulate storage failure on putConflict
+    const originalPutConflict = storage.putConflict.bind(storage);
+    storage.putConflict = async () => {
+      throw new Error("Simulated IndexedDB disk failure on putConflict");
+    };
+
+    // Push should fail because conflict record could not be written
+    await assert.rejects(
+      adapter.pushMutations(storage),
+      (err: any) => err.message.includes("Simulated IndexedDB disk failure")
+    );
+
+    // Crucially: mutation MUST STILL BE IN QUEUE (no data loss!)
+    const pending = await storage.listPendingMutations();
+    assert.equal(pending.length, 1);
+    assert.equal(pending[0]?.mutation_id, "mut-dataloss-1");
+
+    // Restore putConflict
+    storage.putConflict = originalPutConflict;
   } finally {
     globalThis.fetch = oldFetch;
     await storage.close();

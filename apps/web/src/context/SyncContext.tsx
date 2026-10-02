@@ -293,7 +293,7 @@ export const SyncProvider: React.FC<SyncProviderProps> = ({
   serverAdapter: propServerAdapter,
   children,
 }) => {
-  const { storage, vaultState, vaultLink } = useVault();
+  const { storage, vaultState, vaultLink, client } = useVault();
   const { session, serverOrigin, isAuthenticated } = useAuth();
 
   const activeAdapter = useMemo(() => {
@@ -310,6 +310,7 @@ export const SyncProvider: React.FC<SyncProviderProps> = ({
         serverOrigin,
         token: session.token,
         accountId: session.accountId,
+        workerClient: client,
       });
     }
     return undefined;
@@ -320,6 +321,7 @@ export const SyncProvider: React.FC<SyncProviderProps> = ({
     session?.accountId,
     vaultLink,
     serverOrigin,
+    client,
   ]);
 
   const store = useMemo(

@@ -15,7 +15,9 @@ workspace = true
 [dependencies]
 zk-protocol = { workspace = true }
 zk-crypto = { workspace = true }
+zk-storage = { workspace = true, default-features = false }
 zk-core = { workspace = true }
+zk-sync = { workspace = true, default-features = false }
 wasm-bindgen = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

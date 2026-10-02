@@ -10,7 +10,7 @@ description = "Storage abstraction traits for encrypted notes, mutations, and sy
 workspace = true
 
 [features]
-default = ["sqlite"]
+default = []
 sqlite = ["dep:rusqlite"]
 
 [dependencies]

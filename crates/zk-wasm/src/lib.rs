@@ -26,6 +26,8 @@ use zk_crypto::vault::{
 };
 use zk_protocol::attachment::{AttachmentManifest, EncryptedChunk};
 use zk_protocol::envelope::EncryptedEnvelope;
+use zk_protocol::sync::ConflictResponse;
+use zk_storage::models::{ConflictRecord, MutationType, PendingMutation};
 
 /// Typed errors produced across the WASM boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -662,6 +664,103 @@ impl WasmVaultSession {
 
         Ok(plaintext)
     }
+
+    /// Generates a three-way merge candidate for a conflict using the active session key (ZK-053).
+    /// Decrypts BASE (if provided), LOCAL, and REMOTE envelopes, executes line-level diff3 merge,
+    /// and re-encrypts the merge candidate into an EncryptedEnvelope under the active VaultKey.
+    ///
+    /// Fails closed if the vault is locked (SEC-010).
+    pub fn generate_merge_candidate(
+        &self,
+        base_envelope_json: Option<String>,
+        local_envelope_json: &str,
+        remote_envelope_json: &str,
+    ) -> Result<String, JsValue> {
+        if !self.is_unlocked() {
+            return Err(to_js_error(WasmError::VaultLocked));
+        }
+        let key = self
+            .inner
+            .active_key()
+            .map_err(|e| to_js_error(WasmError::Crypto(e.to_string())))?;
+
+        let base_envelope: Option<EncryptedEnvelope> = match base_envelope_json {
+            Some(json) if !json.trim().is_empty() => {
+                Some(serde_json::from_str(&json).map_err(|e| to_js_error(e.to_string()))?)
+            }
+            _ => None,
+        };
+        let local_envelope: EncryptedEnvelope =
+            serde_json::from_str(local_envelope_json).map_err(|e| to_js_error(e.to_string()))?;
+        let remote_envelope: EncryptedEnvelope =
+            serde_json::from_str(remote_envelope_json).map_err(|e| to_js_error(e.to_string()))?;
+
+        let (_outcome, candidate_envelope) = zk_sync::generate_merge_candidate(
+            base_envelope.as_ref(),
+            &local_envelope,
+            &remote_envelope,
+            key,
+        )
+        .map_err(|e| to_js_error(format!("failed to generate merge candidate: {e}")))?;
+
+        serde_json::to_string(&candidate_envelope).map_err(|e| to_js_error(e.to_string()))
+    }
+
+    /// Records a conflict by creating a persistent ConflictRecord (ZK-053).
+    /// If the session is unlocked and neither side is deleted, generates a line-level diff3 merge candidate.
+    pub fn record_conflict(
+        &self,
+        mutation_json: &str,
+        conflict_json: &str,
+        base_envelope_json: Option<String>,
+    ) -> Result<String, JsValue> {
+        let mutation: PendingMutation =
+            serde_json::from_str(mutation_json).map_err(|e| to_js_error(e.to_string()))?;
+        let conflict: ConflictResponse =
+            serde_json::from_str(conflict_json).map_err(|e| to_js_error(e.to_string()))?;
+
+        let base_envelope: Option<EncryptedEnvelope> = match base_envelope_json {
+            Some(json) if !json.trim().is_empty() => {
+                Some(serde_json::from_str(&json).map_err(|e| to_js_error(e.to_string()))?)
+            }
+            _ => None,
+        };
+
+        let local_is_deleted = mutation.mutation_type == MutationType::Delete;
+        let remote_is_deleted = conflict.is_deleted;
+
+        let candidate_envelope = if local_is_deleted || remote_is_deleted || !self.is_unlocked() {
+            None
+        } else if let Ok(key) = self.inner.active_key() {
+            match zk_sync::generate_merge_candidate(
+                base_envelope.as_ref(),
+                &mutation.envelope,
+                &conflict.current_envelope,
+                key,
+            ) {
+                Ok((_outcome, env)) => Some(env),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+
+        let conflict_record = ConflictRecord::new(
+            uuid::Uuid::new_v4().to_string(),
+            &mutation.object_id,
+            mutation.object_kind,
+            mutation.expected_revision,
+            conflict.current_revision,
+            base_envelope,
+            mutation.envelope,
+            conflict.current_envelope,
+            candidate_envelope,
+            zk_core::time::now_utc_rfc3339(),
+        )
+        .with_deletion_flags(local_is_deleted, remote_is_deleted);
+
+        serde_json::to_string(&conflict_record).map_err(|e| to_js_error(e.to_string()))
+    }
 }
 
 impl Drop for WasmVaultSession {
@@ -1022,6 +1121,46 @@ pub fn wasm_calculate_chunk_count(size: f64, chunk_size: u32) -> u32 {
     zk_core::attachment::calculate_chunk_count(size as u64, chunk_size as usize)
 }
 
+/// Builds an unresolved ConflictRecord from JSON representations of a PendingMutation and ConflictResponse (ZK-053).
+/// Used across the WASM boundary when the vault session is locked or unavailable.
+#[wasm_bindgen]
+pub fn build_conflict_record(
+    mutation_json: &str,
+    conflict_json: &str,
+    base_envelope_json: Option<String>,
+) -> Result<String, JsValue> {
+    let mutation: PendingMutation =
+        serde_json::from_str(mutation_json).map_err(|e| to_js_error(e.to_string()))?;
+    let conflict: ConflictResponse =
+        serde_json::from_str(conflict_json).map_err(|e| to_js_error(e.to_string()))?;
+
+    let base_envelope: Option<EncryptedEnvelope> = match base_envelope_json {
+        Some(json) if !json.trim().is_empty() => {
+            Some(serde_json::from_str(&json).map_err(|e| to_js_error(e.to_string()))?)
+        }
+        _ => None,
+    };
+
+    let local_is_deleted = mutation.mutation_type == MutationType::Delete;
+    let remote_is_deleted = conflict.is_deleted;
+
+    let conflict_record = ConflictRecord::new(
+        uuid::Uuid::new_v4().to_string(),
+        &mutation.object_id,
+        mutation.object_kind,
+        mutation.expected_revision,
+        conflict.current_revision,
+        base_envelope,
+        mutation.envelope,
+        conflict.current_envelope,
+        None,
+        zk_core::time::now_utc_rfc3339(),
+    )
+    .with_deletion_flags(local_is_deleted, remote_is_deleted);
+
+    serde_json::to_string(&conflict_record).map_err(|e| to_js_error(e.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1259,5 +1398,109 @@ mod tests {
             Some(content_hash)
         );
         assert_eq!(dec_manifest_result.attachment_key_base64(), att_key_b64);
+    }
+
+    #[test]
+    fn test_wasm_conflict_record_and_merge_candidate() {
+        let params = KdfParams::new_test();
+        let mut init_res = init_vault_impl("conflict-passphrase", &params).expect("init vault");
+        let session = init_res.take_session().expect("take session");
+
+        let obj_id = "test-conflict-note-1";
+
+        // Create base, local, and remote envelopes with non-overlapping edits
+        let base_env_json = session
+            .encrypt_note_impl(
+                obj_id,
+                "Title",
+                "Line 1\nBase Line 2\nLine 3",
+                vec!["tag1".to_string()],
+                vec![],
+            )
+            .expect("encrypt base");
+
+        let local_env_json = session
+            .encrypt_note_impl(
+                obj_id,
+                "Title",
+                "Line 1\nLocal Line 2\nLine 3",
+                vec!["tag1".to_string(), "local_tag".to_string()],
+                vec![],
+            )
+            .expect("encrypt local");
+
+        let remote_env_json = session
+            .encrypt_note_impl(
+                obj_id,
+                "Title",
+                "Line 1\nBase Line 2\nLine 3\nRemote Line 4",
+                vec!["tag1".to_string(), "remote_tag".to_string()],
+                vec![],
+            )
+            .expect("encrypt remote");
+
+        let local_env: EncryptedEnvelope =
+            serde_json::from_str(&local_env_json).expect("parse local");
+        let remote_env: EncryptedEnvelope =
+            serde_json::from_str(&remote_env_json).expect("parse remote");
+
+        let mutation = PendingMutation {
+            mutation_id: "mut-test-1".to_string(),
+            object_id: obj_id.to_string(),
+            expected_revision: 1,
+            object_kind: 1,
+            mutation_type: MutationType::Upsert,
+            envelope: local_env,
+            created_at: "2026-10-02T12:00:00Z".to_string(),
+            retry_count: 0,
+            status: zk_storage::models::MutationStatus::Pending,
+        };
+
+        let conflict = ConflictResponse {
+            error: zk_protocol::constants::ERROR_REVISION_CONFLICT.to_string(),
+            object_id: obj_id.to_string(),
+            expected_revision: 1,
+            current_revision: 2,
+            current_server_seq: 10,
+            current_envelope: remote_env,
+            is_deleted: false,
+        };
+
+        let mutation_json = serde_json::to_string(&mutation).expect("serialize mutation");
+        let conflict_json = serde_json::to_string(&conflict).expect("serialize conflict");
+
+        // 1. Session unlocked: generates 3-way merge candidate envelope
+        let record_json = session
+            .record_conflict(&mutation_json, &conflict_json, Some(base_env_json.clone()))
+            .expect("record conflict");
+
+        let record: ConflictRecord =
+            serde_json::from_str(&record_json).expect("parse conflict record");
+        assert_eq!(record.object_id, obj_id);
+        assert_eq!(record.base_revision, 1);
+        assert_eq!(record.remote_revision, 2);
+        assert!(!record.resolved);
+        assert!(!record.local_is_deleted);
+        assert!(!record.remote_is_deleted);
+        assert!(record.candidate_envelope.is_some());
+
+        // Decrypt the candidate envelope to verify structured merge took place
+        let candidate_env_json = serde_json::to_string(&record.candidate_envelope.unwrap())
+            .expect("serialize candidate");
+        let candidate_note = session
+            .decrypt_note_impl(&candidate_env_json)
+            .expect("decrypt candidate");
+        assert_eq!(candidate_note.title(), "Title");
+        assert!(candidate_note.body().contains("Local Line 2"));
+        assert!(candidate_note.body().contains("Remote Line 4"));
+
+        // 2. Standalone builder (used when vault is locked): produces record without candidate envelope
+        let standalone_record_json =
+            build_conflict_record(&mutation_json, &conflict_json, Some(base_env_json))
+                .expect("build standalone conflict record");
+        let standalone_record: ConflictRecord =
+            serde_json::from_str(&standalone_record_json).expect("parse standalone record");
+        assert_eq!(standalone_record.object_id, obj_id);
+        assert!(standalone_record.candidate_envelope.is_none());
     }
 }

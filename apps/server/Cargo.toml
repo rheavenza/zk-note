@@ -35,10 +35,10 @@ base64ct = { workspace = true }
 blake2 = { workspace = true }
 
 [dev-dependencies]
-zk-sync = { workspace = true }
+zk-sync = { workspace = true, features = ["native-adapter"] }
 zk-core = { workspace = true }
 zk-crypto = { workspace = true }
-zk-storage = { workspace = true }
+zk-storage = { workspace = true, features = ["sqlite"] }
 
 
 
