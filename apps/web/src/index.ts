@@ -11,6 +11,7 @@ export * from "./context/VaultContext.js";
 export * from "./context/NotesContext.js";
 export * from "./context/SearchContext.js";
 export * from "./context/SyncContext.js";
+export * from "./sync/index.js";
 export * from "./context/AuthContext.js";
 export * from "./auth/webauthn.js";
 export * from "./auth/session.js";

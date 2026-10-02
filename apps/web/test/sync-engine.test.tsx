@@ -1,0 +1,1360 @@
+/**
+ * Comprehensive Sync Engine & Browser Sync Adapter Tests (ZK-106).
+ *
+ * Covers all required acceptance criteria and security invariants:
+ * 1. Clean create -> push -> pull round trip
+ * 2. Edit sync
+ * 3. Delete / tombstone sync
+ * 4. Offline edit then reconnect
+ * 5. Duplicate mutation replay (idempotent 200)
+ * 6. Lost response after server accepted mutation
+ * 7. Stale edit CAS conflict
+ * 8. Delete-vs-edit conflict
+ * 9. Pull pagination / sequence ordering
+ * 10. Cursor persistence
+ * 11. Crash between ciphertext persistence and cursor advancement
+ * 12. Browser restart with pending mutations (resetInFlightMutations)
+ * 13. Locked-vault pull (zero plaintext, ciphertext stored only)
+ * 14. Unauthorized / expired session (401 fails closed, preserves local notes)
+ * 15. Server switch isolation (OriginMismatchError)
+ * 16. Account switch isolation (WrongAccountError)
+ * 17. Two-browser offline conflict
+ * 18. Zero plaintext leakage in network payloads (SEC-001, SEC-002)
+ * 19. Zero secrets in logs (SEC-003)
+ * 20. Truthful sync UI: "Server synchronization is not configured" disappears once linked
+ */
+
+import test from "node:test";
+import assert from "node:assert/strict";
+import React from "react";
+import { renderToString } from "react-dom/server";
+import "fake-indexeddb/auto";
+
+import {
+  BrowserSyncAdapter,
+  SyncError,
+  UnauthorizedSyncError,
+  validateNoPlaintextSecrets,
+} from "../src/sync/adapter.js";
+import {
+  writeVaultLink,
+  VaultLinkRecord,
+  WrongAccountError,
+  OriginMismatchError,
+} from "../src/auth/vault-link.js";
+import { IndexedDbStorage } from "../src/storage/indexeddb.js";
+import {
+  MutationType,
+  MutationStatus,
+  EncryptedEnvelopeDto,
+  StoredEncryptedObject,
+} from "../src/storage/models.js";
+import {
+  SyncProvider,
+  useSync,
+} from "../src/context/SyncContext.js";
+import { SyncStatusIndicator } from "../src/components/SyncStatusIndicator.js";
+import { AuthProvider } from "../src/context/AuthContext.js";
+import { VaultProvider } from "../src/context/VaultContext.js";
+import { VaultWorkerClient } from "../src/worker/client.js";
+
+// ============================================================================
+// Mock Server & Helpers
+// ============================================================================
+
+const SERVER_ORIGIN = "https://sync.example.com";
+const ACCOUNT_ID = "acc-alice-1";
+const AUTH_TOKEN = "jwt-valid-token-alice";
+
+function createMockStorage(): Storage {
+  const map = new Map<string, string>();
+  return {
+    getItem: (key: string) => map.get(key) ?? null,
+    setItem: (key: string, value: string) => map.set(key, value),
+    removeItem: (key: string) => map.delete(key),
+    clear: () => map.clear(),
+    key: (i: number) => Array.from(map.keys())[i] ?? null,
+    get length() {
+      return map.size;
+    },
+  };
+}
+
+function createEnvelope(objectId: string, tag = "v1"): EncryptedEnvelopeDto {
+  return {
+    envelope_version: 1,
+    object_id: objectId,
+    object_kind: 1,
+    wrapped_key: {
+      nonce: `nonce-key-${objectId}-${tag}`,
+      ciphertext: `ct-key-${objectId}-${tag}`,
+    },
+    payload: {
+      nonce: `nonce-payload-${objectId}-${tag}`,
+      ciphertext: `ct-payload-${objectId}-${tag}`,
+    },
+  };
+}
+
+interface StoredServerObject {
+  revision: number;
+  server_seq: number;
+  is_deleted: boolean;
+  envelope: EncryptedEnvelopeDto;
+  object_kind: number;
+}
+
+class MockSyncServer {
+  public objects = new Map<string, StoredServerObject>();
+  public history: Array<{
+    server_seq: number;
+    object_id: string;
+    revision: number;
+    object_kind: number;
+    is_deleted: boolean;
+    envelope: EncryptedEnvelopeDto;
+  }> = [];
+  public acceptedMutations = new Map<string, { object_id: string; revision: number; server_seq: number }>();
+  public currentSeq = 0;
+  public networkCalls: Array<{ url: string; method: string; body?: any; headers?: any }> = [];
+  public shouldSimulateLostResponse = false;
+  public forceHttpError: number | null = null;
+
+  public handleFetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    const url = typeof input === "string" ? input : input.toString();
+    const method = init?.method || "GET";
+    const headers = (init?.headers || {}) as Record<string, string>;
+    const bodyText = init?.body ? String(init.body) : undefined;
+    const body = bodyText ? JSON.parse(bodyText) : undefined;
+
+    this.networkCalls.push({ url, method, body, headers });
+
+    // Enforce SEC-001 / SEC-002 check on every incoming payload
+    if (body) {
+      validateNoPlaintextSecrets(body);
+    }
+
+    if (this.forceHttpError) {
+      return new Response(JSON.stringify({ error: `HTTP ${this.forceHttpError}` }), {
+        status: this.forceHttpError,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    const authHeader = headers["authorization"] || headers["Authorization"];
+    if (!authHeader || !authHeader.startsWith("Bearer ") || !authHeader.includes(AUTH_TOKEN)) {
+      return new Response(JSON.stringify({ error: "Unauthorized" }), {
+        status: 401,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    if (url.endsWith("/v1/sync/push") && method === "POST") {
+      const { mutation_id, object_id, expected_revision, object_kind, envelope, is_deleted } = body;
+
+      // Check idempotency replay
+      if (this.acceptedMutations.has(mutation_id)) {
+        const replay = this.acceptedMutations.get(mutation_id)!;
+        return new Response(JSON.stringify(replay), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+
+      // Check CAS revision
+      const existing = this.objects.get(object_id);
+      const currentRev = existing ? existing.revision : 0;
+      if (currentRev !== expected_revision) {
+        return new Response(
+          JSON.stringify({
+            error: "revision_conflict",
+            object_id,
+            expected_revision,
+            current_revision: currentRev,
+            current_server_seq: existing ? existing.server_seq : 0,
+            current_envelope: existing ? existing.envelope : envelope,
+            is_deleted: existing ? existing.is_deleted : false,
+          }),
+          { status: 409, headers: { "Content-Type": "application/json" } }
+        );
+      }
+
+      // If simulating a lost response, server accepts and writes, but response drops
+      const nextRev = currentRev + 1;
+      const nextSeq = ++this.currentSeq;
+      const storedObj: StoredServerObject = {
+        revision: nextRev,
+        server_seq: nextSeq,
+        is_deleted: Boolean(is_deleted),
+        envelope,
+        object_kind,
+      };
+      this.objects.set(object_id, storedObj);
+      this.history.push({
+        server_seq: nextSeq,
+        object_id,
+        revision: nextRev,
+        object_kind,
+        is_deleted: Boolean(is_deleted),
+        envelope,
+      });
+
+      const responsePayload = {
+        object_id,
+        revision: nextRev,
+        server_seq: nextSeq,
+      };
+      this.acceptedMutations.set(mutation_id, responsePayload);
+
+      if (this.shouldSimulateLostResponse) {
+        this.shouldSimulateLostResponse = false;
+        throw new TypeError("Failed to fetch: network response lost after server write");
+      }
+
+      return new Response(JSON.stringify(responsePayload), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    if (url.includes("/v1/sync/pull")) {
+      let cursor = 0;
+      let limit = 100;
+
+      if (method === "POST" && body) {
+        cursor = Number(body.cursor ?? 0);
+        limit = Number(body.limit ?? 100);
+      } else {
+        const u = new URL(url);
+        cursor = Number(u.searchParams.get("after") ?? u.searchParams.get("cursor") ?? u.searchParams.get("since") ?? 0);
+        limit = Number(u.searchParams.get("limit") ?? 100);
+      }
+
+      const filtered = this.history.filter((h) => h.server_seq > cursor);
+      const changes = filtered.slice(0, limit);
+      const has_more = filtered.length > limit;
+      const next_cursor = changes.length > 0 ? changes[changes.length - 1]!.server_seq : cursor;
+
+      return new Response(
+        JSON.stringify({
+          changes,
+          next_cursor,
+          has_more,
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      );
+    }
+
+    return new Response(JSON.stringify({ error: "Not Found" }), { status: 404 });
+  };
+}
+
+function createMockSyncWorkerClient(): VaultWorkerClient {
+  const client: Partial<VaultWorkerClient> = {
+    getStatus: async () => ({ isUnlocked: true, sessionInitialized: true }),
+    lockVault: async () => ({ success: true as const }),
+    onLock: () => () => {},
+    dispose: () => {},
+  };
+  return client as VaultWorkerClient;
+}
+
+// ============================================================================
+// Test Suite
+// ============================================================================
+
+test("clean create -> push -> pull round trip", async () => {
+  const server = new MockSyncServer();
+  const oldFetch = globalThis.fetch;
+  globalThis.fetch = server.handleFetch as unknown as typeof fetch;
+
+  const storageA = new IndexedDbStorage(`test-e2e-create-a-${Date.now()}`);
+  const storageB = new IndexedDbStorage(`test-e2e-create-b-${Date.now()}`);
+  const mockStore = createMockStorage();
+
+  const linkRecord: VaultLinkRecord = {
+    serverOrigin: SERVER_ORIGIN,
+    accountId: ACCOUNT_ID,
+    linkedAt: new Date().toISOString(),
+  };
+  writeVaultLink(mockStore, linkRecord);
+
+  try {
+    const adapterA = new BrowserSyncAdapter({
+      serverOrigin: SERVER_ORIGIN,
+      token: AUTH_TOKEN,
+      accountId: ACCOUNT_ID,
+      linkStorage: mockStore,
+    });
+    const adapterB = new BrowserSyncAdapter({
+      serverOrigin: SERVER_ORIGIN,
+      token: AUTH_TOKEN,
+      accountId: ACCOUNT_ID,
+      linkStorage: mockStore,
+    });
+
+    // 1. Client A creates a note and enqueues a mutation
+    const noteId = "note-roundtrip-1";
+    const envelope = createEnvelope(noteId, "rev1");
+    const storedObject: StoredEncryptedObject = {
+      object_id: noteId,
+      revision: 1,
+      server_seq: 0,
+      object_kind: 1,
+      envelope,
+      is_deleted: false,
+      updated_at: new Date().toISOString(),
+    };
+    await storageA.putObject(storedObject);
+    await storageA.enqueueMutation({
+      mutation_id: "mut-create-1",
+      object_id: noteId,
+      expected_revision: 0,
+      object_kind: 1,
+      mutation_type: MutationType.Upsert,
+      envelope,
+      created_at: new Date().toISOString(),
+      retry_count: 0,
+      status: MutationStatus.Pending,
+    });
+
+    // Verify client A has 1 pending mutation
+    let pendingA = await storageA.listPendingMutations();
+    assert.equal(pendingA.length, 1);
+
+    // 2. Client A pushes via sync()
+    const syncReportA = await adapterA.sync(storageA);
+    assert.equal(syncReportA.push.accepted.length, 1);
+    assert.equal(syncReportA.push.conflicts.length, 0);
+
+    // Pending mutation is cleared from client A
+    pendingA = await storageA.listPendingMutations();
+    assert.equal(pendingA.length, 0);
+
+    // Stored object in Client A now has server_seq = 1
+    const objA = await storageA.getObject(noteId);
+    assert.ok(objA);
+    assert.equal(objA?.server_seq, 1);
+
+    // 3. Client B syncs (pulls)
+    const syncReportB = await adapterB.sync(storageB);
+    assert.equal(syncReportB.initialPull.appliedChanges, 1);
+    assert.equal(syncReportB.finalCursor, 1);
+
+    // Client B now has the encrypted object persisted
+    const objB = await storageB.getObject(noteId);
+    assert.ok(objB);
+    assert.equal(objB?.revision, 1);
+    assert.equal(objB?.server_seq, 1);
+    assert.deepEqual(objB?.envelope, envelope);
+  } finally {
+    globalThis.fetch = oldFetch;
+    await storageA.close();
+    await storageB.close();
+  }
+});
+
+test("edit sync", async () => {
+  const server = new MockSyncServer();
+  const oldFetch = globalThis.fetch;
+  globalThis.fetch = server.handleFetch as unknown as typeof fetch;
+
+  const storageA = new IndexedDbStorage(`test-e2e-edit-a-${Date.now()}`);
+  const storageB = new IndexedDbStorage(`test-e2e-edit-b-${Date.now()}`);
+  const mockStore = createMockStorage();
+  writeVaultLink(mockStore, { serverOrigin: SERVER_ORIGIN, accountId: ACCOUNT_ID, linkedAt: new Date().toISOString() });
+
+  try {
+    const adapterA = new BrowserSyncAdapter({ serverOrigin: SERVER_ORIGIN, token: AUTH_TOKEN, accountId: ACCOUNT_ID, linkStorage: mockStore });
+    const adapterB = new BrowserSyncAdapter({ serverOrigin: SERVER_ORIGIN, token: AUTH_TOKEN, accountId: ACCOUNT_ID, linkStorage: mockStore });
+
+    // Client A creates note (rev 1)
+    const noteId = "note-edit-1";
+    const env1 = createEnvelope(noteId, "rev1");
+    await storageA.putObject({
+      object_id: noteId,
+      revision: 1,
+      server_seq: 0,
+      object_kind: 1,
+      envelope: env1,
+      is_deleted: false,
+      updated_at: new Date().toISOString(),
+    });
+    await storageA.enqueueMutation({
+      mutation_id: "mut-edit-c1",
+      object_id: noteId,
+      expected_revision: 0,
+      object_kind: 1,
+      mutation_type: MutationType.Upsert,
+      envelope: env1,
+      created_at: new Date().toISOString(),
+      retry_count: 0,
+      status: MutationStatus.Pending,
+    });
+    await adapterA.sync(storageA);
+
+    // Client B pulls rev 1
+    await adapterB.sync(storageB);
+    const objBRev1 = await storageB.getObject(noteId);
+    assert.equal(objBRev1?.revision, 1);
+
+    // Client A edits note (rev 1 -> 2)
+    const env2 = createEnvelope(noteId, "rev2");
+    await storageA.putObject({
+      object_id: noteId,
+      revision: 2,
+      server_seq: 1,
+      object_kind: 1,
+      envelope: env2,
+      is_deleted: false,
+      updated_at: new Date().toISOString(),
+    });
+    await storageA.enqueueMutation({
+      mutation_id: "mut-edit-u1",
+      object_id: noteId,
+      expected_revision: 1,
+      object_kind: 1,
+      mutation_type: MutationType.Upsert,
+      envelope: env2,
+      created_at: new Date().toISOString(),
+      retry_count: 0,
+      status: MutationStatus.Pending,
+    });
+    await adapterA.sync(storageA);
+
+    // Client B pulls edit
+    await adapterB.sync(storageB);
+    const objBRev2 = await storageB.getObject(noteId);
+    assert.equal(objBRev2?.revision, 2);
+    assert.deepEqual(objBRev2?.envelope, env2);
+  } finally {
+    globalThis.fetch = oldFetch;
+    await storageA.close();
+    await storageB.close();
+  }
+});
+
+test("delete/tombstone sync", async () => {
+  const server = new MockSyncServer();
+  const oldFetch = globalThis.fetch;
+  globalThis.fetch = server.handleFetch as unknown as typeof fetch;
+
+  const storageA = new IndexedDbStorage(`test-e2e-del-a-${Date.now()}`);
+  const storageB = new IndexedDbStorage(`test-e2e-del-b-${Date.now()}`);
+  const mockStore = createMockStorage();
+  writeVaultLink(mockStore, { serverOrigin: SERVER_ORIGIN, accountId: ACCOUNT_ID, linkedAt: new Date().toISOString() });
+
+  try {
+    const adapterA = new BrowserSyncAdapter({ serverOrigin: SERVER_ORIGIN, token: AUTH_TOKEN, accountId: ACCOUNT_ID, linkStorage: mockStore });
+    const adapterB = new BrowserSyncAdapter({ serverOrigin: SERVER_ORIGIN, token: AUTH_TOKEN, accountId: ACCOUNT_ID, linkStorage: mockStore });
+
+    const noteId = "note-del-1";
+    const env1 = createEnvelope(noteId, "rev1");
+    await storageA.putObject({
+      object_id: noteId,
+      revision: 1,
+      server_seq: 0,
+      object_kind: 1,
+      envelope: env1,
+      is_deleted: false,
+      updated_at: new Date().toISOString(),
+    });
+    await storageA.enqueueMutation({
+      mutation_id: "mut-del-c1",
+      object_id: noteId,
+      expected_revision: 0,
+      object_kind: 1,
+      mutation_type: MutationType.Upsert,
+      envelope: env1,
+      created_at: new Date().toISOString(),
+      retry_count: 0,
+      status: MutationStatus.Pending,
+    });
+    await adapterA.sync(storageA);
+    await adapterB.sync(storageB);
+
+    // Client A deletes note (tombstone)
+    await storageA.markDeleted(noteId, 2, env1, new Date().toISOString());
+    await storageA.enqueueMutation({
+      mutation_id: "mut-del-d1",
+      object_id: noteId,
+      expected_revision: 1,
+      object_kind: 1,
+      mutation_type: MutationType.Delete,
+      envelope: env1,
+      created_at: new Date().toISOString(),
+      retry_count: 0,
+      status: MutationStatus.Pending,
+    });
+    await adapterA.sync(storageA);
+
+    // Client B pulls deletion
+    await adapterB.sync(storageB);
+    const objB = await storageB.getObject(noteId);
+    assert.ok(objB);
+    assert.equal(objB?.is_deleted, true);
+    assert.equal(objB?.revision, 2);
+  } finally {
+    globalThis.fetch = oldFetch;
+    await storageA.close();
+    await storageB.close();
+  }
+});
+
+test("offline edit then reconnect", async () => {
+  const server = new MockSyncServer();
+  const oldFetch = globalThis.fetch;
+  globalThis.fetch = server.handleFetch as unknown as typeof fetch;
+
+  const storage = new IndexedDbStorage(`test-e2e-offline-${Date.now()}`);
+  const mockStore = createMockStorage();
+  writeVaultLink(mockStore, { serverOrigin: SERVER_ORIGIN, accountId: ACCOUNT_ID, linkedAt: new Date().toISOString() });
+
+  try {
+    const adapter = new BrowserSyncAdapter({ serverOrigin: SERVER_ORIGIN, token: AUTH_TOKEN, accountId: ACCOUNT_ID, linkStorage: mockStore });
+
+    // Server is down / offline
+    server.forceHttpError = 503;
+
+    const env = createEnvelope("note-offline-1", "rev1");
+    await storage.enqueueMutation({
+      mutation_id: "mut-offline-1",
+      object_id: "note-offline-1",
+      expected_revision: 0,
+      object_kind: 1,
+      mutation_type: MutationType.Upsert,
+      envelope: env,
+      created_at: new Date().toISOString(),
+      retry_count: 0,
+      status: MutationStatus.Pending,
+    });
+
+    // Push fails
+    await assert.rejects(
+      adapter.sync(storage),
+      (err: any) => err instanceof SyncError
+    );
+
+    // Mutation remains intact in pending queue
+    let pending = await storage.listPendingMutations();
+    assert.equal(pending.length, 1);
+    assert.equal(pending[0]?.status, MutationStatus.Pending);
+
+    // Server comes back online
+    server.forceHttpError = null;
+
+    // Retry sync
+    const report = await adapter.sync(storage);
+    assert.equal(report.push.accepted.length, 1);
+
+    // Mutation is cleared
+    pending = await storage.listPendingMutations();
+    assert.equal(pending.length, 0);
+  } finally {
+    globalThis.fetch = oldFetch;
+    await storage.close();
+  }
+});
+
+test("duplicate mutation replay is idempotent", async () => {
+  const server = new MockSyncServer();
+  const oldFetch = globalThis.fetch;
+  globalThis.fetch = server.handleFetch as unknown as typeof fetch;
+
+  const storage = new IndexedDbStorage(`test-e2e-replay-${Date.now()}`);
+  const mockStore = createMockStorage();
+  writeVaultLink(mockStore, { serverOrigin: SERVER_ORIGIN, accountId: ACCOUNT_ID, linkedAt: new Date().toISOString() });
+
+  try {
+    const adapter = new BrowserSyncAdapter({ serverOrigin: SERVER_ORIGIN, token: AUTH_TOKEN, accountId: ACCOUNT_ID, linkStorage: mockStore });
+
+    const noteId = "note-replay-1";
+    const env = createEnvelope(noteId, "rev1");
+    const mutation = {
+      mutation_id: "mut-stable-id-1",
+      object_id: noteId,
+      expected_revision: 0,
+      object_kind: 1,
+      envelope: env,
+      is_deleted: false,
+    };
+
+    // First push
+    const res1 = await adapter.pushMutation(mutation);
+    assert.equal(res1.revision, 1);
+    assert.equal(res1.server_seq, 1);
+
+    // Replay exact same mutation
+    const res2 = await adapter.pushMutation(mutation);
+    assert.equal(res2.revision, 1);
+    assert.equal(res2.server_seq, 1);
+
+    // Server still only has 1 sequence and 1 object revision
+    assert.equal(server.currentSeq, 1);
+    assert.equal(server.objects.get(noteId)?.revision, 1);
+  } finally {
+    globalThis.fetch = oldFetch;
+    await storage.close();
+  }
+});
+
+test("lost response after server accepted mutation", async () => {
+  const server = new MockSyncServer();
+  const oldFetch = globalThis.fetch;
+  globalThis.fetch = server.handleFetch as unknown as typeof fetch;
+
+  const storage = new IndexedDbStorage(`test-e2e-lost-resp-${Date.now()}`);
+  const mockStore = createMockStorage();
+  writeVaultLink(mockStore, { serverOrigin: SERVER_ORIGIN, accountId: ACCOUNT_ID, linkedAt: new Date().toISOString() });
+
+  try {
+    const adapter = new BrowserSyncAdapter({ serverOrigin: SERVER_ORIGIN, token: AUTH_TOKEN, accountId: ACCOUNT_ID, linkStorage: mockStore });
+
+    const noteId = "note-lost-1";
+    const env = createEnvelope(noteId, "rev1");
+    await storage.enqueueMutation({
+      mutation_id: "mut-lost-resp-1",
+      object_id: noteId,
+      expected_revision: 0,
+      object_kind: 1,
+      mutation_type: MutationType.Upsert,
+      envelope: env,
+      created_at: new Date().toISOString(),
+      retry_count: 0,
+      status: MutationStatus.Pending,
+    });
+
+    // Simulate lost response: server accepts mutation, but network drops before response reaches client
+    server.shouldSimulateLostResponse = true;
+
+    await assert.rejects(
+      adapter.sync(storage),
+      (err: any) => err instanceof SyncError && err.message.includes("network response lost")
+    );
+
+    // Mutation remains pending in storage (was reset from in-flight on failure)
+    let pending = await storage.listPendingMutations();
+    assert.equal(pending.length, 1);
+
+    // On next sync cycle, client retries exact same mutation
+    const report = await adapter.sync(storage);
+    assert.equal(report.push.accepted.length, 1);
+    assert.equal(report.push.conflicts.length, 0);
+
+    // Mutation successfully cleared without creating a duplicate revision
+    pending = await storage.listPendingMutations();
+    assert.equal(pending.length, 0);
+    assert.equal(server.objects.get(noteId)?.revision, 1);
+  } finally {
+    globalThis.fetch = oldFetch;
+    await storage.close();
+  }
+});
+
+test("stale edit CAS conflict creates actionable conflict record", async () => {
+  const server = new MockSyncServer();
+  const oldFetch = globalThis.fetch;
+  globalThis.fetch = server.handleFetch as unknown as typeof fetch;
+
+  const storage = new IndexedDbStorage(`test-e2e-stale-cas-${Date.now()}`);
+  const mockStore = createMockStorage();
+  writeVaultLink(mockStore, { serverOrigin: SERVER_ORIGIN, accountId: ACCOUNT_ID, linkedAt: new Date().toISOString() });
+
+  try {
+    const adapter = new BrowserSyncAdapter({ serverOrigin: SERVER_ORIGIN, token: AUTH_TOKEN, accountId: ACCOUNT_ID, linkStorage: mockStore });
+
+    const noteId = "note-cas-1";
+    // Remote is already at revision 2
+    server.objects.set(noteId, {
+      revision: 2,
+      server_seq: 2,
+      is_deleted: false,
+      envelope: createEnvelope(noteId, "remote-rev2"),
+      object_kind: 1,
+    });
+    server.currentSeq = 2;
+
+    // Client attempts to push with stale expected_revision 1
+    const localEnvelope = createEnvelope(noteId, "local-stale-rev2");
+    await storage.putObject({
+      object_id: noteId,
+      revision: 2,
+      server_seq: 1,
+      object_kind: 1,
+      envelope: localEnvelope,
+      is_deleted: false,
+      updated_at: new Date().toISOString(),
+    });
+    await storage.enqueueMutation({
+      mutation_id: "mut-stale-1",
+      object_id: noteId,
+      expected_revision: 1,
+      object_kind: 1,
+      mutation_type: MutationType.Upsert,
+      envelope: localEnvelope,
+      created_at: new Date().toISOString(),
+      retry_count: 0,
+      status: MutationStatus.Pending,
+    });
+
+    const report = await adapter.pushMutations(storage);
+    assert.equal(report.conflicts.length, 1);
+    assert.equal(report.accepted.length, 0);
+
+    // Conflict record preserved in storage
+    const conflicts = await storage.listConflicts(false);
+    assert.equal(conflicts.length, 1);
+    assert.equal(conflicts[0]?.object_id, noteId);
+    assert.equal(conflicts[0]?.base_revision, 1);
+    assert.equal(conflicts[0]?.remote_revision, 2);
+    assert.deepEqual(conflicts[0]?.local_envelope, localEnvelope);
+
+    // Pending mutation is cleared so it won't spin forever
+    const pending = await storage.listPendingMutations();
+    assert.equal(pending.length, 0);
+  } finally {
+    globalThis.fetch = oldFetch;
+    await storage.close();
+  }
+});
+
+test("delete-vs-edit conflict", async () => {
+  const server = new MockSyncServer();
+  const oldFetch = globalThis.fetch;
+  globalThis.fetch = server.handleFetch as unknown as typeof fetch;
+
+  const storage = new IndexedDbStorage(`test-e2e-del-vs-edit-${Date.now()}`);
+  const mockStore = createMockStorage();
+  writeVaultLink(mockStore, { serverOrigin: SERVER_ORIGIN, accountId: ACCOUNT_ID, linkedAt: new Date().toISOString() });
+
+  try {
+    const adapter = new BrowserSyncAdapter({ serverOrigin: SERVER_ORIGIN, token: AUTH_TOKEN, accountId: ACCOUNT_ID, linkStorage: mockStore });
+
+    const noteId = "note-dve-1";
+    // Remote was edited to revision 2
+    server.objects.set(noteId, {
+      revision: 2,
+      server_seq: 5,
+      is_deleted: false,
+      envelope: createEnvelope(noteId, "remote-edited-rev2"),
+      object_kind: 1,
+    });
+    server.currentSeq = 5;
+
+    // Client had deleted with expected_revision 1
+    const tombstoneEnv = createEnvelope(noteId, "local-tombstone");
+    await storage.enqueueMutation({
+      mutation_id: "mut-dve-del-1",
+      object_id: noteId,
+      expected_revision: 1,
+      object_kind: 1,
+      mutation_type: MutationType.Delete,
+      envelope: tombstoneEnv,
+      created_at: new Date().toISOString(),
+      retry_count: 0,
+      status: MutationStatus.Pending,
+    });
+
+    const report = await adapter.pushMutations(storage);
+    assert.equal(report.conflicts.length, 1);
+
+    const conflicts = await storage.listConflicts(false);
+    assert.equal(conflicts.length, 1);
+    assert.equal(conflicts[0]?.object_id, noteId);
+    assert.equal(conflicts[0]?.remote_revision, 2);
+  } finally {
+    globalThis.fetch = oldFetch;
+    await storage.close();
+  }
+});
+
+test("pull pagination / sequence ordering", async () => {
+  const server = new MockSyncServer();
+  const oldFetch = globalThis.fetch;
+  globalThis.fetch = server.handleFetch as unknown as typeof fetch;
+
+  const storage = new IndexedDbStorage(`test-e2e-pagination-${Date.now()}`);
+  const mockStore = createMockStorage();
+  writeVaultLink(mockStore, { serverOrigin: SERVER_ORIGIN, accountId: ACCOUNT_ID, linkedAt: new Date().toISOString() });
+
+  try {
+    const adapter = new BrowserSyncAdapter({ serverOrigin: SERVER_ORIGIN, token: AUTH_TOKEN, accountId: ACCOUNT_ID, linkStorage: mockStore });
+
+    // Populate 5 history entries on server
+    for (let i = 1; i <= 5; i++) {
+      const noteId = `note-page-${i}`;
+      server.history.push({
+        server_seq: i,
+        object_id: noteId,
+        revision: 1,
+        object_kind: 1,
+        is_deleted: false,
+        envelope: createEnvelope(noteId, "rev1"),
+      });
+    }
+
+    // Pull with page size limit = 2
+    const report = await adapter.pullChangesToStorage(storage, undefined, 2);
+    assert.equal(report.pagesFetched, 3);
+    assert.equal(report.totalChanges, 5);
+    assert.equal(report.appliedChanges, 5);
+    assert.equal(report.initialCursor, 0);
+    assert.equal(report.finalCursor, 5);
+
+    // All 5 objects are persisted
+    for (let i = 1; i <= 5; i++) {
+      const obj = await storage.getObject(`note-page-${i}`);
+      assert.ok(obj);
+      assert.equal(obj?.server_seq, i);
+    }
+  } finally {
+    globalThis.fetch = oldFetch;
+    await storage.close();
+  }
+});
+
+test("cursor persistence and resumption", async () => {
+  const server = new MockSyncServer();
+  const oldFetch = globalThis.fetch;
+  globalThis.fetch = server.handleFetch as unknown as typeof fetch;
+
+  const storage = new IndexedDbStorage(`test-e2e-cursor-persist-${Date.now()}`);
+  const mockStore = createMockStorage();
+  writeVaultLink(mockStore, { serverOrigin: SERVER_ORIGIN, accountId: ACCOUNT_ID, linkedAt: new Date().toISOString() });
+
+  try {
+    const adapter = new BrowserSyncAdapter({ serverOrigin: SERVER_ORIGIN, token: AUTH_TOKEN, accountId: ACCOUNT_ID, linkStorage: mockStore });
+
+    server.history.push({
+      server_seq: 1,
+      object_id: "note-cp-1",
+      revision: 1,
+      object_kind: 1,
+      is_deleted: false,
+      envelope: createEnvelope("note-cp-1"),
+    });
+
+    await adapter.sync(storage);
+
+    // Cursor is persisted in storage
+    const state = await storage.getSyncState(adapter.identity);
+    assert.equal(state?.sync_cursor, 1);
+    assert.ok(state?.last_sync_at);
+
+    // Add another item
+    server.history.push({
+      server_seq: 2,
+      object_id: "note-cp-2",
+      revision: 1,
+      object_kind: 1,
+      is_deleted: false,
+      envelope: createEnvelope("note-cp-2"),
+    });
+
+    // Next sync resumes from cursor 1 and fetches only item 2
+    server.networkCalls = [];
+    await adapter.sync(storage);
+
+    const pullCalls = server.networkCalls.filter((c) => c.url.includes("/v1/sync/pull"));
+    assert.ok(pullCalls.length > 0);
+    const pullUrl = new URL(pullCalls[0]!.url);
+    assert.equal(pullUrl.searchParams.get("after"), "1");
+
+    const updatedState = await storage.getSyncState(adapter.identity);
+    assert.equal(updatedState?.sync_cursor, 2);
+  } finally {
+    globalThis.fetch = oldFetch;
+    await storage.close();
+  }
+});
+
+test("crash between ciphertext persistence and cursor advancement does not skip changes", async () => {
+  const server = new MockSyncServer();
+  const oldFetch = globalThis.fetch;
+  globalThis.fetch = server.handleFetch as unknown as typeof fetch;
+
+  const storage = new IndexedDbStorage(`test-e2e-crash-recovery-${Date.now()}`);
+  const mockStore = createMockStorage();
+  writeVaultLink(mockStore, { serverOrigin: SERVER_ORIGIN, accountId: ACCOUNT_ID, linkedAt: new Date().toISOString() });
+
+  try {
+    const adapter = new BrowserSyncAdapter({ serverOrigin: SERVER_ORIGIN, token: AUTH_TOKEN, accountId: ACCOUNT_ID, linkStorage: mockStore });
+
+    server.history.push({
+      server_seq: 1,
+      object_id: "note-crash-1",
+      revision: 1,
+      object_kind: 1,
+      is_deleted: false,
+      envelope: createEnvelope("note-crash-1"),
+    });
+
+    // Monkey-patch setSyncCursor to simulate crash right after object persistence
+    let crashTriggered = false;
+    const originalSetSyncCursor = storage.setSyncCursor.bind(storage);
+    storage.setSyncCursor = async (cursor, identity) => {
+      if (!crashTriggered) {
+        crashTriggered = true;
+        throw new Error("Simulated storage crash during cursor commit");
+      }
+      return originalSetSyncCursor(cursor, identity);
+    };
+
+    await assert.rejects(
+      adapter.pullChangesToStorage(storage),
+      (err: any) => err.message.includes("Simulated storage crash")
+    );
+
+    // Object 1 was stored, but cursor was NOT advanced (still 0)
+    const storedObj = await storage.getObject("note-crash-1");
+    assert.ok(storedObj);
+    const syncState = await storage.getSyncState(adapter.identity);
+    assert.equal(syncState?.sync_cursor ?? 0, 0);
+
+    // On restart / subsequent pull, resumes from cursor 0 cleanly without skipping
+    const recoveryReport = await adapter.pullChangesToStorage(storage);
+    assert.equal(recoveryReport.finalCursor, 1);
+    const finalState = await storage.getSyncState(adapter.identity);
+    assert.equal(finalState?.sync_cursor, 1);
+  } finally {
+    globalThis.fetch = oldFetch;
+    await storage.close();
+  }
+});
+
+test("browser restart with pending mutations resets in-flight status", async () => {
+  const storage = new IndexedDbStorage(`test-e2e-restart-${Date.now()}`);
+
+  try {
+    // Simulate mutation left in "in-flight" status due to browser crash/close
+    await storage.enqueueMutation({
+      mutation_id: "mut-crash-inflight",
+      object_id: "note-crash-inflight",
+      expected_revision: 0,
+      object_kind: 1,
+      mutation_type: MutationType.Upsert,
+      envelope: createEnvelope("note-crash-inflight"),
+      created_at: new Date().toISOString(),
+      retry_count: 0,
+      status: MutationStatus.InFlight,
+    });
+
+    let pending = await storage.listPendingMutations();
+    assert.equal(pending.length, 0); // InFlight is not in pending list
+
+    // On browser startup / storage init:
+    const resetCount = await storage.resetInFlightMutations();
+    assert.equal(resetCount, 1);
+
+    // Mutation is now Pending again and ready for sync
+    pending = await storage.listPendingMutations();
+    assert.equal(pending.length, 1);
+    assert.equal(pending[0]?.status, MutationStatus.Pending);
+  } finally {
+    await storage.close();
+  }
+});
+
+test("locked-vault pull: fetches and persists ciphertext only, zero plaintext, zero decryption", async () => {
+  const server = new MockSyncServer();
+  const oldFetch = globalThis.fetch;
+  globalThis.fetch = server.handleFetch as unknown as typeof fetch;
+
+  const storage = new IndexedDbStorage(`test-e2e-locked-pull-${Date.now()}`);
+  const mockStore = createMockStorage();
+  writeVaultLink(mockStore, { serverOrigin: SERVER_ORIGIN, accountId: ACCOUNT_ID, linkedAt: new Date().toISOString() });
+
+  try {
+    const adapter = new BrowserSyncAdapter({ serverOrigin: SERVER_ORIGIN, token: AUTH_TOKEN, accountId: ACCOUNT_ID, linkStorage: mockStore });
+
+    server.history.push({
+      server_seq: 1,
+      object_id: "note-locked-1",
+      revision: 1,
+      object_kind: 1,
+      is_deleted: false,
+      envelope: createEnvelope("note-locked-1", "secret-payload"),
+    });
+
+    // Vault is LOCKED (no vault worker, no keys in memory). Pull executes.
+    const report = await adapter.pullChangesToStorage(storage);
+    assert.equal(report.appliedChanges, 1);
+    assert.equal(report.finalCursor, 1);
+
+    // Verify stored object contains ONLY the encrypted envelope, no plaintext fields
+    const stored = await storage.getObject("note-locked-1");
+    assert.ok(stored);
+    assert.equal((stored as any).title, undefined);
+    assert.equal((stored as any).body, undefined);
+    assert.equal((stored as any).tags, undefined);
+    assert.ok(stored?.envelope.payload.ciphertext.includes("ct-payload-note-locked-1"));
+  } finally {
+    globalThis.fetch = oldFetch;
+    await storage.close();
+  }
+});
+
+test("unauthorized / expired session: fails closed with UnauthorizedSyncError, preserves local notes", async () => {
+  const server = new MockSyncServer();
+  const oldFetch = globalThis.fetch;
+  globalThis.fetch = server.handleFetch as unknown as typeof fetch;
+
+  const storage = new IndexedDbStorage(`test-e2e-unauthorized-${Date.now()}`);
+  const mockStore = createMockStorage();
+  writeVaultLink(mockStore, { serverOrigin: SERVER_ORIGIN, accountId: ACCOUNT_ID, linkedAt: new Date().toISOString() });
+
+  try {
+    // Use invalid/expired token
+    const adapter = new BrowserSyncAdapter({
+      serverOrigin: SERVER_ORIGIN,
+      token: "expired-token",
+      accountId: ACCOUNT_ID,
+      linkStorage: mockStore,
+    });
+
+    const env = createEnvelope("note-unauth-1");
+    await storage.putObject({
+      object_id: "note-unauth-1",
+      revision: 1,
+      server_seq: 0,
+      object_kind: 1,
+      envelope: env,
+      is_deleted: false,
+      updated_at: new Date().toISOString(),
+    });
+    await storage.enqueueMutation({
+      mutation_id: "mut-unauth-1",
+      object_id: "note-unauth-1",
+      expected_revision: 0,
+      object_kind: 1,
+      mutation_type: MutationType.Upsert,
+      envelope: env,
+      created_at: new Date().toISOString(),
+      retry_count: 0,
+      status: MutationStatus.Pending,
+    });
+
+    await assert.rejects(
+      adapter.sync(storage),
+      (err: any) => err instanceof UnauthorizedSyncError
+    );
+
+    // Local encrypted notes and pending mutation queue remain fully intact!
+    const obj = await storage.getObject("note-unauth-1");
+    assert.ok(obj);
+    const pending = await storage.listPendingMutations();
+    assert.equal(pending.length, 1);
+  } finally {
+    globalThis.fetch = oldFetch;
+    await storage.close();
+  }
+});
+
+test("server switch isolation: OriginMismatchError stops sync before network", async () => {
+  const storage = new IndexedDbStorage(`test-e2e-server-switch-${Date.now()}`);
+  const mockStore = createMockStorage();
+
+  try {
+    // Vault is linked to server A
+    writeVaultLink(mockStore, {
+      serverOrigin: "https://server-a.com",
+      accountId: ACCOUNT_ID,
+      linkedAt: new Date().toISOString(),
+    });
+
+    // Adapter configured for server B
+    const adapterB = new BrowserSyncAdapter({
+      serverOrigin: "https://server-b.com",
+      token: AUTH_TOKEN,
+      accountId: ACCOUNT_ID,
+      linkStorage: mockStore,
+    });
+
+    assert.throws(
+      () => adapterB.assertLinkedStorage(storage),
+      (err: any) => err instanceof OriginMismatchError
+    );
+  } finally {
+    await storage.close();
+  }
+});
+
+test("account switch isolation: WrongAccountError stops sync before network", async () => {
+  const storage = new IndexedDbStorage(`test-e2e-account-switch-${Date.now()}`);
+  const mockStore = createMockStorage();
+
+  try {
+    // Vault is linked to account A
+    writeVaultLink(mockStore, {
+      serverOrigin: SERVER_ORIGIN,
+      accountId: "acc-alice-1",
+      linkedAt: new Date().toISOString(),
+    });
+
+    // Adapter configured for account B
+    const adapterB = new BrowserSyncAdapter({
+      serverOrigin: SERVER_ORIGIN,
+      token: AUTH_TOKEN,
+      accountId: "acc-bob-2",
+      linkStorage: mockStore,
+    });
+
+    assert.throws(
+      () => adapterB.assertLinkedStorage(storage),
+      (err: any) => err instanceof WrongAccountError
+    );
+  } finally {
+    await storage.close();
+  }
+});
+
+test("two-browser offline conflict produces conflict record", async () => {
+  const server = new MockSyncServer();
+  const oldFetch = globalThis.fetch;
+  globalThis.fetch = server.handleFetch as unknown as typeof fetch;
+
+  const storageA = new IndexedDbStorage(`test-e2e-2b-a-${Date.now()}`);
+  const storageB = new IndexedDbStorage(`test-e2e-2b-b-${Date.now()}`);
+  const mockStore = createMockStorage();
+  writeVaultLink(mockStore, { serverOrigin: SERVER_ORIGIN, accountId: ACCOUNT_ID, linkedAt: new Date().toISOString() });
+
+  try {
+    const adapterA = new BrowserSyncAdapter({ serverOrigin: SERVER_ORIGIN, token: AUTH_TOKEN, accountId: ACCOUNT_ID, linkStorage: mockStore });
+    const adapterB = new BrowserSyncAdapter({ serverOrigin: SERVER_ORIGIN, token: AUTH_TOKEN, accountId: ACCOUNT_ID, linkStorage: mockStore });
+
+    const noteId = "note-2b-1";
+    const envRev1 = createEnvelope(noteId, "rev1");
+
+    // Both start at rev 1
+    await storageA.putObject({
+      object_id: noteId,
+      revision: 1,
+      server_seq: 0,
+      object_kind: 1,
+      envelope: envRev1,
+      is_deleted: false,
+      updated_at: new Date().toISOString(),
+    });
+    await storageA.enqueueMutation({
+      mutation_id: "mut-2b-c1",
+      object_id: noteId,
+      expected_revision: 0,
+      object_kind: 1,
+      mutation_type: MutationType.Upsert,
+      envelope: envRev1,
+      created_at: new Date().toISOString(),
+      retry_count: 0,
+      status: MutationStatus.Pending,
+    });
+    await adapterA.sync(storageA);
+    await adapterB.sync(storageB);
+
+    // Browser A edits offline (rev 2) and syncs
+    const envA2 = createEnvelope(noteId, "rev2-browserA");
+    await storageA.putObject({
+      object_id: noteId,
+      revision: 2,
+      server_seq: 1,
+      object_kind: 1,
+      envelope: envA2,
+      is_deleted: false,
+      updated_at: new Date().toISOString(),
+    });
+    await storageA.enqueueMutation({
+      mutation_id: "mut-2b-uA2",
+      object_id: noteId,
+      expected_revision: 1,
+      object_kind: 1,
+      mutation_type: MutationType.Upsert,
+      envelope: envA2,
+      created_at: new Date().toISOString(),
+      retry_count: 0,
+      status: MutationStatus.Pending,
+    });
+    await adapterA.sync(storageA);
+    assert.equal(server.objects.get(noteId)?.revision, 2);
+
+    // Browser B also edited offline (rev 2 with expected_revision 1) and syncs
+    const envB2 = createEnvelope(noteId, "rev2-browserB");
+    await storageB.putObject({
+      object_id: noteId,
+      revision: 2,
+      server_seq: 1,
+      object_kind: 1,
+      envelope: envB2,
+      is_deleted: false,
+      updated_at: new Date().toISOString(),
+    });
+    await storageB.enqueueMutation({
+      mutation_id: "mut-2b-uB2",
+      object_id: noteId,
+      expected_revision: 1,
+      object_kind: 1,
+      mutation_type: MutationType.Upsert,
+      envelope: envB2,
+      created_at: new Date().toISOString(),
+      retry_count: 0,
+      status: MutationStatus.Pending,
+    });
+
+    // Browser B sync detects CAS conflict
+    const reportB = await adapterB.sync(storageB);
+    assert.equal(reportB.push.conflicts.length, 1);
+
+    // Browser B has conflict record
+    const conflictsB = await storageB.listConflicts(false);
+    assert.equal(conflictsB.length, 1);
+    assert.equal(conflictsB[0]?.object_id, noteId);
+    assert.equal(conflictsB[0]?.base_revision, 1);
+    assert.equal(conflictsB[0]?.remote_revision, 2);
+  } finally {
+    globalThis.fetch = oldFetch;
+    await storageA.close();
+    await storageB.close();
+  }
+});
+
+test("Zero plaintext in request fixtures (SEC-001/SEC-002)", () => {
+  // Push request with forbidden field must throw immediately
+  const badPayloads = [
+    { mutation_id: "m1", object_id: "n1", expected_revision: 0, title: "Secret Note" },
+    { mutation_id: "m1", object_id: "n1", expected_revision: 0, body: "My plain note text" },
+    { mutation_id: "m1", object_id: "n1", expected_revision: 0, tags: ["private"] },
+    { mutation_id: "m1", object_id: "n1", expected_revision: 0, passphrase: "password123" },
+    { mutation_id: "m1", object_id: "n1", expected_revision: 0, vault_key: "raw-key-bytes" },
+  ];
+
+  for (const payload of badPayloads) {
+    assert.throws(
+      () => validateNoPlaintextSecrets(payload),
+      (err: any) => err.message.includes("SEC-001/SEC-002 violation")
+    );
+  }
+
+  // Valid opaque envelope payload passes
+  const validPayload = {
+    mutation_id: "m1",
+    object_id: "n1",
+    expected_revision: 0,
+    object_kind: 1,
+    envelope: createEnvelope("n1"),
+    is_deleted: false,
+  };
+  assert.doesNotThrow(() => validateNoPlaintextSecrets(validPayload));
+});
+
+test("Zero secrets in logs (SEC-003)", async () => {
+  const loggedMessages: string[] = [];
+  const originalLog = console.log;
+  const originalWarn = console.warn;
+  const originalError = console.error;
+
+  console.log = (...args) => loggedMessages.push(args.join(" "));
+  console.warn = (...args) => loggedMessages.push(args.join(" "));
+  console.error = (...args) => loggedMessages.push(args.join(" "));
+
+  const storage = new IndexedDbStorage(`test-e2e-logs-${Date.now()}`);
+  const mockStore = createMockStorage();
+  writeVaultLink(mockStore, { serverOrigin: SERVER_ORIGIN, accountId: ACCOUNT_ID, linkedAt: new Date().toISOString() });
+
+  try {
+    const adapter = new BrowserSyncAdapter({
+      serverOrigin: SERVER_ORIGIN,
+      token: AUTH_TOKEN,
+      accountId: ACCOUNT_ID,
+      linkStorage: mockStore,
+    });
+
+    try {
+      await adapter.sync(storage);
+    } catch {
+      // Ignore network errors
+    }
+
+    const allLogs = loggedMessages.join("\n");
+    assert.doesNotMatch(allLogs, new RegExp(AUTH_TOKEN));
+    assert.doesNotMatch(allLogs, /passphrase|vault_key|private_key/i);
+  } finally {
+    console.log = originalLog;
+    console.warn = originalWarn;
+    console.error = originalError;
+    await storage.close();
+  }
+});
+
+test("Sync Now no longer reports 'server synchronization is not configured' once authenticated & linked", async () => {
+  const server = new MockSyncServer();
+  const oldFetch = globalThis.fetch;
+  globalThis.fetch = server.handleFetch as unknown as typeof fetch;
+
+  const storage = new IndexedDbStorage(`test-e2e-syncnow-linked-${Date.now()}`);
+  const client = createMockSyncWorkerClient();
+  const mockStore = createMockStorage();
+
+  try {
+    // 1. Unlinked state: syncNow reports "Server synchronization is not configured"
+    let syncRef: ReturnType<typeof useSync> | null = null;
+    const Consumer: React.FC = () => {
+      syncRef = useSync();
+      return <SyncStatusIndicator />;
+    };
+
+    renderToString(
+      <AuthProvider serverUrl={SERVER_ORIGIN} initialSession={null}>
+        <VaultProvider client={client} storage={storage} initialBootstrap={null} localStore={mockStore}>
+          <SyncProvider>
+            <Consumer />
+          </SyncProvider>
+        </VaultProvider>
+      </AuthProvider>
+    );
+
+    let sync = syncRef as unknown as ReturnType<typeof useSync>;
+    await sync.syncNow();
+    assert.equal(sync.error, "Server synchronization is not configured. Notes remain local.");
+
+    // 2. Link vault to account
+    const linkRecord: VaultLinkRecord = {
+      serverOrigin: SERVER_ORIGIN,
+      accountId: ACCOUNT_ID,
+      linkedAt: new Date().toISOString(),
+    };
+    writeVaultLink(mockStore, linkRecord);
+
+    renderToString(
+      <AuthProvider
+        serverUrl={SERVER_ORIGIN}
+        initialSession={{
+          sessionId: "sess-alice-1",
+          token: AUTH_TOKEN,
+          accountId: ACCOUNT_ID,
+          deviceId: "dev-1",
+          expiresAt: new Date(Date.now() + 3600000).toISOString(),
+        }}
+      >
+        <VaultProvider
+          client={client}
+          storage={storage}
+          initialBootstrap={null}
+          initialVaultLink={linkRecord}
+          localStore={mockStore}
+        >
+          <SyncProvider>
+            <Consumer />
+          </SyncProvider>
+        </VaultProvider>
+      </AuthProvider>
+    );
+
+    sync = syncRef as unknown as ReturnType<typeof useSync>;
+    sync.clearError();
+    await sync.syncNow();
+
+    // The error "Server synchronization is not configured" MUST NOT appear
+    assert.notEqual(sync.error, "Server synchronization is not configured. Notes remain local.");
+    assert.equal(sync.status, "synced");
+  } finally {
+    globalThis.fetch = oldFetch;
+    await storage.close();
+  }
+});

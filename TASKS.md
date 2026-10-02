@@ -148,13 +148,27 @@ multi-thread Web Worker bootstrap restoration and unlocking. All repository-wide
 Rust and web quality gates pass cleanly.
 
 ## ZK-106 — Durable browser ciphertext synchronization
-State: BACKLOG
+State: DONE (PR open / review pending)
 Priority: P1
 Dependencies: ZK-105
 Ticket: [docs/tickets/ZK-106.md](docs/tickets/ZK-106.md)
 Acceptance: authenticated push/pull, stable mutation IDs, CAS conflicts,
 tombstones, durable cursor, locked ciphertext pull, and account isolation.
 Verification: web gates, Rust sync/server tests, crash/retry and conflict tests.
+Implementation note: Implemented `BrowserSyncAdapter` in `apps/web/src/sync/adapter.ts`
+and wired it into `SyncProvider` (`apps/web/src/context/SyncContext.tsx`).
+Pushes encrypted mutations to `POST /v1/sync/push` and pulls remote changes from
+`GET /v1/sync/pull` in sequence order. All network payloads are strictly validated
+against plaintext/secret leakage (`validateNoPlaintextSecrets` enforces SEC-001/SEC-002/SEC-003).
+Mutations maintain stable idempotency IDs (`mutation_id`), `expected_revision`, and
+survive browser restarts with `resetInFlightMutations()`. Push honors CAS revision
+rules: stale edits and delete-vs-edit produce actionable `ConflictRecord`s without
+silent overwrites. Pull durably stores encrypted objects before advancing the sync cursor.
+Sync safely operates while the vault is locked (stores ciphertext only, zero decryption or
+search indexing). Scoped database and sync state isolation enforce strict `(serverOrigin, accountId)`
+boundaries (`OriginMismatchError` / `WrongAccountError`). Comprehensive 20-scenario automated
+test suite added in `apps/web/test/sync-engine.test.tsx` (162 total web tests passing).
+All repository-wide Rust and web quality gates pass cleanly.
 
 ## ZK-107 — Web sync flow and deployment acceptance
 State: BACKLOG

@@ -21,8 +21,31 @@ import {
   EncryptedEnvelopeDto,
 } from "./models.js";
 
+import { normalizeServerOrigin } from "../auth/session.js";
+
 export const DB_SCHEMA_VERSION = 2;
 export const DEFAULT_DB_NAME = "zk_notes_db";
+
+/**
+ * Returns a deterministic, collision-safe database name scoped to (serverOrigin, accountId)
+ * to enforce physical storage isolation between different accounts/servers (ZK-106).
+ */
+export function getScopedDatabaseName(
+  baseName: string = DEFAULT_DB_NAME,
+  serverOrigin?: string | null,
+  accountId?: string | null
+): string {
+  if (!serverOrigin || !accountId) return baseName;
+  try {
+    const originPart = normalizeServerOrigin(serverOrigin).replace(/[^a-zA-Z0-9]/g, "_");
+    const accountPart = accountId.trim().replace(/[^a-zA-Z0-9]/g, "_");
+    return `${baseName}_${originPart}_${accountPart}`;
+  } catch {
+    const cleanOrigin = serverOrigin.trim().replace(/[^a-zA-Z0-9]/g, "_");
+    const accountPart = accountId.trim().replace(/[^a-zA-Z0-9]/g, "_");
+    return `${baseName}_${cleanOrigin}_${accountPart}`;
+  }
+}
 
 export class IndexedDbStorage {
   private dbName: string;
@@ -238,13 +261,14 @@ export class IndexedDbStorage {
 
       req.onsuccess = () => {
         const mutations: PendingMutation[] = req.result || [];
+        const pending = mutations.filter((m) => m.status === MutationStatus.Pending);
         // FIFO order: sort by created_at ascending, breaking ties with expected_revision
-        mutations.sort((a, b) => {
+        pending.sort((a, b) => {
           const cmp = a.created_at.localeCompare(b.created_at);
           if (cmp !== 0) return cmp;
           return a.expected_revision - b.expected_revision;
         });
-        resolve(mutations);
+        resolve(pending);
       };
       req.onerror = () => reject(req.error);
     });
@@ -306,6 +330,30 @@ export class IndexedDbStorage {
     return mutations.filter(
       (m) => m.status === MutationStatus.Pending || m.status === MutationStatus.InFlight
     ).length;
+  }
+
+  /**
+   * Resets all mutations currently stuck in InFlight status back to Pending (ZK-041/ZK-106).
+   * Ensures interrupted push operations from crashes/restarts can be safely retried.
+   */
+  public async resetInFlightMutations(): Promise<number> {
+    const db = await this.getDb();
+    const allMutations: PendingMutation[] = await new Promise((resolve, reject) => {
+      const tx = db.transaction("mutations", "readonly");
+      const store = tx.objectStore("mutations");
+      const req = store.getAll();
+      req.onsuccess = () => resolve(req.result || []);
+      req.onerror = () => reject(req.error);
+    });
+
+    let resetCount = 0;
+    for (const m of allMutations) {
+      if (m.status === MutationStatus.InFlight) {
+        await this.updateMutationStatus(m.mutation_id, MutationStatus.Pending, m.retry_count);
+        resetCount++;
+      }
+    }
+    return resetCount;
   }
 
   // ==========================================================================
@@ -423,12 +471,12 @@ export class IndexedDbStorage {
   // SyncStateStore Implementation
   // ==========================================================================
 
-  public async getSyncState(): Promise<SyncState> {
+  public async getSyncState(identity = "singleton"): Promise<SyncState> {
     const db = await this.getDb();
     return new Promise((resolve, reject) => {
       const tx = db.transaction("sync_state", "readonly");
       const store = tx.objectStore("sync_state");
-      const req = store.get("singleton");
+      const req = store.get(identity);
 
       req.onsuccess = () => {
         if (req.result && req.result.state) {
@@ -445,19 +493,19 @@ export class IndexedDbStorage {
     });
   }
 
-  public async setSyncCursor(cursor: number): Promise<void> {
-    const current = await this.getSyncState();
+  public async setSyncCursor(cursor: number, identity = "singleton"): Promise<void> {
+    const current = await this.getSyncState(identity);
     current.sync_cursor = cursor;
-    await this.setSyncState(current);
+    await this.setSyncState(current, identity);
   }
 
-  public async setSyncState(state: SyncState): Promise<void> {
+  public async setSyncState(state: SyncState, identity = "singleton"): Promise<void> {
     const db = await this.getDb();
     return new Promise((resolve, reject) => {
       const tx = db.transaction("sync_state", "readwrite");
       const store = tx.objectStore("sync_state");
       const req = store.put({
-        key: "singleton",
+        key: identity,
         state,
       });
 
