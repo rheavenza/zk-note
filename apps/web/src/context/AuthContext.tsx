@@ -66,7 +66,7 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({
   initialSession,
 }) => {
   const [serverOrigin, updateServerOrigin] = useState(() => {
-    const fallback = serverUrl ?? (typeof window !== "undefined" ? window.location.origin : "http://localhost:8080");
+    const fallback = serverUrl ?? (typeof window !== "undefined" && window.location?.origin ? window.location.origin : "http://localhost:8080");
     return typeof window !== "undefined" && !serverUrl ? readServerOrigin(window.localStorage, fallback) : normalizeServerOrigin(fallback);
   });
   const currentOrigin = useRef(serverOrigin);
@@ -128,6 +128,15 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({
     const timer = window.setTimeout(() => { setSession(null); setIsExpired(true); persistSession(serverOrigin, null); }, delay);
     return () => window.clearTimeout(timer);
   }, [session, sessionOrigin, serverOrigin]);
+
+  useEffect(() => {
+    if (initialSession !== undefined) {
+      const isCurrent = Boolean(initialSession && isSessionCurrent(initialSession));
+      setSession(isCurrent ? initialSession : null);
+      setIsExpired(Boolean(initialSession && !isCurrent));
+      setSessionOrigin(serverOrigin);
+    }
+  }, [initialSession, serverOrigin]);
 
   const clearError = useCallback(() => setError(null), []);
 

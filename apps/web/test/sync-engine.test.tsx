@@ -28,6 +28,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import React from "react";
 import { renderToString } from "react-dom/server";
+import { createRoot } from "react-dom/client";
 import "fake-indexeddb/auto";
 
 import {
@@ -1964,6 +1965,253 @@ test("migration: fails closed on source-clear failure", async () => {
   await scopedStorage.close();
 });
 
+function setupDomEnvironment(customStorage?: Storage) {
+  (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
+
+  const storageMap = new Map<string, string>();
+  const mockStorage: Storage = customStorage || {
+    getItem: (k: string) => storageMap.get(k) ?? null,
+    setItem: (k: string, v: string) => storageMap.set(k, String(v)),
+    removeItem: (k: string) => storageMap.delete(k),
+    clear: () => storageMap.clear(),
+    key: (i: number) => Array.from(storageMap.keys())[i] ?? null,
+    length: 0,
+  };
+
+  const windowListeners = new Map<string, Function[]>();
+
+  function createMockElement(tagName = "DIV"): any {
+    const listeners = new Map<string, Function[]>();
+    const children: any[] = [];
+    const attributes = new Map<string, string>();
+    const target: any = {
+      nodeType: 1,
+      tagName: tagName.toUpperCase(),
+      childNodes: children,
+      firstChild: null,
+      style: {},
+      className: "",
+      textContent: "",
+      innerHTML: "",
+      value: "",
+      removeChild(c: any) {
+        const idx = children.indexOf(c);
+        if (idx !== -1) children.splice(idx, 1);
+        target.firstChild = children[0] || null;
+        return c;
+      },
+      appendChild(c: any) {
+        children.push(c);
+        target.firstChild = children[0];
+        return c;
+      },
+      insertBefore(c: any, ref: any) {
+        const idx = children.indexOf(ref);
+        if (idx === -1) children.push(c);
+        else children.splice(idx, 0, c);
+        target.firstChild = children[0];
+        return c;
+      },
+      addEventListener(name: string, fn: Function) {
+        if (!listeners.has(name)) listeners.set(name, []);
+        listeners.get(name)!.push(fn);
+      },
+      removeEventListener(name: string, fn: Function) {
+        const arr = listeners.get(name);
+        if (arr) {
+          const idx = arr.indexOf(fn);
+          if (idx !== -1) arr.splice(idx, 1);
+        }
+      },
+      setAttribute(name: string, val: any) {
+        attributes.set(name, String(val));
+      },
+      getAttribute(name: string) {
+        return attributes.get(name) ?? null;
+      },
+      removeAttribute(name: string) {
+        attributes.delete(name);
+      },
+      contains(other: any) {
+        if (other === target) return true;
+        return children.some((c) => c && typeof c.contains === "function" && c.contains(other));
+      },
+      ownerDocument: null,
+    };
+    return target;
+  }
+
+  const container = createMockElement("DIV");
+  const doc: any = {
+    nodeType: 9,
+    documentElement: container,
+    createElement(tag: string) {
+      const el = createMockElement(tag);
+      el.ownerDocument = doc;
+      return el;
+    },
+    createElementNS(_ns: string, tag: string) {
+      const el = createMockElement(tag);
+      el.ownerDocument = doc;
+      return el;
+    },
+    createTextNode(text: string) {
+      return { nodeType: 3, textContent: text, setAttribute() {}, removeAttribute() {} };
+    },
+    createComment(data: string) {
+      return { nodeType: 8, data };
+    },
+    addEventListener() {},
+    removeEventListener() {},
+    activeElement: container,
+  };
+  container.ownerDocument = doc;
+
+  const originalDoc = (globalThis as any).document;
+  const originalWindow = (globalThis as any).window;
+  const originalIframe = (globalThis as any).HTMLIFrameElement;
+
+  (globalThis as any).HTMLIFrameElement = class HTMLIFrameElement {};
+  (globalThis as any).document = doc;
+  (globalThis as any).window = {
+    document: doc,
+    location: {
+      origin: SERVER_ORIGIN,
+      href: `${SERVER_ORIGIN}/`,
+      protocol: SERVER_ORIGIN.startsWith("https") ? "https:" : "http:",
+    },
+    HTMLIFrameElement: (globalThis as any).HTMLIFrameElement,
+    addEventListener(name: string, fn: Function) {
+      if (!windowListeners.has(name)) windowListeners.set(name, []);
+      windowListeners.get(name)!.push(fn);
+    },
+    removeEventListener(name: string, fn: Function) {
+      const arr = windowListeners.get(name);
+      if (arr) {
+        const idx = arr.indexOf(fn);
+        if (idx !== -1) arr.splice(idx, 1);
+      }
+    },
+    dispatchEvent(event: any) {
+      const arr = windowListeners.get(event.type);
+      if (arr) {
+        for (const fn of [...arr]) fn(event);
+      }
+      return true;
+    },
+    localStorage: mockStorage,
+    setTimeout: (fn: any, ms?: number, ...args: any[]) => {
+      const t = setTimeout(fn, ms, ...args);
+      if (typeof (t as any)?.unref === "function") (t as any).unref();
+      return t;
+    },
+    clearTimeout: (id: any) => clearTimeout(id),
+    setInterval: (fn: any, ms?: number, ...args: any[]) => {
+      const t = setInterval(fn, ms, ...args);
+      if (typeof (t as any)?.unref === "function") (t as any).unref();
+      return t;
+    },
+    clearInterval: (id: any) => clearInterval(id),
+  };
+
+  return {
+    container,
+    localStorage: mockStorage,
+    cleanup() {
+      (globalThis as any).document = originalDoc;
+      (globalThis as any).window = originalWindow;
+      (globalThis as any).HTMLIFrameElement = originalIframe;
+    },
+  };
+}
+
+function createMockVaultWorker(options?: {
+  isUnlocked?: boolean;
+  lockDelayMs?: number;
+  onGetStatus?: (isUnlocked: boolean) => void;
+}) {
+  let isUnlocked = options?.isUnlocked ?? false;
+  const messageListeners: any[] = [];
+  const lockDelayMs = options?.lockDelayMs ?? 0;
+
+  const worker = {
+    postMessage: (msg: any) => {
+      if (msg.type === "LOCK_VAULT" || msg.type === "LOCK") {
+        if (lockDelayMs > 0) {
+          setTimeout(() => {
+            isUnlocked = false;
+            for (const l of messageListeners) {
+              l({ data: { id: msg.id, ok: true, data: null } });
+            }
+          }, lockDelayMs);
+        } else {
+          isUnlocked = false;
+          for (const l of messageListeners) {
+            l({ data: { id: msg.id, ok: true, data: null } });
+          }
+        }
+      } else if (msg.type === "GET_STATUS") {
+        options?.onGetStatus?.(isUnlocked);
+        for (const l of messageListeners) {
+          l({ data: { id: msg.id, ok: true, data: { isUnlocked } } });
+        }
+      } else {
+        for (const l of messageListeners) {
+          l({ data: { id: msg.id, ok: true, data: null } });
+        }
+      }
+    },
+    addEventListener: (_type: string, listener: any) => {
+      messageListeners.push(listener);
+    },
+    removeEventListener: () => {},
+    getIsUnlocked: () => isUnlocked,
+    setIsUnlocked: (val: boolean) => {
+      isUnlocked = val;
+    },
+  };
+
+  return worker;
+}
+
+async function mountTestApp(
+  element: React.ReactElement,
+  options?: { localStorage?: Storage }
+) {
+  const env = setupDomEnvironment(options?.localStorage);
+  const root = createRoot(env.container);
+  await (React as any).act(async () => {
+    root.render(element);
+  });
+
+  return {
+    root,
+    container: env.container,
+    localStorage: env.localStorage,
+    async act(fn: () => Promise<void> | void) {
+      await (React as any).act(async () => {
+        await fn();
+      });
+    },
+    async update(newElement: React.ReactElement) {
+      await (React as any).act(async () => {
+        root.render(newElement);
+      });
+    },
+    async settle(ms = 50) {
+      await (React as any).act(async () => {
+        await new Promise((r) => setTimeout(r, ms));
+      });
+    },
+    async unmount() {
+      await (React as any).act(async () => {
+        root.unmount();
+      });
+      env.cleanup();
+    },
+  };
+}
+
 test("identity lifecycle: authenticating as unlinked/wrong account does not adopt scoped DB or drain default DB", async () => {
   const defaultStorage = new IndexedDbStorage(DEFAULT_DB_NAME);
   const noteId = "note-unlinked-safe";
@@ -1989,20 +2237,19 @@ test("identity lifecycle: authenticating as unlinked/wrong account does not adop
     status: MutationStatus.Pending,
   });
 
-  // User logs into account "unlinked-user-1", but vault is NOT linked to this account
-  const mockWorker = {
-    postMessage: () => {},
-    addEventListener: () => {},
-    removeEventListener: () => {},
-  };
+  const mockWorker = createMockVaultWorker({ isUnlocked: false });
   const client = new VaultWorkerClient(mockWorker as any);
 
   // Scoped DB for unlinked-user-1
   const unlinkedScopedDb = getScopedDatabaseName(DEFAULT_DB_NAME, SERVER_ORIGIN, "unlinked-user-1");
   const unlinkedStorage = new IndexedDbStorage(unlinkedScopedDb);
+  const linkedScopedDb = getScopedDatabaseName(DEFAULT_DB_NAME, SERVER_ORIGIN, "linked-user-1");
+  const linkedStorage = new IndexedDbStorage(linkedScopedDb);
 
-  const rendered = renderToString(
-    <AuthProvider
+  let activeMountedDb = "";
+  const harness = await mountTestApp(
+    <App
+      serverUrl={SERVER_ORIGIN}
       initialSession={{
         sessionId: "sess-unlinked",
         token: "tok-unlinked",
@@ -2010,85 +2257,170 @@ test("identity lifecycle: authenticating as unlinked/wrong account does not adop
         deviceId: "dev-unlinked",
         expiresAt: new Date(Date.now() + 3600000).toISOString(),
       }}
-      serverUrl={SERVER_ORIGIN}
+      client={client}
+      onMountedStateChange={(state) => {
+        activeMountedDb = state.dbName;
+      }}
     >
-      <App client={client} />
-    </AuthProvider>
+      <div id="test-observer">unlinked</div>
+    </App>
   );
-  assert.ok(rendered);
 
-  // Crucially: default storage remains untouched!
-  const remainingDefaultObjs = await defaultStorage.listObjects();
-  assert.equal(remainingDefaultObjs.length, 1);
-  assert.equal(remainingDefaultObjs[0]?.object_id, noteId);
-  const remainingDefaultMuts = await defaultStorage.listPendingMutations();
-  assert.equal(remainingDefaultMuts.length, 1);
+  try {
+    // Wait for all React mount and identity effects to settle
+    await harness.settle();
 
-  // And unlinked account storage was NOT created or populated with default notes
-  const unlinkedObjsAfter = await unlinkedStorage.listObjects();
-  assert.equal(unlinkedObjsAfter.length, 0);
+    // App must remain on DEFAULT_DB_NAME because vault is not linked to unlinked-user-1
+    assert.equal(activeMountedDb, DEFAULT_DB_NAME);
 
-  await defaultStorage.close();
-  await unlinkedStorage.close();
+    // Crucially: default storage remains untouched!
+    const remainingDefaultObjs = await defaultStorage.listObjects();
+    assert.equal(remainingDefaultObjs.length, 1);
+    assert.equal(remainingDefaultObjs[0]?.object_id, noteId);
+    const remainingDefaultMuts = await defaultStorage.listPendingMutations();
+    assert.equal(remainingDefaultMuts.length, 1);
+
+    // And unlinked account storage was NOT created or populated with default notes
+    const unlinkedObjsAfter = await unlinkedStorage.listObjects();
+    assert.equal(unlinkedObjsAfter.length, 0);
+
+    // Now, link the vault to a linked account 'linked-user-1'
+    await harness.act(() => {
+      writeVaultLink(harness.localStorage, {
+        serverOrigin: SERVER_ORIGIN,
+        accountId: "linked-user-1",
+        linkedAt: new Date().toISOString(),
+      });
+    });
+
+    // Re-render App with initialSession matching the link
+    await harness.update(
+      <App
+        serverUrl={SERVER_ORIGIN}
+        initialSession={{
+          sessionId: "sess-linked",
+          token: "tok-linked",
+          accountId: "linked-user-1",
+          deviceId: "dev-linked",
+          expiresAt: new Date(Date.now() + 3600000).toISOString(),
+        }}
+        client={client}
+        onMountedStateChange={(state) => {
+          activeMountedDb = state.dbName;
+        }}
+      >
+        <div id="test-observer">linked</div>
+      </App>
+    );
+
+    // Settle migration and transition effects
+    await harness.settle(80);
+
+    assert.equal(activeMountedDb, linkedScopedDb, "App must adopt scoped DB when vault link matches session");
+
+    // Verify pre-auth notes migrated to scoped storage and drained from default storage
+    const migratedObj = await linkedStorage.getObject(noteId);
+    assert.ok(migratedObj, "notes must be migrated into scoped storage");
+    assert.equal(migratedObj.object_id, noteId);
+
+    const drainedDefault = await defaultStorage.listObjects();
+    assert.equal(drainedDefault.length, 0, "default storage must be cleared after successful migration");
+  } finally {
+    await harness.unmount();
+    await defaultStorage.close();
+    await unlinkedStorage.close();
+    await linkedStorage.close();
+  }
 });
 
 test("worker isolation: delayed LOCK_VAULT response prevents GET_STATUS race during identity switch", async () => {
-  let isUnlocked = true;
   let statusObservedWhileUnlocked = false;
+  let isTransitioning = false;
 
-  const messageListeners: any[] = [];
-  const mockWorker = {
-    postMessage: (msg: any) => {
-      if (msg.type === "LOCK_VAULT" || msg.type === "LOCK") {
-        // Deliberately delay LOCK_VAULT response by 30ms
-        setTimeout(() => {
-          isUnlocked = false;
-          for (const l of messageListeners) {
-            l({ data: { id: msg.id, ok: true, data: null } });
-          }
-        }, 30);
-      } else if (msg.type === "GET_STATUS") {
-        if (isUnlocked) {
-          statusObservedWhileUnlocked = true;
-        }
-        for (const l of messageListeners) {
-          l({ data: { id: msg.id, ok: true, data: { isUnlocked } } });
-        }
+  const mockWorker = createMockVaultWorker({
+    isUnlocked: true,
+    lockDelayMs: 40,
+    onGetStatus: (unlocked) => {
+      if (isTransitioning && unlocked) {
+        statusObservedWhileUnlocked = true;
       }
     },
-    addEventListener: (_type: string, listener: any) => {
-      messageListeners.push(listener);
-    },
-    removeEventListener: () => {},
-  };
+  });
 
   const client = new VaultWorkerClient(mockWorker as any);
 
-  // Store 1 is active with unlocked worker
-  const storage1 = new IndexedDbStorage("test-identity-race-1");
-  const store1 = new VaultStore(client, storage1);
-  await client.getStatus();
-  assert.equal(isUnlocked, true);
+  let activeMountedDb = "";
+  const handleMountedStateChange = (state: { dbName: string }) => {
+    activeMountedDb = state.dbName;
+    if (state.dbName !== DEFAULT_DB_NAME && mockWorker.getIsUnlocked()) {
+      statusObservedWhileUnlocked = true;
+    }
+  };
 
-  statusObservedWhileUnlocked = false;
+  // Mount App initially in unlinked state (DEFAULT_DB_NAME) with unlocked client
+  const harness = await mountTestApp(
+    <App
+      serverUrl={SERVER_ORIGIN}
+      client={client}
+      onMountedStateChange={handleMountedStateChange}
+    >
+      <div id="test-observer">test-2</div>
+    </App>
+  );
 
-  // App gates mounting on identity switch: it awaits activeClient.lockVault()
-  const lockPromise = client.lockVault();
+  try {
+    await harness.settle();
+    assert.equal(activeMountedDb, DEFAULT_DB_NAME);
+    assert.equal(mockWorker.getIsUnlocked(), true);
 
-  // If a second store were constructed immediately without awaiting lock, it would observe isUnlocked = true
-  // Verify that awaiting lockPromise guarantees isUnlocked is false
-  await lockPromise;
+    // Now initiate an actual React App transition to linked account 'linked-user-target'
+    isTransitioning = true;
+    statusObservedWhileUnlocked = false;
 
-  const storage2 = new IndexedDbStorage("test-identity-race-2");
-  const store2 = new VaultStore(client, storage2);
-  await client.getStatus();
+    // Pre-associate vault link in localStorage and dispatch change event
+    await harness.act(() => {
+      writeVaultLink(harness.localStorage, {
+        serverOrigin: SERVER_ORIGIN,
+        accountId: "linked-user-target",
+        linkedAt: new Date().toISOString(),
+      });
+    });
 
-  assert.equal(isUnlocked, false);
-  assert.equal(statusObservedWhileUnlocked, false, "new store must not observe unlocked status during identity switch");
-  assert.equal(store2.getState().vaultState, "UNINITIALIZED");
+    // Update App with authenticated session matching the link
+    await harness.update(
+      <App
+        serverUrl={SERVER_ORIGIN}
+        initialSession={{
+          sessionId: "sess-target",
+          token: "tok-target",
+          accountId: "linked-user-target",
+          deviceId: "dev-target",
+          expiresAt: new Date(Date.now() + 3600000).toISOString(),
+        }}
+        client={client}
+        onMountedStateChange={handleMountedStateChange}
+      >
+        <div id="test-observer">test-2-target</div>
+      </App>
+    );
 
-  store1.dispose();
-  store2.dispose();
-  await storage1.close();
-  await storage2.close();
+    // During the delayed LOCK_VAULT transition (e.g. 10ms into the 40ms delay),
+    // App must NOT have mounted the new VaultProvider yet!
+    await new Promise((r) => setTimeout(r, 10));
+    assert.equal(
+      activeMountedDb,
+      DEFAULT_DB_NAME,
+      "App must gate mounting new VaultProvider until lockVault finishes"
+    );
+
+    // Let the 40ms delay resolve and the transition effect settle
+    await harness.settle(80);
+
+    const expectedScopedDb = getScopedDatabaseName(DEFAULT_DB_NAME, SERVER_ORIGIN, "linked-user-target");
+    assert.equal(activeMountedDb, expectedScopedDb, "App must transition to target scoped DB once locked");
+    assert.equal(mockWorker.getIsUnlocked(), false, "Worker must be locked after transition");
+    assert.equal(statusObservedWhileUnlocked, false, "New identity must never observe unlocked status during identity switch");
+  } finally {
+    await harness.unmount();
+  }
 });

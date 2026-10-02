@@ -29,11 +29,30 @@ import { UnlockScreen } from "./components/UnlockScreen.js";
 import { NotesWorkspace } from "./components/NotesWorkspace.js";
 import { readVaultLink, VaultLinkRecord } from "./auth/vault-link.js";
 import { normalizeServerOrigin } from "./auth/session.js";
+import { WebAuthnSession } from "./auth/webauthn.js";
+
+export interface AppInnerProps {
+  client?: VaultWorkerClient;
+  storage?: IndexedDbStorage;
+  onMountedStateChange?: (state: {
+    dbName: string;
+    storage: IndexedDbStorage;
+    client: VaultWorkerClient;
+  }) => void;
+  children?: React.ReactNode;
+}
 
 export interface AppProps {
   client?: VaultWorkerClient;
   storage?: IndexedDbStorage;
   serverUrl?: string;
+  initialSession?: WebAuthnSession | null;
+  onMountedStateChange?: (state: {
+    dbName: string;
+    storage: IndexedDbStorage;
+    client: VaultWorkerClient;
+  }) => void;
+  children?: React.ReactNode;
 }
 
 function createDefaultWorkerClient(): VaultWorkerClient {
@@ -51,10 +70,12 @@ function createDefaultWorkerClient(): VaultWorkerClient {
   return new VaultWorkerClient(dummyWorker);
 }
 
-const AppInner: React.FC<{
-  client?: VaultWorkerClient;
-  storage?: IndexedDbStorage;
-}> = ({ client, storage: propStorage }) => {
+export const AppInner: React.FC<AppInnerProps> = ({
+  client,
+  storage: propStorage,
+  onMountedStateChange,
+  children,
+}) => {
   const { serverOrigin, session } = useAuth();
 
   const [currentLink, setCurrentLink] = React.useState<VaultLinkRecord | null>(() => {
@@ -164,6 +185,10 @@ const AppInner: React.FC<{
     };
   }, [targetDbName, mountedState.dbName, mountedState.client, propStorage, client, retryNonce]);
 
+  React.useEffect(() => {
+    onMountedStateChange?.(mountedState);
+  }, [mountedState, onMountedStateChange]);
+
   if (migrationError) {
     return (
       <div className="flex h-screen items-center justify-center bg-gray-50 dark:bg-gray-900 p-6">
@@ -196,6 +221,18 @@ const AppInner: React.FC<{
     );
   }
 
+  if (children) {
+    return (
+      <VaultProvider
+        key={mountedState.dbName}
+        client={mountedState.client}
+        storage={mountedState.storage}
+      >
+        {children}
+      </VaultProvider>
+    );
+  }
+
   return (
     <VaultProvider
       key={mountedState.dbName}
@@ -217,11 +254,24 @@ const AppInner: React.FC<{
   );
 };
 
-export const App: React.FC<AppProps> = ({ client, storage, serverUrl }) => {
+export const App: React.FC<AppProps> = ({
+  client,
+  storage,
+  serverUrl,
+  initialSession,
+  onMountedStateChange,
+  children,
+}) => {
   return (
     <ErrorBoundary>
-      <AuthProvider serverUrl={serverUrl}>
-        <AppInner client={client} storage={storage} />
+      <AuthProvider serverUrl={serverUrl} initialSession={initialSession}>
+        <AppInner
+          client={client}
+          storage={storage}
+          onMountedStateChange={onMountedStateChange}
+        >
+          {children}
+        </AppInner>
       </AuthProvider>
     </ErrorBoundary>
   );
