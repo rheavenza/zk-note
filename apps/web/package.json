@@ -9,7 +9,9 @@
     "lint": "tsc --noEmit",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "test": "tsc && node --test dist/test/*.test.js"
+    "test": "tsc && node --test dist/test/*.test.js",
+    "typecheck:e2e": "tsc -p e2e/tsconfig.json",
+    "test:e2e": "playwright test"
   },
   "dependencies": {
     "react": "^19.3.0",
@@ -17,6 +19,7 @@
     "zk-wasm": "file:../../crates/zk-wasm/pkg"
   },
   "devDependencies": {
+    "@playwright/test": "^1.63.0",
     "@types/node": "^22.0.0",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
