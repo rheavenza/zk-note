@@ -270,12 +270,13 @@ export const MarkdownEditor: React.FC<MarkdownEditorProps> = ({
         />
 
         <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
-          {/* Autosave Status Badge */}
-          <span style={getSaveStatusStyle(saveStatus)} className="zk-save-status">
-            {saveStatus === "saving" && "⏳ Saving..."}
-            {saveStatus === "saved" && "✓ Saved"}
+          {/* Autosave Status Badge: this reports LOCAL encrypted persistence only.
+              Server synchronization is reported separately by the sync indicator (ZK-107). */}
+          <span style={getSaveStatusStyle(saveStatus)} className="zk-save-status" title="Local save state on this device">
+            {saveStatus === "saving" && "⏳ Saving locally..."}
+            {saveStatus === "saved" && "✓ Saved locally"}
             {saveStatus === "unsaved" && "● Unsaved"}
-            {saveStatus === "error" && "⚠ Save failed"}
+            {saveStatus === "error" && "⚠ Local save failed"}
           </span>
 
           {/* Delete Button */}
