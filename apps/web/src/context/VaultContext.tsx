@@ -511,6 +511,9 @@ export class VaultStore {
     }
     this.unsubscribeLock();
     this.listeners.clear();
+    if (this.client && typeof this.client.lockVault === "function") {
+      this.client.lockVault().catch(() => {});
+    }
   }
 }
 
@@ -551,8 +554,11 @@ export const VaultProvider: React.FC<VaultProviderProps> = ({
   useEffect(() => {
     return () => {
       store.dispose();
+      if (client && typeof client.lockVault === "function") {
+        client.lockVault().catch(() => {});
+      }
     };
-  }, [store]);
+  }, [store, client]);
 
   // Window/document user activity listeners to touch idle timeout
   useEffect(() => {

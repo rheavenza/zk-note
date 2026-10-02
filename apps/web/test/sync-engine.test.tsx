@@ -59,7 +59,7 @@ import {
 } from "../src/context/SyncContext.js";
 import { SyncStatusIndicator } from "../src/components/SyncStatusIndicator.js";
 import { AuthProvider } from "../src/context/AuthContext.js";
-import { VaultProvider } from "../src/context/VaultContext.js";
+import { VaultProvider, VaultStore } from "../src/context/VaultContext.js";
 import { VaultWorkerClient } from "../src/worker/client.js";
 
 // ============================================================================
@@ -1378,7 +1378,7 @@ test("HTTP 409 replay mismatch fails closed, preserves mutation, does not record
       if (url.endsWith("/v1/sync/push")) {
         return new Response(
           JSON.stringify({
-            code: "ERROR_MUTATION_REPLAY_MISMATCH",
+            code: "MUTATION_REPLAY_MISMATCH",
             message: "Mutation replay mismatch: mutation_id already accepted with different payload",
           }),
           { status: 409, headers: { "Content-Type": "application/json" } }
@@ -1408,12 +1408,12 @@ test("HTTP 409 replay mismatch fails closed, preserves mutation, does not record
       status: MutationStatus.Pending,
     });
 
-    // Push must fail closed with ERROR_MUTATION_REPLAY_MISMATCH
+    // Push must fail closed with MUTATION_REPLAY_MISMATCH
     await assert.rejects(
       adapter.pushMutations(storage),
       (err: any) =>
         err instanceof SyncError &&
-        err.code === "ERROR_MUTATION_REPLAY_MISMATCH" &&
+        err.code === "MUTATION_REPLAY_MISMATCH" &&
         err.message.includes("replay mismatch")
     );
 
@@ -1685,6 +1685,205 @@ test("conflict handling data-loss window: mutation is never removed before confl
 
     // Restore putConflict
     storage.putConflict = originalPutConflict;
+  } finally {
+    globalThis.fetch = oldFetch;
+    await storage.close();
+  }
+});
+
+test("scoped database name is collision-resistant across punctuated and distinct origins", () => {
+  const base = DEFAULT_DB_NAME;
+  const name1 = getScopedDatabaseName(base, "https://a-b.example.com", "user1");
+  const name2 = getScopedDatabaseName(base, "https://a.b-example.com", "user1");
+  assert.notEqual(name1, name2, "distinct origins with hyphen vs dot must not collide");
+
+  const name3 = getScopedDatabaseName(base, "https://example.com/api", "user1");
+  const name4 = getScopedDatabaseName(base, "https://example.com/api2", "user1");
+  assert.notEqual(name3, name4);
+
+  const name5 = getScopedDatabaseName(base, "https://example.com", "user_1");
+  const name6 = getScopedDatabaseName(base, "https://example.com", "user-1");
+  assert.notEqual(name5, name6, "accounts with underscore vs hyphen must not collide");
+
+  const name7 = getScopedDatabaseName(base, "https://example.com", "user:1");
+  const name8 = getScopedDatabaseName(base, "https://example.com", "user1");
+  assert.notEqual(name7, name8);
+});
+
+test("lifecycle: pre-auth notes in default DB migrate durably to scoped DB on login/link", async () => {
+  const defaultStorage = new IndexedDbStorage(DEFAULT_DB_NAME);
+  const noteId = "note-preauth-1";
+  const env = createEnvelope(noteId, "preauth-v1");
+
+  await defaultStorage.putObject({
+    object_id: noteId,
+    object_kind: 1,
+    revision: 0,
+    server_seq: 0,
+    is_deleted: false,
+    envelope: env,
+    updated_at: new Date().toISOString(),
+  });
+
+  await defaultStorage.enqueueMutation({
+    mutation_id: "mut-preauth-1",
+    object_id: noteId,
+    expected_revision: 0,
+    object_kind: 1,
+    mutation_type: MutationType.Upsert,
+    envelope: env,
+    created_at: new Date().toISOString(),
+    retry_count: 0,
+    status: MutationStatus.Pending,
+  });
+
+  await defaultStorage.putBaseVersion(noteId, 0, env);
+
+  // Now user links/authenticates with (SERVER_ORIGIN, "acc-migrated-user")
+  const scopedDbName = getScopedDatabaseName(DEFAULT_DB_NAME, SERVER_ORIGIN, "acc-migrated-user");
+  const scopedStorage = new IndexedDbStorage(scopedDbName);
+
+  // Opening the scoped storage automatically migrates pre-auth data
+  await scopedStorage.getDb();
+
+  // Verify records are now in scoped storage
+  const migratedObj = await scopedStorage.getObject(noteId);
+  assert.ok(migratedObj, "object must be migrated to scoped storage");
+  assert.equal(migratedObj.object_id, noteId);
+
+  const migratedMutations = await scopedStorage.listPendingMutations();
+  assert.equal(migratedMutations.length, 1);
+  assert.equal(migratedMutations[0]?.mutation_id, "mut-preauth-1");
+
+  const migratedBase = await scopedStorage.getBaseVersion(noteId, 0);
+  assert.ok(migratedBase, "base version must be migrated");
+
+  // Verify default storage was cleared so second account does not inherit same unlinked data
+  const remainingDefaultObjs = await defaultStorage.listObjects();
+  assert.equal(remainingDefaultObjs.length, 0, "default storage must be cleared after migration");
+  const remainingDefaultMuts = await defaultStorage.listPendingMutations();
+  assert.equal(remainingDefaultMuts.length, 0);
+
+  // Clean up
+  await scopedStorage.close();
+  await defaultStorage.close();
+});
+
+test("lifecycle: account switch while vault is unlocked locks worker and prevents key contamination", async () => {
+  let isUnlocked = true;
+  let lockCalls = 0;
+
+  const messageListeners: any[] = [];
+  const mockWorker = {
+    postMessage: (msg: any) => {
+      if (msg.type === "LOCK_VAULT" || msg.type === "LOCK") {
+        isUnlocked = false;
+        lockCalls++;
+        for (const l of messageListeners) {
+          l({ data: { id: msg.id, ok: true, data: null } });
+        }
+      } else if (msg.type === "GET_STATUS") {
+        for (const l of messageListeners) {
+          l({ data: { id: msg.id, ok: true, data: { isUnlocked } } });
+        }
+      }
+    },
+    addEventListener: (_type: string, listener: any) => {
+      messageListeners.push(listener);
+    },
+    removeEventListener: () => {},
+  };
+  const client = new VaultWorkerClient(mockWorker as any);
+
+  const storage1 = new IndexedDbStorage("test-identity-1");
+  const store1 = new VaultStore(client, storage1);
+
+  // Store 1 is active with unlocked worker
+  assert.equal(isUnlocked, true);
+
+  // Account switch occurs: store1 is disposed
+  store1.dispose();
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(isUnlocked, false, "disposing store on identity switch must lock worker");
+  assert.ok(lockCalls >= 1);
+
+  // New store mounted for identity 2
+  const storage2 = new IndexedDbStorage("test-identity-2");
+  const store2 = new VaultStore(client, storage2);
+  assert.notEqual(store2.getState().vaultState, "UNLOCKED", "new store must not be UNLOCKED");
+
+  store2.dispose();
+  await storage1.close();
+  await storage2.close();
+});
+
+test("worker/WASM conflict-generation failure fails closed without silent fallback or data loss", async () => {
+  const server = new MockSyncServer();
+  const oldFetch = globalThis.fetch;
+  globalThis.fetch = server.handleFetch as unknown as typeof fetch;
+
+  const storage = new IndexedDbStorage(`test-e2e-failclosed-conflict-${Date.now()}`);
+  const mockStore = createMockStorage();
+  writeVaultLink(mockStore, {
+    serverOrigin: SERVER_ORIGIN,
+    accountId: ACCOUNT_ID,
+    linkedAt: new Date().toISOString(),
+  });
+
+  // Mock worker client whose recordConflict throws an error (e.g. cryptographic failure / tampering)
+  const failingWorkerClient = {
+    recordConflict: async () => {
+      throw new Error("Cryptographic verification failed: tampered ciphertext during merge candidate generation (SEC-010)");
+    },
+  } as unknown as VaultWorkerClient;
+
+  const adapter = new BrowserSyncAdapter({
+    serverOrigin: SERVER_ORIGIN,
+    token: AUTH_TOKEN,
+    accountId: ACCOUNT_ID,
+    linkStorage: mockStore,
+    workerClient: failingWorkerClient,
+  });
+
+  const noteId = "note-failclosed-1";
+  server.objects.set(noteId, {
+    revision: 2,
+    server_seq: 1,
+    is_deleted: false,
+    envelope: createEnvelope(noteId, "remote-rev2"),
+    object_kind: 1,
+  });
+  server.currentSeq = 1;
+
+  const localEnv = createEnvelope(noteId, "local-rev1");
+  await storage.enqueueMutation({
+    mutation_id: "mut-failclosed-1",
+    object_id: noteId,
+    expected_revision: 0,
+    object_kind: 1,
+    mutation_type: MutationType.Upsert,
+    envelope: localEnv,
+    created_at: new Date().toISOString(),
+    retry_count: 0,
+    status: MutationStatus.Pending,
+  });
+
+  try {
+    // Push encounters 409 conflict, calls recordConflict, which throws.
+    // MUST fail closed: no silent fallback to JS constructed record!
+    await assert.rejects(
+      adapter.pushMutations(storage),
+      (err: any) => err.message.includes("Cryptographic verification failed")
+    );
+
+    // Crucially: mutation MUST remain intact in queue marked Pending
+    const pending = await storage.listPendingMutations();
+    assert.equal(pending.length, 1);
+    assert.equal(pending[0]?.mutation_id, "mut-failclosed-1");
+
+    // No bogus conflict record should have been written
+    const conflicts = await storage.listConflicts(false);
+    assert.equal(conflicts.length, 0);
   } finally {
     globalThis.fetch = oldFetch;
     await storage.close();

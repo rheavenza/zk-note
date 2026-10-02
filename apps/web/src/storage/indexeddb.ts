@@ -26,9 +26,18 @@ import { normalizeServerOrigin } from "../auth/session.js";
 export const DB_SCHEMA_VERSION = 2;
 export const DEFAULT_DB_NAME = "zk_notes_db";
 
+function stringToHex(str: string): string {
+  const bytes = new TextEncoder().encode(str);
+  let hex = "";
+  for (const b of bytes) {
+    hex += b.toString(16).padStart(2, "0");
+  }
+  return hex;
+}
+
 /**
  * Returns a deterministic, collision-safe database name scoped to (serverOrigin, accountId)
- * to enforce physical storage isolation between different accounts/servers (ZK-106).
+ * using bijective byte-level hex encoding to prevent origin collisions (ZK-106).
  */
 export function getScopedDatabaseName(
   baseName: string = DEFAULT_DB_NAME,
@@ -37,13 +46,13 @@ export function getScopedDatabaseName(
 ): string {
   if (!serverOrigin || !accountId) return baseName;
   try {
-    const originPart = normalizeServerOrigin(serverOrigin).replace(/[^a-zA-Z0-9]/g, "_");
-    const accountPart = accountId.trim().replace(/[^a-zA-Z0-9]/g, "_");
+    const originPart = stringToHex(normalizeServerOrigin(serverOrigin));
+    const accountPart = stringToHex(accountId.trim());
     return `${baseName}_${originPart}_${accountPart}`;
   } catch {
-    const cleanOrigin = serverOrigin.trim().replace(/[^a-zA-Z0-9]/g, "_");
-    const accountPart = accountId.trim().replace(/[^a-zA-Z0-9]/g, "_");
-    return `${baseName}_${cleanOrigin}_${accountPart}`;
+    const originPart = stringToHex(serverOrigin.trim());
+    const accountPart = stringToHex(accountId.trim());
+    return `${baseName}_${originPart}_${accountPart}`;
   }
 }
 
@@ -51,6 +60,7 @@ export class IndexedDbStorage {
   private dbName: string;
   private idbFactory: IDBFactory;
   private dbPromise: Promise<IDBDatabase> | null = null;
+  private migrationPromise: Promise<void> | null = null;
 
   constructor(dbName = DEFAULT_DB_NAME, idbFactory?: IDBFactory) {
     this.dbName = dbName;
@@ -75,8 +85,26 @@ export class IndexedDbStorage {
 
   /**
    * Opens or initializes the IndexedDB database.
+   * For account-scoped databases, ensures existing pre-auth notes from DEFAULT_DB_NAME
+   * are durably migrated on first access.
    */
   public async getDb(): Promise<IDBDatabase> {
+    const db = await this.getRawDb();
+
+    if (this.dbName !== DEFAULT_DB_NAME) {
+      if (!this.migrationPromise) {
+        this.migrationPromise = this.ensureMigratedFromDefault();
+      }
+      await this.migrationPromise;
+    }
+
+    return db;
+  }
+
+  /**
+   * Opens or returns the raw IDBDatabase instance without running migration hooks.
+   */
+  public async getRawDb(): Promise<IDBDatabase> {
     if (this.dbPromise) {
       return this.dbPromise;
     }
@@ -99,6 +127,129 @@ export class IndexedDbStorage {
     });
 
     return this.dbPromise;
+  }
+
+  private async ensureMigratedFromDefault(): Promise<void> {
+    try {
+      const defaultStorage = new IndexedDbStorage(DEFAULT_DB_NAME, this.idbFactory);
+      await this.migrateFrom(defaultStorage);
+    } catch {
+      // Ignore migration errors if default storage does not exist or cannot be opened
+    }
+  }
+
+  /**
+   * Durably copies all encrypted objects, mutations, base versions, conflicts, and blobs
+   * from sourceStorage to this storage, then clears the source storage.
+   */
+  public async migrateFrom(sourceStorage: IndexedDbStorage): Promise<boolean> {
+    if (sourceStorage.getDatabaseName() === this.dbName) {
+      return false;
+    }
+
+    const sourceDb = await sourceStorage.getRawDb();
+    const targetDb = await this.getRawDb();
+
+    // Check if source has any data to migrate
+    const sourceHasData = await new Promise<boolean>((resolve, reject) => {
+      const tx = sourceDb.transaction(
+        ["objects", "mutations", "conflicts"],
+        "readonly"
+      );
+      let count = 0;
+      tx.objectStore("objects").count().onsuccess = (e: any) => {
+        count += e.target.result || 0;
+      };
+      tx.objectStore("mutations").count().onsuccess = (e: any) => {
+        count += e.target.result || 0;
+      };
+      tx.objectStore("conflicts").count().onsuccess = (e: any) => {
+        count += e.target.result || 0;
+      };
+      tx.oncomplete = () => resolve(count > 0);
+      tx.onerror = () => reject(tx.error);
+    });
+
+    if (!sourceHasData) {
+      return false;
+    }
+
+    // Read all records from source
+    const readStore = async (storeName: string): Promise<any[]> => {
+      return new Promise((resolve, reject) => {
+        const tx = sourceDb.transaction(storeName, "readonly");
+        const store = tx.objectStore(storeName);
+        const req = store.getAll();
+        req.onsuccess = () => resolve(req.result || []);
+        req.onerror = () => reject(req.error);
+      });
+    };
+
+    const objects = await readStore("objects");
+    const mutations = await readStore("mutations");
+    const baseVersions = await readStore("base_versions");
+    const conflicts = await readStore("conflicts");
+    const blobs = sourceDb.objectStoreNames.contains("blobs")
+      ? await readStore("blobs")
+      : [];
+
+    // Write all records to target
+    await new Promise<void>((resolve, reject) => {
+      const storeNames = ["objects", "mutations", "base_versions", "conflicts"];
+      if (targetDb.objectStoreNames.contains("blobs")) {
+        storeNames.push("blobs");
+      }
+      const tx = targetDb.transaction(storeNames, "readwrite");
+
+      const objStore = tx.objectStore("objects");
+      for (const obj of objects) {
+        objStore.put(obj);
+      }
+      const mutStore = tx.objectStore("mutations");
+      for (const m of mutations) {
+        mutStore.put(m);
+      }
+      const bvStore = tx.objectStore("base_versions");
+      for (const bv of baseVersions) {
+        bvStore.put(bv);
+      }
+      const confStore = tx.objectStore("conflicts");
+      for (const c of conflicts) {
+        confStore.put(c);
+      }
+      if (targetDb.objectStoreNames.contains("blobs")) {
+        const blobStore = tx.objectStore("blobs");
+        for (const b of blobs) {
+          blobStore.put(b);
+        }
+      }
+
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+
+    // Clear migrated data from source storage
+    await sourceStorage.clearAllData();
+    return true;
+  }
+
+  /**
+   * Clears objects, mutations, base_versions, conflicts, and blobs in this storage.
+   */
+  public async clearAllData(): Promise<void> {
+    const db = await this.getRawDb();
+    await new Promise<void>((resolve, reject) => {
+      const storeNames = ["objects", "mutations", "base_versions", "conflicts"];
+      if (db.objectStoreNames.contains("blobs")) {
+        storeNames.push("blobs");
+      }
+      const tx = db.transaction(storeNames, "readwrite");
+      for (const name of storeNames) {
+        tx.objectStore(name).clear();
+      }
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
   }
 
   private initializeSchema(db: IDBDatabase, _oldVersion: number): void {
@@ -321,14 +472,16 @@ export class IndexedDbStorage {
   public async updateMutationStatus(
     mutationId: string,
     status: MutationStatus,
-    retryCount: number
+    retryCount?: number
   ): Promise<void> {
     const mutation = await this.getMutation(mutationId);
     if (!mutation) {
       throw new Error(`Mutation ${mutationId} not found`);
     }
     mutation.status = status;
-    mutation.retry_count = retryCount;
+    if (retryCount !== undefined) {
+      mutation.retry_count = retryCount;
+    }
     await this.enqueueMutation(mutation);
   }
 

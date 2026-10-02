@@ -23,14 +23,42 @@ import {
 import { IndexedDbStorage } from "../storage/indexeddb.js";
 import {
   EncryptedEnvelopeDto,
-  StoredEncryptedObject,
-  MutationType,
   MutationStatus,
-  PendingMutation,
   ConflictRecord,
 } from "../storage/models.js";
 import { VaultWorkerClient } from "../worker/client.js";
 import * as zk from "zk-wasm";
+
+let wasmInitPromise: Promise<void> | null = null;
+
+export async function ensureWasmInitialized(): Promise<void> {
+  if (wasmInitPromise) return wasmInitPromise;
+  wasmInitPromise = (async () => {
+    try {
+      if (typeof (zk as any).initSync === "function") {
+        if (typeof process !== "undefined" && process.versions?.node) {
+          const { createRequire } = await import("node:module");
+          const fs = await import("node:fs");
+          const path = await import("node:path");
+          const require = createRequire(import.meta.url);
+          const pkgJs = require.resolve("zk-wasm");
+          const wasmPath = path.join(path.dirname(pkgJs), "zk_wasm_bg.wasm");
+          if (fs.existsSync(wasmPath)) {
+            const bytes = fs.readFileSync(wasmPath);
+            (zk as any).initSync({ module: bytes });
+            return;
+          }
+        }
+      }
+      if (typeof (zk as any).default === "function") {
+        await (zk as any).default();
+      }
+    } catch {
+      // Ignore if already initialized
+    }
+  })();
+  return wasmInitPromise;
+}
 
 // ============================================================================
 // Protocol DTO Types
@@ -377,145 +405,147 @@ export class BrowserSyncAdapter implements SyncServerAdapter {
    * Pushes all pending mutations from IndexedDB storage.
    * Honors server compare-and-swap responses and records actionable ConflictRecords on 409.
    */
+  /**
+   * Pushes all pending mutations from IndexedDB storage.
+   * Driven by the shared Rust core WasmSyncStateMachine.
+   */
   public async pushMutations(
     storage: IndexedDbStorage,
     linkStorage?: Pick<Storage, "getItem">
   ): Promise<PushReport> {
     this.assertLinkedStorage(storage, linkStorage);
+    await ensureWasmInitialized();
 
-    // Reset any in-flight mutations from interrupted runs (SEC-007 idempotency)
     await storage.resetInFlightMutations();
 
     const pendingMutations = await storage.listPendingMutations();
+    const sm = new zk.WasmSyncStateMachine(0n, JSON.stringify(pendingMutations));
+
+    // Initialize state machine and step past initial pull to enter push phase directly
+    sm.start();
+    const pushInitActionsJson = sm.handle_pull_response(
+      JSON.stringify({ changes: [], next_cursor: 0, has_more: false })
+    );
+    const actions: any[] = JSON.parse(pushInitActionsJson);
+
     const report: PushReport = {
       totalAttempted: 0,
       accepted: [],
       conflicts: [],
     };
 
-    const conflictedObjects = new Set<string>();
+    while (actions.length > 0) {
+      const action = actions.shift();
+      if (!action) continue;
 
-    for (const mutation of pendingMutations) {
-      if (
-        mutation.status !== MutationStatus.Pending &&
-        mutation.status !== MutationStatus.InFlight
-      ) {
-        continue;
-      }
+      switch (action.type) {
+        case "ResetInFlightMutations": {
+          await storage.resetInFlightMutations();
+          break;
+        }
 
-      // If an earlier mutation for this object encountered a conflict,
-      // skip pushing subsequent edits for this object to prevent pushing stale dependent revisions (SEC-006).
-      if (conflictedObjects.has(mutation.object_id)) {
-        continue;
-      }
+        case "MarkMutationInFlight": {
+          await storage.updateMutationStatus(
+            action.mutation_id,
+            MutationStatus.InFlight,
+            action.retry_count
+          );
+          break;
+        }
 
-      report.totalAttempted++;
-
-      const pushReq: PushRequestDto = {
-        mutation_id: mutation.mutation_id,
-        object_id: mutation.object_id,
-        expected_revision: mutation.expected_revision,
-        object_kind: mutation.object_kind,
-        envelope: mutation.envelope,
-        is_deleted: mutation.mutation_type === MutationType.Delete,
-      };
-
-      // Mark in-flight locally (increments retry count)
-      await storage.updateMutationStatus(
-        mutation.mutation_id,
-        MutationStatus.InFlight,
-        mutation.retry_count + 1
-      );
-
-      try {
-        const resp = await this.pushMutation(pushReq);
-
-        // Accepted: durably update local object store with server sequence & revision
-        const storedObject: StoredEncryptedObject = {
-          object_id: resp.object_id,
-          object_kind: mutation.object_kind,
-          revision: resp.revision,
-          server_seq: resp.server_seq,
-          is_deleted: mutation.mutation_type === MutationType.Delete,
-          envelope: mutation.envelope,
-          updated_at: new Date().toISOString(),
-        };
-
-        await storage.putObject(storedObject);
-
-        // ONLY after local object write succeeds, remove from mutation queue
-        await storage.removeMutation(mutation.mutation_id);
-
-        report.accepted.push(resp);
-      } catch (err) {
-        if (err instanceof RevisionConflictError) {
-          // Stale edit or delete-vs-edit CAS conflict (SEC-006 / SEC-008):
-          conflictedObjects.add(mutation.object_id);
+        case "SendPush": {
+          report.totalAttempted++;
+          const currentMutation = pendingMutations.find(
+            (m) => m.mutation_id === action.request.mutation_id
+          );
 
           try {
-            // 1. Fetch base version first
-            const baseEnvelope = await storage.getBaseVersion(
-              mutation.object_id,
-              mutation.expected_revision
+            const resp = await this.pushMutation(action.request);
+            report.accepted.push(resp);
+            const nextActions = JSON.parse(
+              sm.handle_push_success(action.request.mutation_id, JSON.stringify(resp))
             );
-
-            // 2. Generate conflict record using the shared Rust core (via Web Worker or WASM)
-            let conflictRecord: ConflictRecord;
-            if (this.workerClient) {
-              try {
-                const recordJson = await this.workerClient.recordConflict(
-                  JSON.stringify(mutation),
-                  JSON.stringify(err.conflict),
-                  baseEnvelope ? JSON.stringify(baseEnvelope) : null
-                );
-                conflictRecord = JSON.parse(recordJson);
-              } catch {
-                conflictRecord = buildLocalConflictRecord(
-                  mutation,
-                  err.conflict,
-                  baseEnvelope
-                );
-              }
-            } else {
-              conflictRecord = buildLocalConflictRecord(
-                mutation,
-                err.conflict,
-                baseEnvelope
+            actions.push(...nextActions);
+          } catch (err: any) {
+            if (err instanceof RevisionConflictError) {
+              const baseEnvelope = await storage.getBaseVersion(
+                action.request.object_id,
+                action.request.expected_revision
               );
+
+              // Fail closed: shared-core Rust/WASM generates conflict record; no TypeScript fallback!
+              let conflictRecord: ConflictRecord;
+              try {
+                if (this.workerClient) {
+                  const recordJson = await this.workerClient.recordConflict(
+                    JSON.stringify(currentMutation || action.request),
+                    JSON.stringify(err.conflict),
+                    baseEnvelope ? JSON.stringify(baseEnvelope) : null
+                  );
+                  conflictRecord = JSON.parse(recordJson);
+                } else {
+                  const recordJson = zk.build_conflict_record(
+                    JSON.stringify(currentMutation || action.request),
+                    JSON.stringify(err.conflict),
+                    baseEnvelope ? JSON.stringify(baseEnvelope) : null
+                  );
+                  conflictRecord = JSON.parse(recordJson);
+                }
+              } catch (recErr) {
+                await storage
+                  .updateMutationStatus(action.request.mutation_id, MutationStatus.Pending)
+                  .catch(() => {});
+                throw recErr;
+              }
+
+              report.conflicts.push(conflictRecord);
+              const nextActions = JSON.parse(
+                sm.handle_push_conflict(action.request.mutation_id, JSON.stringify(conflictRecord))
+              );
+              actions.push(...nextActions);
+            } else {
+              // Any non-revision-conflict error (network error, 409 replay mismatch, 500, etc.):
+              // Fail closed: reset in-flight mutation back to Pending so it can be retried / inspected (no data loss!)
+              await storage
+                .updateMutationStatus(action.request.mutation_id, MutationStatus.Pending)
+                .catch(() => {});
+              throw err;
             }
+          }
+          break;
+        }
 
-            // 3. Durably commit conflict record to storage FIRST
-            await storage.putConflict(conflictRecord);
+        case "AcknowledgeAccepted": {
+          await storage.putObject(action.object);
+          await storage.removeMutation(action.mutation_id);
+          break;
+        }
 
-            // 4. In accordance with Rust zk-sync push_pending_changes:
-            // Leave the local mutation recoverable in the queue (marked Pending)
-            // instead of premature deletion, so the user can resolve or recover it.
-            await storage.updateMutationStatus(
-              mutation.mutation_id,
-              MutationStatus.Pending,
-              mutation.retry_count
-            );
-
-            report.conflicts.push(conflictRecord);
+        case "RecordConflict": {
+          try {
+            await storage.putConflict(action.conflict_record);
           } catch (storageErr) {
-            // Fail closed: ensure mutation is not left in InFlight state if conflict recording fails
             await storage
-              .updateMutationStatus(
-                mutation.mutation_id,
-                MutationStatus.Pending,
-                mutation.retry_count
-              )
+              .updateMutationStatus(action.mutation_id, MutationStatus.Pending)
               .catch(() => {});
             throw storageErr;
           }
-        } else {
-          // Reset back to Pending status so it can be retried on reconnect
-          await storage.updateMutationStatus(
-            mutation.mutation_id,
-            MutationStatus.Pending,
-            mutation.retry_count
-          );
-          throw err;
+          break;
+        }
+
+        case "ResetMutationToPending": {
+          await storage.updateMutationStatus(action.mutation_id, MutationStatus.Pending);
+          break;
+        }
+
+        case "MarkMutationFailed": {
+          await storage.updateMutationStatus(action.mutation_id, MutationStatus.Failed);
+          break;
+        }
+
+        case "FetchPull":
+        case "UpdateSyncState": {
+          break;
         }
       }
     }
@@ -526,6 +556,7 @@ export class BrowserSyncAdapter implements SyncServerAdapter {
   /**
    * Pulls remote changes in server sequence order, durably stores encrypted objects FIRST,
    * and advances the sync cursor ONLY after persistence succeeds.
+   * Driven by the shared Rust core WasmSyncStateMachine.
    */
   public async pullChangesToStorage(
     storage: IndexedDbStorage,
@@ -533,58 +564,51 @@ export class BrowserSyncAdapter implements SyncServerAdapter {
     limit = 50
   ): Promise<PullReport> {
     this.assertLinkedStorage(storage, linkStorage);
+    await ensureWasmInitialized();
 
     const syncState = await storage.getSyncState(this.identity);
-    const initialCursor = syncState ? syncState.sync_cursor : 0;
-    let currentCursor = initialCursor;
+    const initialCursor = syncState ? BigInt(syncState.sync_cursor) : 0n;
+    const sm = new zk.WasmSyncStateMachine(initialCursor, JSON.stringify([]));
+
+    const actions: any[] = JSON.parse(sm.start());
     let pagesFetched = 0;
     let totalChanges = 0;
     let appliedChanges = 0;
+    let currentCursor = Number(initialCursor);
 
-    let hasMore = true;
-    while (hasMore) {
-      const resp = await this.pullChanges(currentCursor, limit);
-      pagesFetched++;
+    while (actions.length > 0) {
+      const action = actions.shift();
+      if (!action) continue;
 
-      if (!resp.changes || resp.changes.length === 0) {
-        break;
-      }
-
-      totalChanges += resp.changes.length;
-
-      for (const change of resp.changes) {
-        if (change.server_seq <= currentCursor && currentCursor > 0) {
-          // Skip already processed sequences
-          continue;
+      switch (action.type) {
+        case "FetchPull": {
+          pagesFetched++;
+          const resp = await this.fetchPullChanges(action.after, limit);
+          totalChanges += resp.changes ? resp.changes.length : 0;
+          const nextActions = JSON.parse(sm.handle_pull_response(JSON.stringify(resp)));
+          actions.push(...nextActions);
+          break;
         }
 
-        // STEP 1: Durably store encrypted change into local object store
-        const storedObject: StoredEncryptedObject = {
-          object_id: change.object_id,
-          object_kind: change.object_kind,
-          revision: change.revision,
-          server_seq: change.server_seq,
-          is_deleted: change.is_deleted,
-          envelope: change.envelope,
-          updated_at: new Date().toISOString(),
-        };
+        case "StoreObject": {
+          await storage.putObject(action.object);
+          appliedChanges++;
+          break;
+        }
 
-        await storage.putObject(storedObject);
-
-        // STEP 2: Advance cursor ONLY AFTER persistence succeeds
-        currentCursor = change.server_seq;
-        await storage.setSyncCursor(currentCursor, this.identity);
-        appliedChanges++;
+        case "AdvanceCursor": {
+          currentCursor = action.cursor;
+          await storage.setSyncCursor(action.cursor, this.identity);
+          break;
+        }
       }
-
-      hasMore = resp.has_more;
     }
 
     return {
       pagesFetched,
       totalChanges,
       appliedChanges,
-      initialCursor,
+      initialCursor: Number(initialCursor),
       finalCursor: currentCursor,
     };
   }
@@ -592,48 +616,196 @@ export class BrowserSyncAdapter implements SyncServerAdapter {
   /**
    * Executes a complete pull-before-push sync cycle (MASTER_SPEC.md § 9.6).
    * Advances last_sync_at ONLY after all phases complete successfully.
+   * Owned and driven by the shared Rust core WasmSyncStateMachine.
    */
   public async sync(
     storage: IndexedDbStorage,
     linkStorage?: Pick<Storage, "getItem">
   ): Promise<SyncReport> {
     this.assertLinkedStorage(storage, linkStorage);
+    await ensureWasmInitialized();
 
     const syncState = await storage.getSyncState(this.identity);
-    const initialCursor = syncState ? syncState.sync_cursor : 0;
+    const initialCursor = syncState ? BigInt(syncState.sync_cursor) : 0n;
+    const pendingMutations = await storage.listPendingMutations();
 
-    // 1. Initial Pull: fetch any new remote changes
-    const initialPull = await this.pullChangesToStorage(storage, linkStorage);
+    const sm = new zk.WasmSyncStateMachine(initialCursor, JSON.stringify(pendingMutations));
+    const actions: any[] = JSON.parse(sm.start());
 
-    // 2. Push: transmit pending local mutations with CAS verification
-    const push = await this.pushMutations(storage, linkStorage);
+    let initialPullReport: PullReport | null = null;
+    let followupPullReport: PullReport | null = null;
+    const pushReport: PushReport = {
+      totalAttempted: 0,
+      accepted: [],
+      conflicts: [],
+    };
 
-    // 3. Follow-up Pull: if mutations were accepted, fetch updated sequence numbers
-    let followupPull: PullReport | null = null;
-    if (push.accepted.length > 0) {
-      followupPull = await this.pullChangesToStorage(storage, linkStorage);
+    while (actions.length > 0) {
+      const action = actions.shift();
+      if (!action) continue;
+
+      switch (action.type) {
+        case "ResetInFlightMutations": {
+          await storage.resetInFlightMutations();
+          break;
+        }
+
+        case "FetchPull": {
+          const resp = await this.fetchPullChanges(action.after, action.limit);
+          const nextActions = JSON.parse(sm.handle_pull_response(JSON.stringify(resp)));
+          actions.push(...nextActions);
+          break;
+        }
+
+        case "StoreObject": {
+          await storage.putObject(action.object);
+          break;
+        }
+
+        case "AdvanceCursor": {
+          await storage.setSyncCursor(action.cursor, this.identity);
+          break;
+        }
+
+        case "MarkMutationInFlight": {
+          await storage.updateMutationStatus(
+            action.mutation_id,
+            MutationStatus.InFlight,
+            action.retry_count
+          );
+          break;
+        }
+
+        case "SendPush": {
+          pushReport.totalAttempted++;
+          const currentMutation = pendingMutations.find(
+            (m) => m.mutation_id === action.request.mutation_id
+          );
+
+          try {
+            const resp = await this.pushMutation(action.request);
+            pushReport.accepted.push(resp);
+            const nextActions = JSON.parse(
+              sm.handle_push_success(action.request.mutation_id, JSON.stringify(resp))
+            );
+            actions.push(...nextActions);
+          } catch (err: any) {
+            if (err instanceof RevisionConflictError) {
+              const baseEnvelope = await storage.getBaseVersion(
+                action.request.object_id,
+                action.request.expected_revision
+              );
+
+              // Fail closed: shared-core Rust/WASM generates conflict record; no TypeScript fallback!
+              let conflictRecord: ConflictRecord;
+              try {
+                if (this.workerClient) {
+                  const recordJson = await this.workerClient.recordConflict(
+                    JSON.stringify(currentMutation || action.request),
+                    JSON.stringify(err.conflict),
+                    baseEnvelope ? JSON.stringify(baseEnvelope) : null
+                  );
+                  conflictRecord = JSON.parse(recordJson);
+                } else {
+                  const recordJson = zk.build_conflict_record(
+                    JSON.stringify(currentMutation || action.request),
+                    JSON.stringify(err.conflict),
+                    baseEnvelope ? JSON.stringify(baseEnvelope) : null
+                  );
+                  conflictRecord = JSON.parse(recordJson);
+                }
+              } catch (recErr) {
+                await storage
+                  .updateMutationStatus(action.request.mutation_id, MutationStatus.Pending)
+                  .catch(() => {});
+                throw recErr;
+              }
+
+              pushReport.conflicts.push(conflictRecord);
+              const nextActions = JSON.parse(
+                sm.handle_push_conflict(action.request.mutation_id, JSON.stringify(conflictRecord))
+              );
+              actions.push(...nextActions);
+            } else {
+              // Any non-revision-conflict error (network error, 409 replay mismatch, 500, etc.):
+              // Fail closed: reset in-flight mutation back to Pending so it can be retried / inspected (no data loss!)
+              await storage
+                .updateMutationStatus(action.request.mutation_id, MutationStatus.Pending)
+                .catch(() => {});
+              throw err;
+            }
+          }
+          break;
+        }
+
+        case "AcknowledgeAccepted": {
+          await storage.putObject(action.object);
+          await storage.removeMutation(action.mutation_id);
+          break;
+        }
+
+        case "RecordConflict": {
+          try {
+            await storage.putConflict(action.conflict_record);
+          } catch (storageErr) {
+            await storage
+              .updateMutationStatus(action.mutation_id, MutationStatus.Pending)
+              .catch(() => {});
+            throw storageErr;
+          }
+          break;
+        }
+
+        case "ResetMutationToPending": {
+          await storage.updateMutationStatus(action.mutation_id, MutationStatus.Pending);
+          break;
+        }
+
+        case "MarkMutationFailed": {
+          await storage.updateMutationStatus(action.mutation_id, MutationStatus.Failed);
+          break;
+        }
+
+        case "UpdateSyncState": {
+          await storage.setSyncState(
+            {
+              sync_cursor: action.cursor,
+              last_sync_at: action.last_sync_at,
+              device_id: syncState ? syncState.device_id : null,
+            },
+            this.identity
+          );
+          break;
+        }
+      }
     }
 
-    const finalState = await storage.getSyncState(this.identity);
-    const finalCursor = finalState ? finalState.sync_cursor : initialCursor;
+    const rawReport = JSON.parse(sm.get_report());
 
-    // 4. Update last_sync_at only on complete, error-free sync round
-    const now = new Date();
-    await storage.setSyncState(
-      {
-        sync_cursor: finalCursor,
-        last_sync_at: now.toISOString(),
-        device_id: finalState ? finalState.device_id : null,
-      },
-      this.identity
-    );
+    initialPullReport = {
+      pagesFetched: rawReport.initial_pull.pages_fetched,
+      totalChanges: rawReport.initial_pull.total_changes,
+      appliedChanges: rawReport.initial_pull.applied_changes,
+      initialCursor: rawReport.initial_pull.initial_cursor,
+      finalCursor: rawReport.initial_pull.final_cursor,
+    };
+
+    if (rawReport.followup_pull) {
+      followupPullReport = {
+        pagesFetched: rawReport.followup_pull.pages_fetched,
+        totalChanges: rawReport.followup_pull.total_changes,
+        appliedChanges: rawReport.followup_pull.applied_changes,
+        initialCursor: rawReport.followup_pull.initial_cursor,
+        finalCursor: rawReport.followup_pull.final_cursor,
+      };
+    }
 
     return {
-      initialPull,
-      push,
-      followupPull,
-      initialCursor,
-      finalCursor,
+      initialPull: initialPullReport,
+      push: pushReport,
+      followupPull: followupPullReport,
+      initialCursor: rawReport.initial_cursor,
+      finalCursor: rawReport.final_cursor,
     };
   }
 
@@ -646,47 +818,3 @@ export class BrowserSyncAdapter implements SyncServerAdapter {
   }
 }
 
-/**
- * Builds a ConflictRecord using the shared Rust core wasm export if available,
- * or constructs the exact ConflictRecord conforming to zk-storage models (ZK-053).
- */
-export function buildLocalConflictRecord(
-  mutation: PendingMutation,
-  conflict: ConflictResponseDto,
-  baseEnvelope?: EncryptedEnvelopeDto | null
-): ConflictRecord {
-  try {
-    if (typeof (zk as any).build_conflict_record === "function") {
-      const json = (zk as any).build_conflict_record(
-        JSON.stringify(mutation),
-        JSON.stringify(conflict),
-        baseEnvelope ? JSON.stringify(baseEnvelope) : null
-      );
-      return JSON.parse(json);
-    }
-  } catch {
-    // If wasm is uninitialized on main thread, fallback to direct typed structure
-  }
-
-  const conflictId =
-    typeof crypto !== "undefined" && crypto.randomUUID
-      ? crypto.randomUUID()
-      : `conf-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
-
-  return {
-    conflict_id: conflictId,
-    object_id: mutation.object_id,
-    object_kind: mutation.object_kind,
-    base_revision: mutation.expected_revision,
-    remote_revision: conflict.current_revision,
-    base_envelope: baseEnvelope || null,
-    local_envelope: mutation.envelope,
-    remote_envelope: conflict.current_envelope,
-    candidate_envelope: null,
-    resolved: false,
-    remote_is_deleted: Boolean(conflict.is_deleted),
-    local_is_deleted: mutation.mutation_type === MutationType.Delete,
-    created_at: new Date().toISOString(),
-    resolved_at: null,
-  };
-}

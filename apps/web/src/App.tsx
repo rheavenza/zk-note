@@ -71,6 +71,16 @@ const AppInner: React.FC<{
 
   const storageKey = activeStorage.getDatabaseName();
 
+  const lastStorageKeyRef = React.useRef<string>(storageKey);
+  if (lastStorageKeyRef.current !== storageKey) {
+    lastStorageKeyRef.current = storageKey;
+    activeClient.lockVault().catch(() => {});
+  }
+
+  React.useEffect(() => {
+    activeClient.lockVault().catch(() => {});
+  }, [storageKey, activeClient]);
+
   return (
     <VaultProvider key={storageKey} client={activeClient} storage={activeStorage}>
       <SyncProvider>
