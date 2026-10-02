@@ -10,6 +10,10 @@
 
 import React, { useState, useCallback } from "react";
 import { useVault } from "../context/VaultContext.js";
+import { useAuth } from "../context/AuthContext.js";
+import { AuthControls } from "./AuthControls.js";
+import { restoreVaultFromAccount } from "../auth/vault-link.js";
+import { normalizeServerOrigin } from "../auth/session.js";
 
 export interface UnlockScreenProps {
   children?: React.ReactNode;
@@ -25,14 +29,40 @@ export const UnlockScreen: React.FC<UnlockScreenProps> = ({
   const {
     vaultState,
     bootstrap,
+    vaultLink,
     error: contextError,
     clearError,
     initVault,
     unlockWithPassphrase,
     unlockWithRecoveryKey,
     rewrapPassphrase,
+    restoreFromRemote,
     lock,
   } = useVault();
+  const auth = useAuth();
+
+  const [isRestoring, setIsRestoring] = useState(false);
+  const [restoreError, setRestoreError] = useState<string | null>(null);
+
+  const handleRestoreVault = async () => {
+    if (!auth.session) return;
+    setIsRestoring(true);
+    setRestoreError(null);
+    handleClearError();
+    try {
+      const res = await restoreVaultFromAccount({
+        serverOrigin: auth.serverOrigin,
+        token: auth.session.token,
+        accountId: auth.session.accountId,
+        localBootstrap: bootstrap,
+      });
+      restoreFromRemote(res.bootstrap, res.link);
+    } catch (err: any) {
+      setRestoreError(err.message || "Failed to restore vault from account.");
+    } finally {
+      setIsRestoring(false);
+    }
+  };
 
   const [mode, setMode] = useState<"passphrase" | "recoveryKey">("passphrase");
   const [passphrase, setPassphrase] = useState("");
@@ -231,6 +261,9 @@ export const UnlockScreen: React.FC<UnlockScreenProps> = ({
   if (pendingRecoveryPhrase) {
     return (
       <div className="zk-unlock-container" style={containerStyle}>
+        <div style={{ position: "absolute", top: 16, right: 20, zIndex: 30 }}>
+          <AuthControls />
+        </div>
         <div className="zk-unlock-card" style={cardStyle}>
           <div style={{ textAlign: "center", marginBottom: 20 }}>
             <span style={iconBadgeStyle}>🔑</span>
@@ -469,6 +502,9 @@ export const UnlockScreen: React.FC<UnlockScreenProps> = ({
     const isBusy = vaultState === "UNLOCKING";
     return (
       <div className="zk-unlock-container" style={containerStyle}>
+        <div style={{ position: "absolute", top: 16, right: 20, zIndex: 30 }}>
+          <AuthControls />
+        </div>
         <div className="zk-unlock-card" style={cardStyle}>
           <div style={{ textAlign: "center", marginBottom: 24 }}>
             <span style={iconBadgeStyle}>🔒</span>
@@ -490,6 +526,61 @@ export const UnlockScreen: React.FC<UnlockScreenProps> = ({
               >
                 ×
               </button>
+            </div>
+          )}
+
+          {vaultLink && auth.isAuthenticated && (
+            normalizeServerOrigin(auth.serverOrigin) !== normalizeServerOrigin(vaultLink.serverOrigin) ||
+            auth.session?.accountId !== vaultLink.accountId
+          ) && (
+            <div role="alert" style={{ ...errorAlertStyle, marginBottom: 16 }}>
+              <span>
+                {normalizeServerOrigin(auth.serverOrigin) !== normalizeServerOrigin(vaultLink.serverOrigin)
+                  ? `⚠️ Connected to '${auth.serverOrigin}', but this browser was linked to server '${vaultLink.serverOrigin}'.`
+                  : `⚠️ Signed in as '${auth.session?.accountId}', but this browser was linked to account '${vaultLink.accountId}'.`}
+              </span>
+            </div>
+          )}
+
+          {auth.isAuthenticated && (
+            <div
+              style={{
+                marginBottom: 20,
+                padding: "12px 16px",
+                backgroundColor: "#f0fdf4",
+                border: "1px solid #bbf7d0",
+                borderRadius: "6px",
+                textAlign: "center",
+              }}
+              className="zk-restore-section"
+            >
+              <p style={{ margin: "0 0 10px 0", fontSize: "13px", color: "#166534" }}>
+                Signed in as <strong>{auth.session?.accountId}</strong>
+              </p>
+              <button
+                type="button"
+                onClick={handleRestoreVault}
+                disabled={isBusy || auth.isLoading || isRestoring}
+                style={{
+                  ...primaryButtonStyle,
+                  backgroundColor: "#16a34a",
+                  width: "100%",
+                }}
+                className="zk-restore-vault-button"
+              >
+                {isRestoring ? "Restoring Vault..." : "Restore Vault from Account"}
+              </button>
+              {restoreError && (
+                <p role="alert" style={{ margin: "8px 0 0 0", fontSize: "12px", color: "#b91c1c" }}>
+                  {restoreError}
+                </p>
+              )}
+            </div>
+          )}
+
+          {auth.isAuthenticated && (
+            <div style={{ textAlign: "center", margin: "0 0 16px 0", fontSize: "12px", color: "#9ca3af" }}>
+              — or create a new local vault —
             </div>
           )}
 
@@ -563,6 +654,9 @@ export const UnlockScreen: React.FC<UnlockScreenProps> = ({
 
   return (
     <div className="zk-unlock-container" style={containerStyle}>
+      <div style={{ position: "absolute", top: 16, right: 20, zIndex: 30 }}>
+        <AuthControls />
+      </div>
       <div className="zk-unlock-card" style={cardStyle}>
         <div style={{ textAlign: "center", marginBottom: 24 }}>
           <span style={iconBadgeStyle}>🔒</span>
@@ -570,7 +664,25 @@ export const UnlockScreen: React.FC<UnlockScreenProps> = ({
           <p style={subheadingStyle}>
             Enter your credentials to decrypt and access your zero-knowledge notes.
           </p>
+          {vaultLink && (
+            <p style={{ margin: "8px 0 0 0", fontSize: "12px", color: "#6b7280" }}>
+              Linked to account: <strong>{vaultLink.accountId}</strong> on <strong>{vaultLink.serverOrigin}</strong>
+            </p>
+          )}
         </div>
+
+        {vaultLink && auth.isAuthenticated && (
+          normalizeServerOrigin(auth.serverOrigin) !== normalizeServerOrigin(vaultLink.serverOrigin) ||
+          auth.session?.accountId !== vaultLink.accountId
+        ) && (
+          <div role="alert" style={{ ...errorAlertStyle, marginBottom: 16 }}>
+            <span>
+              {normalizeServerOrigin(auth.serverOrigin) !== normalizeServerOrigin(vaultLink.serverOrigin)
+                ? `⚠️ Connected to '${auth.serverOrigin}', but this vault is linked to server '${vaultLink.serverOrigin}'.`
+                : `⚠️ Signed in as '${auth.session?.accountId}', but this vault belongs to account '${vaultLink.accountId}'.`}
+            </span>
+          </div>
+        )}
 
         {/* Tab switchers */}
         <div style={tabContainerStyle}>
@@ -789,6 +901,7 @@ const containerStyle: React.CSSProperties = {
   padding: "16px",
   boxSizing: "border-box",
   backgroundColor: "#f9fafb",
+  position: "relative",
   fontFamily:
     "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif",
 };

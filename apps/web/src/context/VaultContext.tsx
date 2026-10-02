@@ -17,18 +17,22 @@ import React, {
 import { VaultWorkerClient, WorkerError } from "../worker/client.js";
 import { IndexedDbStorage } from "../storage/indexeddb.js";
 import { WorkerErrorCode } from "../worker/protocol.js";
+import {
+  VaultLinkRecord,
+  readVaultLink,
+  writeVaultLink,
+  assertNoPlaintextSecrets,
+  type VaultBootstrapData,
+} from "../auth/vault-link.js";
 
 export type VaultState = "UNINITIALIZED" | "LOCKED" | "UNLOCKING" | "UNLOCKED";
 
-export interface VaultBootstrapData {
-  wrappedVaultKey: string;
-  kdfParamsJson: string;
-  wrappedRecoveryKey: string;
-}
+export type { VaultBootstrapData };
 
 export interface VaultSnapshot {
   vaultState: VaultState;
   bootstrap: VaultBootstrapData | null;
+  vaultLink: VaultLinkRecord | null;
   error: string | null;
   autoLockTimeoutMinutes: number;
 }
@@ -36,6 +40,7 @@ export interface VaultSnapshot {
 export interface VaultContextType {
   vaultState: VaultState;
   bootstrap: VaultBootstrapData | null;
+  vaultLink: VaultLinkRecord | null;
   error: string | null;
   autoLockTimeoutMinutes: number;
   clearError: () => void;
@@ -49,6 +54,8 @@ export interface VaultContextType {
   ) => Promise<void>;
   lock: () => Promise<void>;
   setAutoLockTimeout: (minutes: number) => void;
+  setVaultLink: (link: VaultLinkRecord | null) => void;
+  restoreFromRemote: (bootstrap: VaultBootstrapData, link?: VaultLinkRecord) => void;
   recordActivity: () => void;
   checkIdleLock: () => Promise<void>;
   client: VaultWorkerClient;
@@ -60,25 +67,44 @@ const BOOTSTRAP_STORAGE_KEY = "zk_vault_bootstrap";
 export const DEFAULT_AUTO_LOCK_MINUTES = 15;
 export const AUTO_LOCK_STORAGE_KEY = "zk_autolock_minutes";
 
-function getStoredBootstrap(): VaultBootstrapData | null {
+export function getStoredBootstrap(
+  storage?: Pick<Storage, "getItem"> | null
+): VaultBootstrapData | null {
+  const store =
+    storage !== undefined
+      ? storage
+      : typeof window !== "undefined" && window.localStorage
+      ? window.localStorage
+      : null;
   try {
-    if (typeof window !== "undefined" && window.localStorage) {
-      const raw = window.localStorage.getItem(BOOTSTRAP_STORAGE_KEY);
+    if (store) {
+      const raw = store.getItem(BOOTSTRAP_STORAGE_KEY);
       if (raw) return JSON.parse(raw);
     }
   } catch {
-    // Ignore storage errors
+    // Ignore storage errors on read
   }
   return null;
 }
 
-function persistBootstrap(data: VaultBootstrapData): void {
-  try {
-    if (typeof window !== "undefined" && window.localStorage) {
-      window.localStorage.setItem(BOOTSTRAP_STORAGE_KEY, JSON.stringify(data));
+export function persistBootstrap(
+  data: VaultBootstrapData,
+  storage?: Pick<Storage, "setItem"> | null
+): void {
+  const store =
+    storage !== undefined
+      ? storage
+      : typeof window !== "undefined" && window.localStorage
+      ? window.localStorage
+      : null;
+
+  if (store) {
+    try {
+      assertNoPlaintextSecrets(data);
+      store.setItem(BOOTSTRAP_STORAGE_KEY, JSON.stringify(data));
+    } catch {
+      throw new Error("Failed to persist vault bootstrap to storage.");
     }
-  } catch {
-    // Ignore storage errors
   }
 }
 
@@ -117,6 +143,7 @@ function persistAutoLockTimeout(minutes: number): void {
 export class VaultStore {
   private state: VaultState;
   private bootstrap: VaultBootstrapData | null;
+  private vaultLink: VaultLinkRecord | null = null;
   private error: string | null = null;
   private autoLockTimeoutMinutes: number;
   private lastActivityTime: number = Date.now();
@@ -130,18 +157,37 @@ export class VaultStore {
     public readonly client: VaultWorkerClient,
     public readonly storage: IndexedDbStorage,
     initialBootstrap: VaultBootstrapData | null = null,
-    initialAutoLockMinutes?: number
+    initialAutoLockMinutes?: number,
+    initialVaultLink?: VaultLinkRecord | null,
+    private readonly localStore: Pick<Storage, "getItem" | "setItem" | "removeItem"> | null = typeof window !== "undefined" && window.localStorage ? window.localStorage : (typeof localStorage !== "undefined" ? localStorage : null)
   ) {
     this.autoLockTimeoutMinutes =
       initialAutoLockMinutes !== undefined
         ? initialAutoLockMinutes
         : getStoredAutoLockTimeout();
 
+    if (initialVaultLink !== undefined) {
+      this.vaultLink = initialVaultLink;
+    } else {
+      try {
+        this.vaultLink =
+          this.localStore
+            ? readVaultLink(this.localStore)
+            : null;
+      } catch (err) {
+        this.vaultLink = null;
+        this.error =
+          err instanceof Error
+            ? err.message
+            : "Failed to read vault link association from storage.";
+      }
+    }
+
     if (initialBootstrap !== undefined && initialBootstrap !== null) {
       this.bootstrap = initialBootstrap;
       this.state = "LOCKED";
     } else if (initialBootstrap === null) {
-      const stored = getStoredBootstrap();
+      const stored = getStoredBootstrap(this.localStore);
       if (stored) {
         this.bootstrap = stored;
         this.state = "LOCKED";
@@ -157,6 +203,7 @@ export class VaultStore {
     this.snapshot = {
       vaultState: this.state,
       bootstrap: this.bootstrap,
+      vaultLink: this.vaultLink,
       error: this.error,
       autoLockTimeoutMinutes: this.autoLockTimeoutMinutes,
     };
@@ -201,6 +248,7 @@ export class VaultStore {
     this.snapshot = {
       vaultState: this.state,
       bootstrap: this.bootstrap,
+      vaultLink: this.vaultLink,
       error: this.error,
       autoLockTimeoutMinutes: this.autoLockTimeoutMinutes,
     };
@@ -213,6 +261,40 @@ export class VaultStore {
   public getSnapshot = (): VaultSnapshot => {
     return this.snapshot;
   };
+
+  public getVaultLink(): VaultLinkRecord | null {
+    return this.vaultLink;
+  }
+
+  public setVaultLink(link: VaultLinkRecord | null): void {
+    if (this.localStore) {
+      writeVaultLink(this.localStore, link);
+    }
+    this.vaultLink = link;
+    this.notify();
+  }
+
+  public restoreFromRemote(
+    bootstrap: VaultBootstrapData,
+    link?: VaultLinkRecord
+  ): void {
+    // 1. Observable/failable persistence of bootstrap
+    persistBootstrap(bootstrap, this.localStore);
+
+    // 2. Observable/failable persistence of link record
+    if (link !== undefined) {
+      if (this.localStore) {
+        writeVaultLink(this.localStore, link);
+      }
+      this.vaultLink = link;
+    }
+
+    // 3. Only transition state and notify after durable storage write succeeds
+    this.bootstrap = bootstrap;
+    this.state = "LOCKED";
+    this.error = null;
+    this.notify();
+  }
 
   public setAutoLockTimeout(minutes: number): void {
     this.autoLockTimeoutMinutes = Math.max(0, minutes);
@@ -278,6 +360,9 @@ export class VaultStore {
           return "Cryptographic operation failed.";
       }
     }
+    if (err instanceof Error && err.message.includes("Failed to persist")) {
+      return err.message;
+    }
     return "An unexpected error occurred.";
   }
 
@@ -297,7 +382,7 @@ export class VaultStore {
         wrappedRecoveryKey: res.wrappedRecoveryKey,
       };
 
-      persistBootstrap(newBootstrap);
+      persistBootstrap(newBootstrap, this.localStore);
 
       this.bootstrap = newBootstrap;
       this.state = "UNLOCKED";
@@ -397,7 +482,7 @@ export class VaultStore {
         wrappedRecoveryKey: this.bootstrap.wrappedRecoveryKey,
       };
 
-      persistBootstrap(newBootstrap);
+      persistBootstrap(newBootstrap, this.localStore);
       this.bootstrap = newBootstrap;
       this.notify();
     } catch (err) {
@@ -436,6 +521,8 @@ export interface VaultProviderProps {
   storage: IndexedDbStorage;
   initialBootstrap?: VaultBootstrapData | null;
   initialAutoLockMinutes?: number;
+  initialVaultLink?: VaultLinkRecord | null;
+  localStore?: Pick<Storage, "getItem" | "setItem" | "removeItem"> | null;
   children: React.ReactNode;
 }
 
@@ -444,11 +531,21 @@ export const VaultProvider: React.FC<VaultProviderProps> = ({
   storage,
   initialBootstrap = null,
   initialAutoLockMinutes,
+  initialVaultLink,
+  localStore,
   children,
 }) => {
   const store = useMemo(
-    () => new VaultStore(client, storage, initialBootstrap, initialAutoLockMinutes),
-    [client, storage, initialBootstrap, initialAutoLockMinutes]
+    () =>
+      new VaultStore(
+        client,
+        storage,
+        initialBootstrap,
+        initialAutoLockMinutes,
+        initialVaultLink,
+        localStore
+      ),
+    [client, storage, initialBootstrap, initialAutoLockMinutes, initialVaultLink, localStore]
   );
 
   useEffect(() => {
@@ -501,6 +598,9 @@ export const VaultProvider: React.FC<VaultProviderProps> = ({
       get bootstrap() {
         return store.getState().bootstrap;
       },
+      get vaultLink() {
+        return store.getState().vaultLink;
+      },
       get error() {
         return store.getState().error;
       },
@@ -515,6 +615,9 @@ export const VaultProvider: React.FC<VaultProviderProps> = ({
         store.rewrapPassphrase(p, k, old),
       lock: () => store.lock(),
       setAutoLockTimeout: (minutes: number) => store.setAutoLockTimeout(minutes),
+      setVaultLink: (link: VaultLinkRecord | null) => store.setVaultLink(link),
+      restoreFromRemote: (b: VaultBootstrapData, l?: VaultLinkRecord) =>
+        store.restoreFromRemote(b, l),
       recordActivity: () => store.recordActivity(),
       checkIdleLock: () => store.checkIdleLock(),
       client: store.client,
@@ -526,6 +629,10 @@ export const VaultProvider: React.FC<VaultProviderProps> = ({
 
   return <VaultContext.Provider value={value}>{children}</VaultContext.Provider>;
 };
+
+export function useVaultOptional(): VaultContextType | null {
+  return useContext(VaultContext);
+}
 
 export function useVault(): VaultContextType {
   const ctx = useContext(VaultContext);

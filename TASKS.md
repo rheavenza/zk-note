@@ -121,13 +121,31 @@ Expired sessions now show an explicit state. Failed or offline server revocation
 keeps the session available for a sign-out retry. Web checks pass at merge.
 
 ## ZK-105 — Safely link and restore encrypted vault bootstrap
-State: BACKLOG
+State: DONE (PR open / review pending)
 Priority: P1
 Dependencies: ZK-104
 Ticket: [docs/tickets/ZK-105.md](docs/tickets/ZK-105.md)
 Acceptance: encrypted bootstrap upload and second-device restore; mismatch,
 wrong account, and interrupted retry never overwrite a vault.
 Verification: web gates, protocol tests, and redacted two-browser evidence.
+Implementation note: Safe linking and remote bootstrap restoration implemented
+in `apps/web/src/auth/vault-link.ts`. Only encrypted bootstrap envelopes and
+permitted KDF/version parameters are transmitted; plaintexts, passphrases, raw keys,
+and recovery keys are strictly excluded and guarded by `assertNoPlaintextSecrets`.
+Mismatched vaults, wrong-account states, and existing conflicting local vaults fail
+non-destructively without silent overwrite. Network interruption and 409 conflict
+retries preserve local state deterministically. Vault state machine, `AuthControls`,
+and `UnlockScreen` provide link/restore UI flows. Addressed PR #10 review findings:
+enforced full `(serverOrigin, accountId)` identity validation with `OriginMismatchError`
+and `WrongAccountError` across both link and restore flows; enforced existing link checks
+in uninitialized and initialized restore; made storage persistence fail-closed across
+`writeVaultLink`, `clearVaultLink`, and `persistBootstrap` so state machine transitions
+never falsely report success on storage write failure; added web quality gates and build
+job to GitHub Actions CI workflow; made `readVaultLink` fail closed on storage read exceptions
+(`STORAGE_ERROR`) and corrupt link records (`CORRUPT_VAULT_LINK`) before any network dispatch,
+strictly reserving `null` for key absence. 142 automated web tests pass, including end-to-end
+multi-thread Web Worker bootstrap restoration and unlocking. All repository-wide
+Rust and web quality gates pass cleanly.
 
 ## ZK-106 — Durable browser ciphertext synchronization
 State: BACKLOG
