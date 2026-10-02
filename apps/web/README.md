@@ -99,14 +99,114 @@ origin and remembers it for this browser origin; changing it clears the current
 session. Passkey sign-in requires the web page and API on the same HTTPS origin,
 so enter the server's HTTPS web address and open the app there. An HTTP LAN API
 address can be stored, but a web page on `localhost` cannot use it for passkey
-sign-in with a server configured for another RP domain. It does not upload the
-local vault. Until the vault-link
-and sync tickets are implemented, the sync indicator says **local only** and
-the Sync action cannot record a successful server sync.
+sign-in with a server configured for another RP domain. Signing in does not
+upload the local vault — linking is a separate, explicit step.
 
 See [same-origin Termux deployment](../../docs/deployment-web-termux.md) for a
 supervised Caddy setup that serves the web client and API behind one HTTPS
 hostname.
+
+---
+
+## 2a. End-to-end workflow: link, sync, restore, and conflict (ZK-107)
+
+### First device
+
+1. **Configure the server origin.** Open the app on the origin that the server
+   uses for WebAuthn (`ZK_WEBAUTHN_ORIGIN`), and leave the Account panel's
+   **Server address** at that same origin.
+2. **Register or sign in.** In the Account panel, enter an account name and use
+   **Create account**, or **Sign in with passkey** on an existing device.
+3. **Create or unlock the local vault.** Enter a master passphrase. The passphrase
+   derives keys locally and is never sent to the server. Save the recovery key.
+4. **Link the vault to the account.** Open the Account panel and choose
+   **Link vault to account**. This uploads only the encrypted bootstrap envelope
+   plus KDF/crypto-version metadata. Linking re-locks the vault so the account's
+   storage is selected; unlock again to continue.
+5. **Sync.** Use **Sync Now** in the sync status popover. The badge only reports
+   **synced** after a completed authenticated server round trip.
+
+### Local save vs. server sync
+
+Two independent indicators report two different facts:
+
+- The editor badge (**Saved locally**) means the note is encrypted and durable on
+  *this device*. It never means the server has the note.
+- The sync badge reports the remote picture: **local only** (no account linked),
+  **sign in to sync** (linked, but no matching session), **not synced yet**
+  (linked and signed in, no round trip completed), **pending changes**, **syncing**,
+  **synced**, **offline**, **error**, or **conflict**.
+
+`last_sync_at` advances only after a successful round trip. Saving, reloading, or
+working offline never sets **synced**.
+
+### Second device
+
+1. Sign in to the same account with a passkey on the new browser.
+2. With no local vault, choose **Restore vault from account**.
+3. Unlock with the master passphrase or recovery key. Only then is the downloaded
+   ciphertext decrypted, and the notes become readable.
+
+If the browser already has a *different* local vault, restore refuses to continue
+and preserves both sides — no automatic overwrite in either direction.
+
+### Working offline and conflicts
+
+Edits made offline are written as durable encrypted mutations with stable
+idempotency ids and appear as **pending changes** (or **offline** with a count).
+They upload on the next successful sync; retrying after a lost response reuses the
+same mutation id, so the server does not create a duplicate revision.
+
+When the same note changes on two devices, the losing side shows **conflict**
+until it is explicitly resolved through the conflict workspace (keep local, keep
+remote, merge, or preserve both). Deletions are revisioned tombstones and are
+never silently resurrected.
+
+### Expired or revoked authentication
+
+A signed-out, expired, or different-account session never hides or deletes local
+encrypted notes. The app stays on the vault's account-scoped database and reports
+**sign in to sync**; queued changes stay **pending** until you sign back in to the
+account the vault is linked to. Signing in to a *different* account keeps the
+linked vault but leaves sync disabled.
+
+### Browser storage behavior
+
+| Data | Where | Survives sign-out / expiry |
+| :--- | :--- | :--- |
+| Auth session (`zk_auth_session_v2`) | `sessionStorage` | No (per-tab, cleared) |
+| Server address (`zk_server_origin`) | `localStorage` | Yes |
+| Vault bootstrap (`zk_vault_bootstrap`) | `localStorage` | Yes |
+| Vault link `(serverOrigin, accountId)` (`zk_vault_link`) | `localStorage` | Yes |
+| Encrypted notes, mutations, conflicts | IndexedDB | Yes |
+
+Encrypted notes live in `zk_notes_db` while the vault is unlinked, and move once
+(when you link) into a scoped database derived from `(serverOrigin, accountId)`.
+Only ciphertext is stored: note bodies, titles, tags, and search indexes exist in
+memory only while the vault is unlocked, and are cleared on lock. Nothing is
+removed except by an explicit destructive action (a revisioned tombstone delete,
+or clearing site data in the browser).
+
+### Browser acceptance tests
+
+The real-browser suite drives the production bundle against a real local
+`zk-server` with a Chromium virtual passkey:
+
+```bash
+cd apps/web
+npm run build                 # required once; zk-wasm pkg must be built first
+npm run test:e2e              # Playwright: two-browser sync, offline, conflict, lock/auth
+ZK_E2E_HTTPS=1 npm run test:e2e   # same suite over a throwaway TLS origin
+```
+
+`ZK_E2E_HTTPS=1` serves the bundle over `https://localhost` with a self-signed
+certificate, matching the deployment requirement that the app and API share a
+single TLS origin; WebAuthn RP ID stays `localhost`.
+
+`e2e/zero-knowledge-evidence.spec.ts` additionally asserts that no plaintext ever
+leaves the browser and writes a redacted payload-shape report into
+`e2e-results/`. The committed, reviewer-facing copy is
+[ZK-107 network evidence](../../docs/tickets/ZK-107-network-evidence.md).
 
 ---
 
