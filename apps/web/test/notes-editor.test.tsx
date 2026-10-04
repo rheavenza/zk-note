@@ -454,3 +454,86 @@ test("End-to-End: Create, edit, autosave, reload, and lock notes with real WebAs
     await storage.close();
   }
 });
+
+// ----------------------------------------------------------------------------
+// 6. ZK-107 regression: a background pull must not rebase an in-flight edit
+// ----------------------------------------------------------------------------
+
+function remoteEnvelope(objectId: string, tag: string) {
+  return {
+    envelope_version: 1,
+    object_id: objectId,
+    object_kind: 1,
+    wrapped_key: { nonce: "nonce-k", ciphertext: `ct-k-${tag}` },
+    payload: { nonce: "nonce-p", ciphertext: `ct-p-${tag}` },
+  };
+}
+
+test("ZK-107: a pull landing mid-edit does not rebase the queued upsert (SEC-006)", async () => {
+  const { client } = createMockWorkerClient();
+  const storage = new IndexedDbStorage(`test-zk107-edit-base-${Date.now()}`);
+  const store = new NotesStore(client, storage);
+  await store.handleVaultUnlocked();
+
+  const note = await store.createNote({ title: "Base", body: "v1" });
+  assert.equal((await storage.getObject(note.id))?.revision, 1, "create persists revision 1");
+
+  // The user begins editing: their in-memory text is based on revision 1.
+  store.updateNote(note.id, { body: "local edit based on revision 1" });
+
+  // A concurrent sync pull stores remote revision 2 before the autosave flushes.
+  await storage.putObject({
+    object_id: note.id,
+    object_kind: 1,
+    revision: 2,
+    server_seq: 2,
+    is_deleted: false,
+    envelope: remoteEnvelope(note.id, "remote"),
+    updated_at: new Date().toISOString(),
+  });
+
+  await store.saveNoteNow(note.id);
+
+  const mutations = (await storage.listPendingMutations()).filter((m) => m.object_id === note.id);
+  const upsert = mutations[mutations.length - 1];
+  assert.ok(upsert, "an upsert mutation should be queued");
+  assert.equal(
+    upsert.expected_revision,
+    1,
+    "the queued mutation must keep the pre-pull base so the push conflicts instead of overwriting"
+  );
+
+  store.dispose();
+  await storage.close();
+});
+
+test("ZK-107: a pull landing before a delete does not rebase the tombstone mutation", async () => {
+  const { client } = createMockWorkerClient();
+  const storage = new IndexedDbStorage(`test-zk107-delete-base-${Date.now()}`);
+  const store = new NotesStore(client, storage);
+  await store.handleVaultUnlocked();
+
+  const note = await store.createNote({ title: "Base", body: "v1" });
+
+  // Remote revision 2 arrives before the user deletes what they were looking at.
+  await storage.putObject({
+    object_id: note.id,
+    object_kind: 1,
+    revision: 2,
+    server_seq: 2,
+    is_deleted: false,
+    envelope: remoteEnvelope(note.id, "remote"),
+    updated_at: new Date().toISOString(),
+  });
+
+  await store.deleteNote(note.id);
+
+  const deletion = (await storage.listPendingMutations()).find(
+    (m) => m.object_id === note.id && m.mutation_type === MutationType.Delete
+  );
+  assert.ok(deletion, "a delete mutation should be queued");
+  assert.equal(deletion.expected_revision, 1, "the tombstone must target the pre-pull base");
+
+  store.dispose();
+  await storage.close();
+});

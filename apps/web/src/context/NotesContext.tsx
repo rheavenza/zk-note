@@ -88,6 +88,16 @@ export class NotesStore {
   private listeners = new Set<() => void>();
   private saveTimers = new Map<string, NodeJS.Timeout | number>();
   private isUnlocked = false;
+  /**
+   * The server revision the in-memory plaintext of each note is based on.
+   *
+   * Advanced by local writes and refreshed from storage only when the note is
+   * (re)loaded — never by a background pull that stores ciphertext on its own.
+   * Otherwise a remote pull landing mid-edit would rebase the queued mutation on
+   * the pulled revision, letting the next push satisfy CAS and silently overwrite
+   * the remote edit instead of conflicting (SEC-006).
+   */
+  private knownRevisions = new Map<string, number>();
   public readonly attachmentManager: AttachmentManager;
   private attachmentProgress: AttachmentProgress | null = null;
   private snapshot: NotesSnapshot;
@@ -171,17 +181,22 @@ export class NotesStore {
     // Wipe decrypted data from memory
     this.notes = [];
     this.selectedNoteId = null;
+    this.knownRevisions.clear();
     this.saveStatus = "saved";
     this.error = null;
     this.notify();
   }
 
   /**
-   * True while a local edit is not yet durably persisted — either a debounced
-   * autosave is pending or a save is currently in flight.
+   * True while a local edit is not yet durably persisted.
+   *
+   * Any status other than "saved" counts: `updateNote` notifies listeners before
+   * it registers the debounce timer, so relying on the timer map alone would leave
+   * a window where an in-memory edit looks clean. "error" counts too — a failed
+   * save means the user's text exists only in memory.
    */
   public hasUnpersistedEdits(): boolean {
-    return this.saveTimers.size > 0 || this.saveStatus === "saving";
+    return this.saveStatus !== "saved" || this.saveTimers.size > 0;
   }
 
   /**
@@ -206,6 +221,16 @@ export class NotesStore {
 
       // The user may have started typing while ciphertext was being read.
       if (options?.skipIfDirty && this.hasUnpersistedEdits()) return false;
+
+      // The plaintext about to be rebuilt in memory is based on exactly these
+      // stored revisions, so re-anchor the mutation base here.
+      const presentIds = new Set(storedObjects.map((object) => object.object_id));
+      for (const object of storedObjects) {
+        this.knownRevisions.set(object.object_id, object.revision);
+      }
+      for (const id of [...this.knownRevisions.keys()]) {
+        if (!presentIds.has(id)) this.knownRevisions.delete(id);
+      }
 
       if (storedObjects.length === 0) {
         this.notes = [];
@@ -396,8 +421,10 @@ export class NotesStore {
       this.saveTimers.delete(id);
     }
 
+    // Same CAS base rule as persistNoteToStorage: the revision the note's visible
+    // content was based on, not whatever a concurrent pull may have stored since.
     const existingObject = await this.storage.getObject(id);
-    const expectedRevision = existingObject ? existingObject.revision : 0;
+    const expectedRevision = this.knownRevisions.get(id) ?? (existingObject ? existingObject.revision : 0);
     const nextRevision = expectedRevision + 1;
     const now = new Date().toISOString();
 
@@ -412,6 +439,7 @@ export class NotesStore {
 
     // 1. Record tombstone in local object store
     await this.storage.markDeleted(id, nextRevision, tombstoneEnvelope, now);
+    this.knownRevisions.delete(id);
 
     // 2. Queue pending mutation for sync
     const mutationId = (typeof crypto !== "undefined" && crypto.randomUUID)
@@ -460,9 +488,13 @@ export class NotesStore {
     );
     const envelope: EncryptedEnvelopeDto = JSON.parse(encRes.envelopeJson);
 
-    // 2. Check current stored revision to compute CAS expected revision
+    // 2. Compute the CAS expected revision from the revision this note's plaintext
+    //    is based on — NOT from whatever is in storage now. A background pull may
+    //    have stored a newer remote revision since the edit began, and using that
+    //    as the base would let the push satisfy CAS and silently overwrite the
+    //    remote edit (SEC-006).
     const existing = await this.storage.getObject(note.id);
-    const expectedRevision = existing ? existing.revision : 0;
+    const expectedRevision = this.knownRevisions.get(note.id) ?? (existing ? existing.revision : 0);
     const nextRevision = expectedRevision + 1;
 
     const storedObject: StoredEncryptedObject = {
@@ -477,6 +509,7 @@ export class NotesStore {
 
     // 3. Write encrypted envelope to local objects store
     await this.storage.putObject(storedObject);
+    this.knownRevisions.set(note.id, nextRevision);
 
     // 4. Queue pending mutation for offline-first sync
     const mutationId = (typeof crypto !== "undefined" && crypto.randomUUID)
