@@ -217,7 +217,7 @@ and pulled remote changes never refreshed the note list. All three blocked ZK-10
 key material crosses the network for bootstrap upload, push, pull, conflict, tombstone, and auth.
 5) Updated the web README and `docs/deployment-web-termux.md` with the real user procedure, browser
 storage behavior, and a deployment acceptance checklist.
-6) All gates pass: web lint/typecheck/typecheck:e2e/test (184)/build/e2e (18, over HTTP and HTTPS);
+6) All gates pass: web lint/typecheck/typecheck:e2e/test (185)/build/e2e (18, over HTTP and HTTPS);
 Rust fmt/clippy/test (491). Live staging smoke remains PENDING (no operator origin/credentials
 available); local automated HTTPS browser evidence is recorded instead.
 7) Review follow-up (PR #12): fixed a CAS-base race where a pull landing mid-edit let the queued
@@ -228,6 +228,11 @@ state event-driven off the storage layer so a durable local save can no longer r
 up to a poll interval, and made the CI browser job an http/https matrix so ZK_E2E_HTTPS=1 is
 independently reproducible. Also closed the conflict-resolution browser coverage gap (Keep Local,
 Preserve Both now completed end to end, not just opened).
+8) Second-round review follow-up: closed the remaining SEC-006 interleaving where reloadNotes()
+re-anchored the revision map before awaiting batch decryption, so an edit typed during decryption
+kept the old visible text but picked up the pulled revision as its CAS base. The re-anchor now
+happens in the same synchronous step as the plaintext replacement, after the final dirty check;
+covered by a unit test that gates decryption to inject the edit mid-flight.
 
 ## ZK-108 — Username/password authentication alongside passkeys
 State: READY
