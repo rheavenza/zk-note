@@ -74,6 +74,31 @@ test.describe("ZK-107 truthful synchronization state", () => {
     await context.close();
   });
 
+  test("a durable local change stops claiming synced immediately, not on a poll", async ({
+    browser,
+  }) => {
+    const { context, page } = await openBrowser(browser);
+    // Freeze page timers so the 3-second status poll cannot fire. The badge must
+    // still react to the durable mutation, proving it is event-driven (ZK-107 A).
+    await page.clock.install();
+    await page.goto("/");
+
+    await createVault(page);
+    await createAccount(page, "owner-immediate");
+    await linkVault(page);
+    await ensureUnlocked(page);
+    await triggerSync(page);
+    await expectStatus(page, "synced");
+
+    await createNote(page, "Immediate Pending", "durable local change");
+    // No timer can help here: only the storage notification can flip the badge.
+    await expect(page.locator(".zk-sync-label")).toHaveText("pending changes", {
+      timeout: 5_000,
+    });
+
+    await context.close();
+  });
+
   test("signing out keeps linked local notes but disables sync", async ({ browser }) => {
     const { context, page } = await openBrowser(browser);
     await page.goto("/");

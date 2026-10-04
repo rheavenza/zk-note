@@ -61,6 +61,7 @@ export class IndexedDbStorage {
   private idbFactory: IDBFactory;
   private dbPromise: Promise<IDBDatabase> | null = null;
   private migrationPromise: Promise<boolean> | null = null;
+  private mutationQueueListeners = new Set<() => void>();
 
   constructor(dbName = DEFAULT_DB_NAME, idbFactory?: IDBFactory) {
     this.dbName = dbName;
@@ -81,6 +82,29 @@ export class IndexedDbStorage {
    */
   public getDatabaseName(): string {
     return this.dbName;
+  }
+
+  /**
+   * Subscribes to durable pending-mutation queue changes (enqueue, status update,
+   * removal). Lets the sync status react to a local save immediately instead of
+   * discovering it on the next poll, so a durable local change can never be shown
+   * as "synced" (ZK-107 acceptance A).
+   */
+  public onMutationQueueChanged(listener: () => void): () => void {
+    this.mutationQueueListeners.add(listener);
+    return () => {
+      this.mutationQueueListeners.delete(listener);
+    };
+  }
+
+  private notifyMutationQueueChanged(): void {
+    for (const listener of this.mutationQueueListeners) {
+      try {
+        listener();
+      } catch {
+        // A misbehaving listener must not break the storage write that succeeded.
+      }
+    }
   }
 
   /**
@@ -393,7 +417,10 @@ export class IndexedDbStorage {
       const store = tx.objectStore("mutations");
       const req = store.put(mutation);
 
-      req.onsuccess = () => resolve();
+      req.onsuccess = () => {
+        resolve();
+        this.notifyMutationQueueChanged();
+      };
       req.onerror = () => reject(req.error);
     });
   }
@@ -464,7 +491,10 @@ export class IndexedDbStorage {
       const store = tx.objectStore("mutations");
       const req = store.delete(mutationId);
 
-      req.onsuccess = () => resolve(true);
+      req.onsuccess = () => {
+        resolve(true);
+        this.notifyMutationQueueChanged();
+      };
       req.onerror = () => reject(req.error);
     });
   }

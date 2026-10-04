@@ -184,6 +184,39 @@ test("ZK-107: unlinked vault with a configured-looking adapter still reports loc
   await storage.close();
 });
 
+test("ZK-107: a durable local mutation updates pending status without waiting for a poll", async () => {
+  const storage = new IndexedDbStorage("test-sync-immediate-pending");
+  const store = new SyncStore(storage, completeAdapter);
+  store.setLinkContext({ linked: true, identity: "http://localhost:8080::acct-1" });
+  await store.refreshStatus();
+  assert.equal(store.getStatus(), "not synced yet");
+
+  // Mirrors how SyncProvider wires the storage notification to the sync store.
+  const unsubscribe = storage.onMutationQueueChanged(() => {
+    void store.refreshStatus();
+  });
+
+  await storage.enqueueMutation({
+    mutation_id: "mut-immediate-1",
+    object_id: "note-immediate-1",
+    expected_revision: 0,
+    object_kind: 1,
+    mutation_type: MutationType.Upsert,
+    envelope: DUMMY_ENVELOPE,
+    created_at: new Date().toISOString(),
+    retry_count: 0,
+    status: MutationStatus.Pending,
+  });
+
+  // A single macrotask is enough: no 3-second polling interval is involved.
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(store.getStatus(), "pending changes");
+  assert.equal(store.getPendingCount(), 1);
+
+  unsubscribe();
+  await storage.close();
+});
+
 test("Sync status displays 'pending changes' when queued mutations exist", async () => {
   const client = createMockSyncWorkerClient();
   const storage = new IndexedDbStorage("test-sync-state-pending");

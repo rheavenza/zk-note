@@ -428,6 +428,25 @@ export const SyncProvider: React.FC<SyncProviderProps> = ({
     }
   }, [store, activeAdapter, linkContext, propStore]);
 
+  // React to durable mutation-queue changes immediately. Polling alone left the
+  // badge claiming "synced" for up to one poll interval after a local change was
+  // already durable; a local save must never be presented as server-synchronized
+  // (ZK-107 acceptance A). Notifications are coalesced per microtask because a
+  // single sync updates many mutation statuses in a burst.
+  useEffect(() => {
+    if (propStore) return undefined;
+    let scheduled = false;
+    const unsubscribe = storage.onMutationQueueChanged(() => {
+      if (scheduled) return;
+      scheduled = true;
+      queueMicrotask(() => {
+        scheduled = false;
+        void store.refreshStatus();
+      });
+    });
+    return unsubscribe;
+  }, [store, storage, propStore]);
+
   useEffect(() => {
     return () => {
       store.dispose();
