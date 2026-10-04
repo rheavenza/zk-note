@@ -109,8 +109,18 @@ jobs:
         run: npm run build
 
   web-e2e:
-    name: Web Browser Acceptance (Playwright)
+    name: Web Browser Acceptance (Playwright, ${{ matrix.mode }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mode: http
+            https: "0"
+          - mode: https
+            https: "1"
+    env:
+      ZK_E2E_HTTPS: ${{ matrix.https }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -144,7 +154,7 @@ jobs:
         working-directory: apps/web
         run: npx playwright install --with-deps chromium
 
-      - name: Run browser acceptance suite
+      - name: Run browser acceptance suite (${{ matrix.mode }})
         working-directory: apps/web
         run: npm run test:e2e
 
@@ -152,6 +162,6 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: playwright-report
+          name: playwright-report-${{ matrix.mode }}
           path: apps/web/e2e-results/
           retention-days: 7
