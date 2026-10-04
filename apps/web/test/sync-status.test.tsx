@@ -192,8 +192,11 @@ test("ZK-107: a durable local mutation updates pending status without waiting fo
   assert.equal(store.getStatus(), "not synced yet");
 
   // Mirrors how SyncProvider wires the storage notification to the sync store.
+  let notifications = 0;
+  let refresh: Promise<void> | null = null;
   const unsubscribe = storage.onMutationQueueChanged(() => {
-    void store.refreshStatus();
+    notifications += 1;
+    refresh = store.refreshStatus();
   });
 
   await storage.enqueueMutation({
@@ -208,10 +211,49 @@ test("ZK-107: a durable local mutation updates pending status without waiting fo
     status: MutationStatus.Pending,
   });
 
-  // A single macrotask is enough: no 3-second polling interval is involved.
-  await new Promise((resolve) => setTimeout(resolve, 0));
+  // The notification must already have fired by the time the durable write
+  // resolves, and its refresh must be awaitable — no timer or poll involved.
+  assert.equal(notifications, 1, "a durable enqueue must emit exactly one notification");
+  const pendingRefresh = refresh as Promise<void> | null;
+  assert.ok(pendingRefresh, "the notification must refresh the sync status");
+  await pendingRefresh;
+
   assert.equal(store.getStatus(), "pending changes");
   assert.equal(store.getPendingCount(), 1);
+
+  unsubscribe();
+  await storage.close();
+});
+
+test("ZK-107: the queue-changed notification announces an already-readable mutation", async () => {
+  const storage = new IndexedDbStorage("test-queue-notify-commit");
+
+  // Contract the sync badge depends on: when a listener is told the durable queue
+  // changed, the announced mutation can already be read back. Note this does not
+  // discriminate request-callback vs transaction-commit emission under
+  // fake-indexeddb — it pins the observable contract, not the internal ordering.
+  let readAtNotification: Promise<number> | null = null;
+  const unsubscribe = storage.onMutationQueueChanged(() => {
+    readAtNotification = storage
+      .listPendingMutations()
+      .then((mutations) => mutations.filter((m) => m.mutation_id === "mut-commit-1").length);
+  });
+
+  await storage.enqueueMutation({
+    mutation_id: "mut-commit-1",
+    object_id: "note-commit-1",
+    expected_revision: 0,
+    object_kind: 1,
+    mutation_type: MutationType.Upsert,
+    envelope: DUMMY_ENVELOPE,
+    created_at: new Date().toISOString(),
+    retry_count: 0,
+    status: MutationStatus.Pending,
+  });
+
+  const observed = readAtNotification as Promise<number> | null;
+  assert.ok(observed, "enqueue must emit a queue-changed notification");
+  assert.equal(await observed, 1, "the announced mutation must already be committed");
 
   unsubscribe();
   await storage.close();

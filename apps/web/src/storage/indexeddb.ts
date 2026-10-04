@@ -108,6 +108,32 @@ export class IndexedDbStorage {
   }
 
   /**
+   * Resolves once the transaction has durably committed — and only then.
+   *
+   * IndexedDB fires a request's `onsuccess` before the surrounding transaction
+   * commits, so resolving there would let callers (and the durable-queue
+   * notification) run ahead of durability: a reader started immediately after
+   * could still observe the pre-write state, and an aborted transaction would
+   * have been reported as success. Every write gates its result on commit.
+   */
+  private commitWrite(tx: IDBTransaction, onCommitted?: () => void): Promise<void> {
+    return new Promise((resolve, reject) => {
+      tx.oncomplete = () => {
+        if (onCommitted) {
+          try {
+            onCommitted();
+          } catch {
+            // A misbehaving listener must not break a write that did commit.
+          }
+        }
+        resolve();
+      };
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error ?? new Error("IndexedDB transaction aborted"));
+    });
+  }
+
+  /**
    * Opens or initializes the IndexedDB database.
    */
   public async getDb(): Promise<IDBDatabase> {
@@ -337,14 +363,9 @@ export class IndexedDbStorage {
 
   public async putObject(object: StoredEncryptedObject): Promise<void> {
     const db = await this.getDb();
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction("objects", "readwrite");
-      const store = tx.objectStore("objects");
-      const req = store.put(object);
-
-      req.onsuccess = () => resolve();
-      req.onerror = () => reject(req.error);
-    });
+    const tx = db.transaction("objects", "readwrite");
+    tx.objectStore("objects").put(object);
+    await this.commitWrite(tx);
   }
 
   public async listObjects(filter?: ObjectFilter): Promise<StoredEncryptedObject[]> {
@@ -396,14 +417,10 @@ export class IndexedDbStorage {
       return false;
     }
     const db = await this.getDb();
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction("objects", "readwrite");
-      const store = tx.objectStore("objects");
-      const req = store.delete(objectId);
-
-      req.onsuccess = () => resolve(true);
-      req.onerror = () => reject(req.error);
-    });
+    const tx = db.transaction("objects", "readwrite");
+    tx.objectStore("objects").delete(objectId);
+    await this.commitWrite(tx);
+    return true;
   }
 
   // ==========================================================================
@@ -412,17 +429,11 @@ export class IndexedDbStorage {
 
   public async enqueueMutation(mutation: PendingMutation): Promise<void> {
     const db = await this.getDb();
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction("mutations", "readwrite");
-      const store = tx.objectStore("mutations");
-      const req = store.put(mutation);
-
-      req.onsuccess = () => {
-        resolve();
-        this.notifyMutationQueueChanged();
-      };
-      req.onerror = () => reject(req.error);
-    });
+    const tx = db.transaction("mutations", "readwrite");
+    tx.objectStore("mutations").put(mutation);
+    // Notify only once committed: the queue-changed signal must mean "on disk",
+    // because the sync badge's truthfulness is built on it.
+    await this.commitWrite(tx, () => this.notifyMutationQueueChanged());
   }
 
   public async getMutation(mutationId: string): Promise<PendingMutation | null> {
@@ -486,17 +497,10 @@ export class IndexedDbStorage {
       return false;
     }
     const db = await this.getDb();
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction("mutations", "readwrite");
-      const store = tx.objectStore("mutations");
-      const req = store.delete(mutationId);
-
-      req.onsuccess = () => {
-        resolve(true);
-        this.notifyMutationQueueChanged();
-      };
-      req.onerror = () => reject(req.error);
-    });
+    const tx = db.transaction("mutations", "readwrite");
+    tx.objectStore("mutations").delete(mutationId);
+    await this.commitWrite(tx, () => this.notifyMutationQueueChanged());
+    return true;
   }
 
   public async updateMutationStatus(
@@ -556,18 +560,13 @@ export class IndexedDbStorage {
     envelope: EncryptedEnvelopeDto
   ): Promise<void> {
     const db = await this.getDb();
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction("base_versions", "readwrite");
-      const store = tx.objectStore("base_versions");
-      const req = store.put({
-        object_id: objectId,
-        revision,
-        envelope,
-      });
-
-      req.onsuccess = () => resolve();
-      req.onerror = () => reject(req.error);
+    const tx = db.transaction("base_versions", "readwrite");
+    tx.objectStore("base_versions").put({
+      object_id: objectId,
+      revision,
+      envelope,
     });
+    await this.commitWrite(tx);
   }
 
   public async getBaseVersion(
@@ -691,17 +690,13 @@ export class IndexedDbStorage {
 
   public async setSyncState(state: SyncState, identity = "singleton"): Promise<void> {
     const db = await this.getDb();
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction("sync_state", "readwrite");
-      const store = tx.objectStore("sync_state");
-      const req = store.put({
-        key: identity,
-        state,
-      });
-
-      req.onsuccess = () => resolve();
-      req.onerror = () => reject(req.error);
+    const tx = db.transaction("sync_state", "readwrite");
+    // `last_sync_at` lives here and drives the "synced" claim, so commit-gate it.
+    tx.objectStore("sync_state").put({
+      key: identity,
+      state,
     });
+    await this.commitWrite(tx);
   }
 
   // ==========================================================================
@@ -710,14 +705,9 @@ export class IndexedDbStorage {
 
   public async putConflict(conflict: ConflictRecord): Promise<void> {
     const db = await this.getDb();
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction("conflicts", "readwrite");
-      const store = tx.objectStore("conflicts");
-      const req = store.put(conflict);
-
-      req.onsuccess = () => resolve();
-      req.onerror = () => reject(req.error);
-    });
+    const tx = db.transaction("conflicts", "readwrite");
+    tx.objectStore("conflicts").put(conflict);
+    await this.commitWrite(tx);
   }
 
   public async getConflict(conflictId: string): Promise<ConflictRecord | null> {
@@ -791,14 +781,10 @@ export class IndexedDbStorage {
       return false;
     }
     const db = await this.getDb();
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction("conflicts", "readwrite");
-      const store = tx.objectStore("conflicts");
-      const req = store.delete(conflictId);
-
-      req.onsuccess = () => resolve(true);
-      req.onerror = () => reject(req.error);
-    });
+    const tx = db.transaction("conflicts", "readwrite");
+    tx.objectStore("conflicts").delete(conflictId);
+    await this.commitWrite(tx);
+    return true;
   }
 
   // ==========================================================================
@@ -808,18 +794,14 @@ export class IndexedDbStorage {
 
   public async putBlob(blobId: string, data: Uint8Array): Promise<void> {
     const db = await this.getDb();
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction("blobs", "readwrite");
-      const store = tx.objectStore("blobs");
-      const req = store.put({
-        blob_id: blobId,
-        data,
-        size: data.length,
-        created_at: new Date().toISOString(),
-      });
-      req.onsuccess = () => resolve();
-      req.onerror = () => reject(req.error);
+    const tx = db.transaction("blobs", "readwrite");
+    tx.objectStore("blobs").put({
+      blob_id: blobId,
+      data,
+      size: data.length,
+      created_at: new Date().toISOString(),
     });
+    await this.commitWrite(tx);
   }
 
   public async getBlob(blobId: string): Promise<Uint8Array | null> {
@@ -845,13 +827,10 @@ export class IndexedDbStorage {
       return false;
     }
     const db = await this.getDb();
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction("blobs", "readwrite");
-      const store = tx.objectStore("blobs");
-      const req = store.delete(blobId);
-      req.onsuccess = () => resolve(true);
-      req.onerror = () => reject(req.error);
-    });
+    const tx = db.transaction("blobs", "readwrite");
+    tx.objectStore("blobs").delete(blobId);
+    await this.commitWrite(tx);
+    return true;
   }
 
   public async listBlobIds(): Promise<string[]> {
