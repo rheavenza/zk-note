@@ -169,3 +169,16 @@ Troubleshooting:
 Current limits: [Workers](https://developers.cloudflare.com/workers/platform/limits/),
 [D1](https://developers.cloudflare.com/d1/platform/limits/), and
 [R2](https://developers.cloudflare.com/r2/pricing/).
+
+
+## Password authentication feasibility
+
+ZK-108 is blocked at its mandatory Worker Argon2id feasibility gate under the
+operator-confirmed Workers Free 10 ms CPU budget. Password registration/login,
+credential migrations and browser password controls are not yet available.
+Passkeys and existing session/revocation behavior remain supported. Account
+authentication and the vault passphrase remain separate; signing in does not
+link, upload, restore or unlock the local vault. No schema or deployment
+configuration changes are required for this evidence-only change.
+
+See [measured CPU results, reproduction and options](tickets/ZK-108-argon2-feasibility.md).

@@ -1,0 +1,24 @@
+[package]
+name = "zk-108-argon2-probe"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone feasibility experiment; never linked into the application.
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+argon2 = "=0.5.3"
+rand_core = { version = "=0.6.4", features = ["getrandom"] }
+wasm-bindgen = "=0.2.128"
+serde_json = "1"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+
+# Match worker-build 0.8.6 default release WASM optimization.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ["-O"]

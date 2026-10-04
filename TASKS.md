@@ -190,7 +190,7 @@ rather than catching and falling back to client-side approximations. Differentia
 All repository-wide Rust and web quality gates pass cleanly.
 
 ## ZK-107 — Web sync flow and deployment acceptance
-State: DONE (PR open / review pending)
+State: DONE (merged PR #12)
 Priority: P1
 Dependencies: ZK-104 through ZK-106
 Ticket: [docs/tickets/ZK-107.md](docs/tickets/ZK-107.md)
@@ -235,7 +235,7 @@ happens in the same synchronous step as the plaintext replacement, after the fin
 covered by a unit test that gates decryption to inject the edit mid-flight.
 
 ## ZK-108 — Username/password authentication alongside passkeys
-State: READY
+State: BLOCKED / SPEC QUESTION
 Priority: P1
 Dependencies: ZK-104
 Source: https://github.com/rheavenza/zk-note/issues/9
@@ -246,6 +246,34 @@ and unchanged zero-knowledge/session-revocation guarantees.
 Verification: full Rust/web gates, shared native/Worker contract, browser auth
 tests, password non-persistence/non-logging checks, and Worker Argon2 runtime
 validation. Keep this work separate from ZK-105/ZK-106 sync PRs.
+
+Implementation sequence (original acceptance criteria preserved):
+
+- ZK-108 feasibility prerequisite: measured vetted Argon2id in native release and
+  local workerd; complete evidence, acceptance blocked by the required CPU budget.
+- Protocol/schema/verifier integration depends on approved feasibility.
+- Native/Worker endpoints, brute-force controls and shared contract depend on integration.
+- Browser UI/enrollment/non-persistence tests depend on backend parity.
+- Full acceptance/documentation/review depends on all preceding steps.
+
+BLOCKED / SPEC QUESTION
+Task: ZK-108
+Reason: Operator confirmed Workers Free (10 ms CPU/request). All five tested
+OWASP Argon2id configurations exceed that budget in local workerd; primary
+m=19456 KiB,t=2,p=1 averages 20.56 ms CPU/operation across 18 requests.
+Relevant invariant/spec section: MASTER_SPEC §4 and P-006; ticket criterion 12.
+Options: approve Workers Paid with sufficient CPU; separately design native
+password verification with Free ciphertext hosting; retain passkeys and defer passwords.
+Recommended option: explicitly approve Workers Paid, then repeat feasibility and
+complete auth implementation without reducing Argon2id strength.
+Evidence: [ZK-108-argon2-feasibility.md](docs/tickets/ZK-108-argon2-feasibility.md).
+No application routes, migrations, sync architecture or browser behavior changed.
+Local workerd CPU measurement is not a deployed Free-plan limit-enforcement test.
+Regression verification: Rust fmt/clippy/491 tests; isolated probe fmt/clippy/test;
+web lint/typecheck/tests/build; shared contract (84 checks/backend); local D1/R2
+fault tests; HTTP and HTTPS browser E2E (18 each).
+Full gate results and deferred acceptance are recorded in the ticket.
+
 
 ---
 
