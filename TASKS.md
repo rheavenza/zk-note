@@ -190,13 +190,49 @@ rather than catching and falling back to client-side approximations. Differentia
 All repository-wide Rust and web quality gates pass cleanly.
 
 ## ZK-107 — Web sync flow and deployment acceptance
-State: BACKLOG
+State: DONE (PR open / review pending)
 Priority: P1
 Dependencies: ZK-104 through ZK-106
 Ticket: [docs/tickets/ZK-107.md](docs/tickets/ZK-107.md)
 Acceptance: truthful sync UI and complete two-browser link, restore, edit,
 delete, offline retry, and conflict flows.
 Verification: web/Rust gates and redacted browser-level end-to-end evidence.
+Evidence: [docs/tickets/ZK-107-network-evidence.md](docs/tickets/ZK-107-network-evidence.md)
+Completion note:
+1) Made the sync indicator truthful: nine distinct states, with `synced` reachable only after an
+authenticated server round trip records `last_sync_at` for the linked identity. Local persistence,
+linking, or a merely-configured adapter can no longer display `synced`; the editor badge now reads
+"Saved locally" so local save is never confused with server sync.
+2) Added the browser acceptance suite `apps/web/e2e/` (Playwright + Chromium) driving the production
+bundle against a real `zk-server` with a virtual passkey and two isolated browser contexts: truthful
+state transitions, second-browser restore and pull, A->B / B->A edit convergence, deletion
+convergence, offline queue + reload durability + reconnect retry, lost-response replay idempotency,
+401/429/5xx retryability with stable mutation ids, stale-edit and delete-vs-edit conflicts, lock
+plaintext scrubbing, wrong-account isolation, session expiry and re-auth.
+3) Fixed three real defects found by browser-level testing: the sync adapter called native `fetch`
+as an object method (Chrome "Illegal invocation" made every browser sync fail); `ConflictProvider`
+was mounted outside `NotesProvider` so conflict state was recreated every render and never surfaced;
+and pulled remote changes never refreshed the note list. All three blocked ZK-107 acceptance.
+4) Added `ZK-107-network-evidence.md` plus an asserting spec proving no plaintext, passphrase, or raw
+key material crosses the network for bootstrap upload, push, pull, conflict, tombstone, and auth.
+5) Updated the web README and `docs/deployment-web-termux.md` with the real user procedure, browser
+storage behavior, and a deployment acceptance checklist.
+6) All gates pass: web lint/typecheck/typecheck:e2e/test (186)/build/e2e (18, over HTTP and HTTPS);
+Rust fmt/clippy/test (491). Live staging smoke remains PENDING (no operator origin/credentials
+available); local automated HTTPS browser evidence is recorded instead.
+7) Review follow-up (PR #12): fixed a CAS-base race where a pull landing mid-edit let the queued
+mutation rebase on the pulled revision and silently overwrite the remote edit (SEC-006) — NotesStore
+now tracks the revision the in-memory plaintext is based on and never rebases it from a pull
+(regression-tested in unit and browser suites, both verified to fail without the fix). Made pending
+state event-driven off the storage layer so a durable local save can no longer read as "synced" for
+up to a poll interval, and made the CI browser job an http/https matrix so ZK_E2E_HTTPS=1 is
+independently reproducible. Also closed the conflict-resolution browser coverage gap (Keep Local,
+Preserve Both now completed end to end, not just opened).
+8) Second-round review follow-up: closed the remaining SEC-006 interleaving where reloadNotes()
+re-anchored the revision map before awaiting batch decryption, so an edit typed during decryption
+kept the old visible text but picked up the pulled revision as its CAS base. The re-anchor now
+happens in the same synchronous step as the plaintext replacement, after the final dirty check;
+covered by a unit test that gates decryption to inject the edit mid-flight.
 
 ## ZK-108 — Username/password authentication alongside passkeys
 State: READY

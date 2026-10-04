@@ -71,9 +71,9 @@ test("without a server adapter sync remains local and does not advance timestamp
 // 1. All 6 Sync States Verification
 // ----------------------------------------------------------------------------
 
-test("Sync status displays 'synced' when online with 0 pending changes and 0 conflicts", async () => {
+test("ZK-107: 'synced' is NOT shown merely because there are 0 pending changes", async () => {
   const client = createMockSyncWorkerClient();
-  const storage = new IndexedDbStorage("test-sync-state-synced");
+  const storage = new IndexedDbStorage("test-sync-state-not-yet-synced");
 
   let syncRef: ReturnType<typeof useSync> | null = null;
   const Consumer: React.FC = () => {
@@ -92,14 +92,170 @@ test("Sync status displays 'synced' when online with 0 pending changes and 0 con
   assert.ok(syncRef !== null);
   const sync = syncRef as unknown as ReturnType<typeof useSync>;
 
-  assert.equal(sync.status, "synced");
-  assert.equal(sync.pendingCount, 0);
-  assert.equal(sync.conflictCount, 0);
+  // An adapter exists but no server round trip has ever completed.
+  assert.equal(sync.status, "not synced yet");
+  assert.equal(sync.syncConfigured, true);
+  assert.equal(sync.hasCompletedSync, false);
+  assert.equal(sync.lastSyncAt, null);
 
-  // HTML must contain exact status label "synced" and checkmark icon
-  assert.ok(html.includes("synced"));
+  // The rendered badge must say "not synced yet" and must never say plain "synced".
+  assert.ok(html.includes(">not synced yet</span>"));
+  assert.ok(!html.includes(">synced</span>"));
+
+  await storage.close();
+});
+
+test("ZK-107: 'synced' appears only after a completed server round trip", async () => {
+  const client = createMockSyncWorkerClient();
+  const storage = new IndexedDbStorage("test-sync-state-synced");
+  const adapter = {
+    pushMutations: async () => {},
+    pullChanges: async () => {},
+  };
+
+  let syncRef: ReturnType<typeof useSync> | null = null;
+  const Consumer: React.FC = () => {
+    syncRef = useSync();
+    return <SyncStatusIndicator />;
+  };
+
+  renderToString(
+    <VaultProvider client={client} storage={storage} initialBootstrap={null}>
+      <SyncProvider serverAdapter={adapter}>
+        <Consumer />
+      </SyncProvider>
+    </VaultProvider>
+  );
+
+  const sync = syncRef as unknown as ReturnType<typeof useSync>;
+  assert.equal(sync.status, "not synced yet");
+
+  await sync.syncNow();
+
+  assert.equal(sync.status, "synced");
+  assert.ok(sync.lastSyncAt instanceof Date);
+  assert.equal(sync.hasCompletedSync, true);
+
+  // The durable timestamp must have been recorded outside React state.
+  const stored = await storage.getSyncState();
+  assert.ok(stored?.last_sync_at);
+
+  const html = renderToString(
+    <VaultProvider client={client} storage={storage} initialBootstrap={null}>
+      <SyncProvider store={sync.store}>
+        <Consumer />
+      </SyncProvider>
+    </VaultProvider>
+  );
+  assert.ok(html.includes(">synced</span>"));
   assert.ok(html.includes("✓"));
 
+  await storage.close();
+});
+
+test("ZK-107: linked but unauthenticated shows 'sign in to sync' and never advances last_sync_at", async () => {
+  const storage = new IndexedDbStorage("test-sync-state-linked-unauthenticated");
+  const store = new SyncStore(storage);
+  // A persisted vault link exists, but no authenticated adapter is wired up.
+  store.setLinkContext({ linked: true, identity: "http://localhost:8080::acct-1" });
+
+  assert.equal(store.getStatus(), "sign in to sync");
+  assert.equal(store.isLinked(), true);
+  assert.equal(store.isSyncConfigured(), false);
+
+  await store.syncNow();
+
+  // Explicit sync attempt without a matching authenticated adapter must fail closed.
+  assert.equal(store.getStatus(), "error");
+  assert.equal(store.getLastSyncAt(), null);
+  assert.equal((await storage.getSyncState("http://localhost:8080::acct-1"))?.last_sync_at, null);
+
+  await storage.close();
+});
+
+test("ZK-107: unlinked vault with a configured-looking adapter still reports local only", async () => {
+  const storage = new IndexedDbStorage("test-sync-state-unlinked");
+  const store = new SyncStore(storage);
+  store.setLinkContext({ linked: false });
+
+  assert.equal(store.getStatus(), "local only");
+  assert.equal(store.isLinked(), false);
+
+  await storage.close();
+});
+
+test("ZK-107: a durable local mutation updates pending status without waiting for a poll", async () => {
+  const storage = new IndexedDbStorage("test-sync-immediate-pending");
+  const store = new SyncStore(storage, completeAdapter);
+  store.setLinkContext({ linked: true, identity: "http://localhost:8080::acct-1" });
+  await store.refreshStatus();
+  assert.equal(store.getStatus(), "not synced yet");
+
+  // Mirrors how SyncProvider wires the storage notification to the sync store.
+  let notifications = 0;
+  let refresh: Promise<void> | null = null;
+  const unsubscribe = storage.onMutationQueueChanged(() => {
+    notifications += 1;
+    refresh = store.refreshStatus();
+  });
+
+  await storage.enqueueMutation({
+    mutation_id: "mut-immediate-1",
+    object_id: "note-immediate-1",
+    expected_revision: 0,
+    object_kind: 1,
+    mutation_type: MutationType.Upsert,
+    envelope: DUMMY_ENVELOPE,
+    created_at: new Date().toISOString(),
+    retry_count: 0,
+    status: MutationStatus.Pending,
+  });
+
+  // The notification must already have fired by the time the durable write
+  // resolves, and its refresh must be awaitable — no timer or poll involved.
+  assert.equal(notifications, 1, "a durable enqueue must emit exactly one notification");
+  const pendingRefresh = refresh as Promise<void> | null;
+  assert.ok(pendingRefresh, "the notification must refresh the sync status");
+  await pendingRefresh;
+
+  assert.equal(store.getStatus(), "pending changes");
+  assert.equal(store.getPendingCount(), 1);
+
+  unsubscribe();
+  await storage.close();
+});
+
+test("ZK-107: the queue-changed notification announces an already-readable mutation", async () => {
+  const storage = new IndexedDbStorage("test-queue-notify-commit");
+
+  // Contract the sync badge depends on: when a listener is told the durable queue
+  // changed, the announced mutation can already be read back. Note this does not
+  // discriminate request-callback vs transaction-commit emission under
+  // fake-indexeddb — it pins the observable contract, not the internal ordering.
+  let readAtNotification: Promise<number> | null = null;
+  const unsubscribe = storage.onMutationQueueChanged(() => {
+    readAtNotification = storage
+      .listPendingMutations()
+      .then((mutations) => mutations.filter((m) => m.mutation_id === "mut-commit-1").length);
+  });
+
+  await storage.enqueueMutation({
+    mutation_id: "mut-commit-1",
+    object_id: "note-commit-1",
+    expected_revision: 0,
+    object_kind: 1,
+    mutation_type: MutationType.Upsert,
+    envelope: DUMMY_ENVELOPE,
+    created_at: new Date().toISOString(),
+    retry_count: 0,
+    status: MutationStatus.Pending,
+  });
+
+  const observed = readAtNotification as Promise<number> | null;
+  assert.ok(observed, "enqueue must emit a queue-changed notification");
+  assert.equal(await observed, 1, "the announced mutation must already be committed");
+
+  unsubscribe();
   await storage.close();
 });
 

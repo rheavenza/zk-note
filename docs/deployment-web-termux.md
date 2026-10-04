@@ -34,8 +34,44 @@ should be opened at the HTTPS origin configured by `ZK_WEBAUTHN_ORIGIN`; its
 Server address field defaults to that same origin. The selected address is
 stored without credentials. Changing it clears the current browser session.
 Browser storage is scoped to the page origin. An existing vault created on a
-local development origin will not appear automatically at the HTTPS origin;
-the encrypted vault-link/restore flow is tracked separately in ZK-105.
+local development origin will not appear automatically at the HTTPS origin; use
+the encrypted **link** / **restore** flow (ZK-105/ZK-107) to move a vault between
+origins without exposing plaintext.
+
+## Deployment acceptance checklist (ZK-107)
+
+Verify each item on the target deployment before calling a release synchronized.
+None of these values are secrets, but keep operator hostnames and addresses out
+of committed files.
+
+1. **API origin / same-origin behavior.** The web page and `/v1` must share one
+   origin. The reverse proxy forwards `/v1/*` and `/health` to the API; the
+   browser never needs a cross-origin API address for passkeys.
+2. **HTTPS requirement.** Serve the app over HTTPS. `ZK_WEBAUTHN_ORIGIN` must be
+   the exact browser origin including scheme and port; a plain-HTTP page cannot
+   authenticate against an HTTPS RP configuration.
+3. **WebAuthn RP compatibility.** `ZK_WEBAUTHN_RP_ID` must be the host's domain
+   (or a registrable parent). Registration and sign-in fail closed in the browser
+   before opening the authenticator when the page origin is incompatible.
+4. **Encrypted storage.** Confirm notes persist as ciphertext in IndexedDB, that
+   the account-scoped database is used after linking, and that locking removes
+   plaintext from the page.
+5. **Linking.** Sign in, then explicitly **Link vault to account**; confirm the
+   upload contains only the encrypted bootstrap and crypto metadata.
+6. **Restore.** On a second browser/profile, sign in and **Restore vault from
+   account**, then unlock locally. Notes must be readable only after decryption.
+7. **Sync.** **Sync Now** must reach a **synced** state only after a real server
+   round trip; `last_sync_at` must not advance for local-only or failed operations.
+8. **Offline.** With the API unreachable, edits stay **pending** and durable across
+   a reload, then upload on reconnect.
+9. **Conflicts.** Concurrent edits produce a visible, persisted conflict that
+   survives reload and lock/unlock and is never auto-resolved.
+10. **Authentication expiry.** Expiring or revoking the session leaves local notes
+    usable, keeps the scoped database selected, and shows **sign in to sync**;
+    re-authenticating resumes sync without losing the queued mutation ids.
+
+Locked-pull (ciphertext pulled while the vault is locked, decrypted only after
+unlock) is covered by `apps/web/test/sync-engine.test.tsx`.
 
 ## Rollback
 

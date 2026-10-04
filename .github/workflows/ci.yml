@@ -96,6 +96,10 @@ jobs:
         working-directory: apps/web
         run: npm run typecheck
 
+      - name: Typecheck browser acceptance tests
+        working-directory: apps/web
+        run: npm run typecheck:e2e
+
       - name: Run test suite
         working-directory: apps/web
         run: npm test
@@ -103,3 +107,61 @@ jobs:
       - name: Build web application
         working-directory: apps/web
         run: npm run build
+
+  web-e2e:
+    name: Web Browser Acceptance (Playwright, ${{ matrix.mode }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mode: http
+            https: "0"
+          - mode: https
+            https: "1"
+    env:
+      ZK_E2E_HTTPS: ${{ matrix.https }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust with wasm target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install wasm-pack
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack
+
+      - name: Build zk-wasm package
+        run: wasm-pack build --target web crates/zk-wasm --out-dir pkg
+
+      - name: Build zk-server
+        run: cargo build -p zk-server
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install web dependencies
+        working-directory: apps/web
+        run: npm ci
+
+      - name: Install Playwright Chromium
+        working-directory: apps/web
+        run: npx playwright install --with-deps chromium
+
+      - name: Run browser acceptance suite (${{ matrix.mode }})
+        working-directory: apps/web
+        run: npm run test:e2e
+
+      - name: Upload Playwright report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-${{ matrix.mode }}
+          path: apps/web/e2e-results/
+          retention-days: 7

@@ -13,8 +13,10 @@ import React, {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useSyncExternalStore,
 } from "react";
+import { useSync } from "./SyncContext.js";
 import { useVault } from "./VaultContext.js";
 import { VaultWorkerClient } from "../worker/client.js";
 import { IndexedDbStorage } from "../storage/indexeddb.js";
@@ -53,7 +55,7 @@ export interface NotesContextType extends NotesSnapshot {
   updateNote: (id: string, updates: { title?: string; body?: string; tags?: string[] }) => void;
   saveNoteNow: (id: string) => Promise<void>;
   deleteNote: (id: string) => Promise<void>;
-  reloadNotes: () => Promise<void>;
+  reloadNotes: (options?: { skipIfDirty?: boolean }) => Promise<boolean>;
   clearError: () => void;
   attachFile: (
     noteId: string,
@@ -86,6 +88,16 @@ export class NotesStore {
   private listeners = new Set<() => void>();
   private saveTimers = new Map<string, NodeJS.Timeout | number>();
   private isUnlocked = false;
+  /**
+   * The server revision the in-memory plaintext of each note is based on.
+   *
+   * Advanced by local writes and refreshed from storage only when the note is
+   * (re)loaded — never by a background pull that stores ciphertext on its own.
+   * Otherwise a remote pull landing mid-edit would rebase the queued mutation on
+   * the pulled revision, letting the next push satisfy CAS and silently overwrite
+   * the remote edit instead of conflicting (SEC-006).
+   */
+  private knownRevisions = new Map<string, number>();
   public readonly attachmentManager: AttachmentManager;
   private attachmentProgress: AttachmentProgress | null = null;
   private snapshot: NotesSnapshot;
@@ -169,17 +181,52 @@ export class NotesStore {
     // Wipe decrypted data from memory
     this.notes = [];
     this.selectedNoteId = null;
+    this.knownRevisions.clear();
     this.saveStatus = "saved";
     this.error = null;
     this.notify();
   }
 
   /**
+   * True while a local edit is not yet durably persisted.
+   *
+   * Any status other than "saved" counts: `updateNote` notifies listeners before
+   * it registers the debounce timer, so relying on the timer map alone would leave
+   * a window where an in-memory edit looks clean. "error" counts too — a failed
+   * save means the user's text exists only in memory.
+   */
+  public hasUnpersistedEdits(): boolean {
+    return this.saveStatus !== "saved" || this.saveTimers.size > 0;
+  }
+
+  /**
+   * Re-anchors `knownRevisions` to the revisions just read from storage. Must be
+   * called in the same synchronous step that replaces the in-memory plaintext, for
+   * exactly the notes that were just decrypted — never earlier, and never when the
+   * reload is abandoned because the user has unpersisted edits.
+   */
+  private reanchorKnownRevisions(storedObjects: StoredEncryptedObject[]): void {
+    const presentIds = new Set(storedObjects.map((object) => object.object_id));
+    for (const object of storedObjects) {
+      this.knownRevisions.set(object.object_id, object.revision);
+    }
+    for (const id of [...this.knownRevisions.keys()]) {
+      if (!presentIds.has(id)) this.knownRevisions.delete(id);
+    }
+  }
+
+  /**
    * Loads all encrypted note objects from IndexedDB, batch decrypts via Web Worker,
    * and populates the in-memory store and worker search index.
+   *
+   * With `skipIfDirty`, the reload is abandoned whenever local work is
+   * unpersisted — both before decrypting and again immediately before the
+   * in-memory notes are replaced — so a background pull can never clobber an
+   * edit the user is still typing. Returns whether the reload was applied.
    */
-  public async reloadNotes(): Promise<void> {
-    if (!this.isUnlocked) return;
+  public async reloadNotes(options?: { skipIfDirty?: boolean }): Promise<boolean> {
+    if (!this.isUnlocked) return false;
+    if (options?.skipIfDirty && this.hasUnpersistedEdits()) return false;
 
     this.isLoading = true;
     this.error = null;
@@ -188,12 +235,16 @@ export class NotesStore {
     try {
       const storedObjects = await this.storage.listObjects({ kind: 1, include_deleted: false });
 
+      // The user may have started typing while ciphertext was being read.
+      if (options?.skipIfDirty && this.hasUnpersistedEdits()) return false;
+
       if (storedObjects.length === 0) {
         this.notes = [];
         this.selectedNoteId = null;
+        this.reanchorKnownRevisions(storedObjects);
         this.isLoading = false;
         this.notify();
-        return;
+        return true;
       }
 
       // Prepare envelopes for worker batch decryption
@@ -209,7 +260,16 @@ export class NotesStore {
         return new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime();
       });
 
+      // Final guard: decryption is async, so re-check before replacing in-memory
+      // notes. A local edit typed during decryption wins.
+      if (options?.skipIfDirty && this.hasUnpersistedEdits()) return false;
+
+      // Replace the plaintext and re-anchor the revision map in ONE synchronous
+      // step. If the anchors moved at an earlier await boundary, an edit typed
+      // during decryption would keep the old visible text but pick up the newly
+      // pulled revision as its CAS base — the overwrite this guard exists to stop.
       this.notes = decryptedNotes;
+      this.reanchorKnownRevisions(storedObjects);
 
       // Select first note if nothing is selected or previously selected note no longer exists
       if (!this.selectedNoteId && decryptedNotes.length > 0) {
@@ -224,8 +284,10 @@ export class NotesStore {
           .indexNote(note.id, note.title, note.body, note.tags, note.updatedAt)
           .catch(() => {});
       }
+      return true;
     } catch (err) {
       this.error = "Failed to decrypt local notes.";
+      return false;
     } finally {
       this.isLoading = false;
       this.notify();
@@ -371,8 +433,10 @@ export class NotesStore {
       this.saveTimers.delete(id);
     }
 
+    // Same CAS base rule as persistNoteToStorage: the revision the note's visible
+    // content was based on, not whatever a concurrent pull may have stored since.
     const existingObject = await this.storage.getObject(id);
-    const expectedRevision = existingObject ? existingObject.revision : 0;
+    const expectedRevision = this.knownRevisions.get(id) ?? (existingObject ? existingObject.revision : 0);
     const nextRevision = expectedRevision + 1;
     const now = new Date().toISOString();
 
@@ -387,6 +451,7 @@ export class NotesStore {
 
     // 1. Record tombstone in local object store
     await this.storage.markDeleted(id, nextRevision, tombstoneEnvelope, now);
+    this.knownRevisions.delete(id);
 
     // 2. Queue pending mutation for sync
     const mutationId = (typeof crypto !== "undefined" && crypto.randomUUID)
@@ -435,9 +500,13 @@ export class NotesStore {
     );
     const envelope: EncryptedEnvelopeDto = JSON.parse(encRes.envelopeJson);
 
-    // 2. Check current stored revision to compute CAS expected revision
+    // 2. Compute the CAS expected revision from the revision this note's plaintext
+    //    is based on — NOT from whatever is in storage now. A background pull may
+    //    have stored a newer remote revision since the edit began, and using that
+    //    as the base would let the push satisfy CAS and silently overwrite the
+    //    remote edit (SEC-006).
     const existing = await this.storage.getObject(note.id);
-    const expectedRevision = existing ? existing.revision : 0;
+    const expectedRevision = this.knownRevisions.get(note.id) ?? (existing ? existing.revision : 0);
     const nextRevision = expectedRevision + 1;
 
     const storedObject: StoredEncryptedObject = {
@@ -452,6 +521,7 @@ export class NotesStore {
 
     // 3. Write encrypted envelope to local objects store
     await this.storage.putObject(storedObject);
+    this.knownRevisions.set(note.id, nextRevision);
 
     // 4. Queue pending mutation for offline-first sync
     const mutationId = (typeof crypto !== "undefined" && crypto.randomUUID)
@@ -637,6 +707,23 @@ export const NotesProvider: React.FC<NotesProviderProps> = ({ children }) => {
 
   const snapshot = useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
 
+  // ZK-107: after a completed server round trip, re-read and re-decrypt local
+  // ciphertext so pulled remote changes become visible without a page reload.
+  // The reload is skipped whenever local work is unpersisted, so a background
+  // pull can never clobber an edit the user is still making.
+  const syncState = useSync();
+  const lastSyncMs = syncState.lastSyncAt ? syncState.lastSyncAt.getTime() : null;
+  const handledSyncMs = useRef<number | null>(null);
+
+  useEffect(() => {
+    if (vaultState !== "UNLOCKED") return;
+    if (lastSyncMs === null || handledSyncMs.current === lastSyncMs) return;
+    if (store.hasUnpersistedEdits()) return;
+    void store.reloadNotes({ skipIfDirty: true }).then((applied) => {
+      if (applied) handledSyncMs.current = lastSyncMs;
+    });
+  }, [lastSyncMs, vaultState, store, snapshot.saveStatus]);
+
   const value: NotesContextType = useMemo(
     () => ({
       get notes() {
@@ -670,7 +757,7 @@ export const NotesProvider: React.FC<NotesProviderProps> = ({ children }) => {
       updateNote: (id, updates) => store.updateNote(id, updates),
       saveNoteNow: (id) => store.saveNoteNow(id),
       deleteNote: (id) => store.deleteNote(id),
-      reloadNotes: () => store.reloadNotes(),
+      reloadNotes: (options?: { skipIfDirty?: boolean }) => store.reloadNotes(options),
       clearError: () => store.clearError(),
       attachFile: (noteId, file, onProgress) => store.attachFile(noteId, file, onProgress),
       detachAttachment: (noteId, attachmentId) => store.detachAttachment(noteId, attachmentId),
@@ -685,37 +772,40 @@ export const NotesProvider: React.FC<NotesProviderProps> = ({ children }) => {
   return <NotesContext.Provider value={value}>{children}</NotesContext.Provider>;
 };
 
+/**
+ * Module-level fallback so consumers outside a NotesProvider do not observe a new
+ * object identity on every render (which would needlessly invalidate memos and
+ * recreate dependent stores on each pass).
+ */
+const NO_NOTES_CONTEXT: NotesContextType = {
+  notes: [],
+  selectedNoteId: null,
+  selectedNote: null,
+  isLoading: false,
+  saveStatus: "saved",
+  lastSavedAt: null,
+  error: null,
+  attachmentProgress: null,
+  selectNote: () => {},
+  createNote: async () => {
+    throw new Error("NotesProvider not available");
+  },
+  updateNote: () => {},
+  saveNoteNow: async () => {},
+  deleteNote: async () => {},
+  reloadNotes: async () => false,
+  clearError: () => {},
+  attachFile: async () => {
+    throw new Error("NotesProvider not available");
+  },
+  detachAttachment: async () => {},
+  downloadAttachment: async () => {
+    throw new Error("NotesProvider not available");
+  },
+  getAttachmentManifests: async () => [],
+  store: null as any,
+};
+
 export function useNotes(): NotesContextType {
-  const ctx = useContext(NotesContext);
-  if (!ctx) {
-    return {
-      notes: [],
-      selectedNoteId: null,
-      selectedNote: null,
-      isLoading: false,
-      saveStatus: "saved",
-      lastSavedAt: null,
-      error: null,
-      attachmentProgress: null,
-      selectNote: () => {},
-      createNote: async () => {
-        throw new Error("NotesProvider not available");
-      },
-      updateNote: () => {},
-      saveNoteNow: async () => {},
-      deleteNote: async () => {},
-      reloadNotes: async () => {},
-      clearError: () => {},
-      attachFile: async () => {
-        throw new Error("NotesProvider not available");
-      },
-      detachAttachment: async () => {},
-      downloadAttachment: async () => {
-        throw new Error("NotesProvider not available");
-      },
-      getAttachmentManifests: async () => [],
-      store: null as any,
-    };
-  }
-  return ctx;
+  return useContext(NotesContext) || NO_NOTES_CONTEXT;
 }

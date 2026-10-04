@@ -285,15 +285,15 @@ export const AppInner: React.FC<AppInnerProps> = ({
       storage={mountedState.storage}
     >
       <SyncProvider>
-        <ConflictProvider>
-          <SearchProvider>
-            <NotesProvider>
+        <NotesProvider>
+          <ConflictProvider>
+            <SearchProvider>
               <UnlockScreen>
                 <NotesWorkspace />
               </UnlockScreen>
-            </NotesProvider>
-          </SearchProvider>
-        </ConflictProvider>
+            </SearchProvider>
+          </ConflictProvider>
+        </NotesProvider>
       </SyncProvider>
     </VaultProvider>
   );
