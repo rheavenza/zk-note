@@ -200,6 +200,22 @@ export class NotesStore {
   }
 
   /**
+   * Re-anchors `knownRevisions` to the revisions just read from storage. Must be
+   * called in the same synchronous step that replaces the in-memory plaintext, for
+   * exactly the notes that were just decrypted — never earlier, and never when the
+   * reload is abandoned because the user has unpersisted edits.
+   */
+  private reanchorKnownRevisions(storedObjects: StoredEncryptedObject[]): void {
+    const presentIds = new Set(storedObjects.map((object) => object.object_id));
+    for (const object of storedObjects) {
+      this.knownRevisions.set(object.object_id, object.revision);
+    }
+    for (const id of [...this.knownRevisions.keys()]) {
+      if (!presentIds.has(id)) this.knownRevisions.delete(id);
+    }
+  }
+
+  /**
    * Loads all encrypted note objects from IndexedDB, batch decrypts via Web Worker,
    * and populates the in-memory store and worker search index.
    *
@@ -222,19 +238,10 @@ export class NotesStore {
       // The user may have started typing while ciphertext was being read.
       if (options?.skipIfDirty && this.hasUnpersistedEdits()) return false;
 
-      // The plaintext about to be rebuilt in memory is based on exactly these
-      // stored revisions, so re-anchor the mutation base here.
-      const presentIds = new Set(storedObjects.map((object) => object.object_id));
-      for (const object of storedObjects) {
-        this.knownRevisions.set(object.object_id, object.revision);
-      }
-      for (const id of [...this.knownRevisions.keys()]) {
-        if (!presentIds.has(id)) this.knownRevisions.delete(id);
-      }
-
       if (storedObjects.length === 0) {
         this.notes = [];
         this.selectedNoteId = null;
+        this.reanchorKnownRevisions(storedObjects);
         this.isLoading = false;
         this.notify();
         return true;
@@ -257,7 +264,12 @@ export class NotesStore {
       // notes. A local edit typed during decryption wins.
       if (options?.skipIfDirty && this.hasUnpersistedEdits()) return false;
 
+      // Replace the plaintext and re-anchor the revision map in ONE synchronous
+      // step. If the anchors moved at an earlier await boundary, an edit typed
+      // during decryption would keep the old visible text but pick up the newly
+      // pulled revision as its CAS base — the overwrite this guard exists to stop.
       this.notes = decryptedNotes;
+      this.reanchorKnownRevisions(storedObjects);
 
       // Select first note if nothing is selected or previously selected note no longer exists
       if (!this.selectedNoteId && decryptedNotes.length > 0) {

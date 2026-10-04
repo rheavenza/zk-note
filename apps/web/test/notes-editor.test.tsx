@@ -31,6 +31,7 @@ import {
 } from "../src/index.js";
 import { IndexedDbStorage } from "../src/storage/indexeddb.js";
 import { VaultWorkerClient } from "../src/worker/client.js";
+import { DecryptBatchItem } from "../src/worker/protocol.js";
 import { MutationType, MutationStatus } from "../src/storage/models.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -533,6 +534,67 @@ test("ZK-107: a pull landing before a delete does not rebase the tombstone mutat
   );
   assert.ok(deletion, "a delete mutation should be queued");
   assert.equal(deletion.expected_revision, 1, "the tombstone must target the pre-pull base");
+
+  store.dispose();
+  await storage.close();
+});
+
+test("ZK-107: an edit made while a reload is decrypting keeps the pre-pull CAS base", async () => {
+  const { client } = createMockWorkerClient();
+  const storage = new IndexedDbStorage(`test-zk107-reload-race-${Date.now()}`);
+
+  // Gate the batch decryption so the test can inject an edit while a reload is
+  // mid-flight — the exact window where the revision anchors must not advance.
+  const decryptBatch = client.decryptNotesBatch!;
+  let releaseDecrypt: (() => void) | null = null;
+  let markDecryptStarted: (() => void) | null = null;
+  const decryptStarted = new Promise<void>((resolve) => {
+    markDecryptStarted = resolve;
+  });
+  client.decryptNotesBatch = ((items: DecryptBatchItem[]) =>
+    new Promise((resolve) => {
+      markDecryptStarted?.();
+      releaseDecrypt = () => resolve(decryptBatch(items));
+    })) as typeof client.decryptNotesBatch;
+
+  const store = new NotesStore(client, storage);
+  await store.handleVaultUnlocked();
+
+  const note = await store.createNote({ title: "Base", body: "v1" });
+  assert.equal((await storage.getObject(note.id))?.revision, 1);
+
+  // A pull stores remote revision 2, then a reload starts and blocks in decryption.
+  await storage.putObject({
+    object_id: note.id,
+    object_kind: 1,
+    revision: 2,
+    server_seq: 2,
+    is_deleted: false,
+    envelope: remoteEnvelope(note.id, "remote"),
+    updated_at: new Date().toISOString(),
+  });
+
+  const reload = store.reloadNotes({ skipIfDirty: true });
+  await decryptStarted;
+
+  // The user types while decryption is still running: the visible text stays on
+  // revision 1, so the queued mutation must stay anchored there too.
+  store.updateNote(note.id, { body: "edit typed during decryption" });
+  (releaseDecrypt as unknown as () => void)();
+
+  const applied = await reload;
+  assert.equal(applied, false, "the reload must abort rather than clobber the live edit");
+
+  await store.saveNoteNow(note.id);
+
+  const mutations = (await storage.listPendingMutations()).filter((m) => m.object_id === note.id);
+  const upsert = mutations[mutations.length - 1];
+  assert.ok(upsert, "an upsert mutation should be queued");
+  assert.equal(
+    upsert.expected_revision,
+    1,
+    "an edit typed during decryption must keep the pre-pull base"
+  );
 
   store.dispose();
   await storage.close();
