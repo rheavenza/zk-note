@@ -217,7 +217,7 @@ and pulled remote changes never refreshed the note list. All three blocked ZK-10
 key material crosses the network for bootstrap upload, push, pull, conflict, tombstone, and auth.
 5) Updated the web README and `docs/deployment-web-termux.md` with the real user procedure, browser
 storage behavior, and a deployment acceptance checklist.
-6) All gates pass: web lint/typecheck/typecheck:e2e/test (185)/build/e2e (18, over HTTP and HTTPS);
+6) All gates pass: web lint/typecheck/typecheck:e2e/test (186)/build/e2e (18, over HTTP and HTTPS);
 Rust fmt/clippy/test (491). Live staging smoke remains PENDING (no operator origin/credentials
 available); local automated HTTPS browser evidence is recorded instead.
 7) Review follow-up (PR #12): fixed a CAS-base race where a pull landing mid-edit let the queued
