@@ -18,11 +18,15 @@ import {
   fillBody,
   linkVault,
   lockVault,
+  noteItem,
   openBrowser,
   openConflictResolverFromSync,
   openNote,
+  openSyncPopover,
+  readStore,
   recordApiPayloads,
   restoreVault,
+  scopedDatabaseName,
   signInWithPasskey,
   triggerSync,
   unlockVault,
@@ -155,6 +159,161 @@ test.describe("ZK-107 conflict acceptance", () => {
     await expect(a.page.locator(".zk-note-item", { hasText: TITLE })).toHaveCount(0);
     await triggerSync(b.page);
     await expect(a.page.locator(".zk-note-item", { hasText: TITLE })).toHaveCount(0);
+
+    await a.context.close();
+    await b.context.close();
+  });
+
+  test("an edit that races an incoming pull conflicts instead of overwriting it", async ({
+    browser,
+  }) => {
+    const { a, b } = await seedTwoBrowsers(browser);
+    const scoped = (await scopedDatabaseName(b.page))!;
+
+    // A edits and synchronizes first, advancing the server past B's local base.
+    await openNote(a.page, TITLE);
+    await fillBody(a.page, "A wins the race");
+    await triggerSync(a.page);
+    await expectStatus(a.page, "synced");
+
+    const before = await readStore(b.page, scoped, "objects");
+    const baseRevision = before.find((object) => !object.is_deleted)?.revision as number;
+    expect(baseRevision).toBeGreaterThanOrEqual(1);
+
+    // Freeze B's page timers so the 600 ms autosave cannot fire on its own. This
+    // makes the race exact: the edit is made first and stays dirty across the
+    // whole sync, then the autosave flushes after the pull has stored revision 2.
+    await b.page.clock.install();
+    await openNote(b.page, TITLE);
+    // Edit first: with timers frozen the debounce cannot fire, so the edit stays
+    // dirty across the whole sync that follows.
+    await b.page
+      .locator('textarea[aria-label="Markdown source content"]')
+      .fill("B edit racing the pull");
+    await openSyncPopover(b.page);
+
+    const pullCompleted = b.page.waitForResponse(
+      (response) => response.url().includes("/v1/sync/pull") && response.status() === 200
+    );
+    await b.page.locator(".zk-sync-now-button").click();
+    await pullCompleted;
+    // Real time (Playwright-side) so the round trip and its post-sync reload
+    // settle; the frozen debounce still cannot have fired.
+    await b.page.waitForTimeout(1_500);
+
+    const dirty = await readStore(b.page, scoped, "objects");
+    expect(
+      dirty.find((object) => !object.is_deleted)?.revision,
+      "the pull must have landed while the edit was still unsaved"
+    ).toBe(baseRevision + 1);
+
+    // Now let the autosave flush.
+    await b.page.clock.fastForward(1_000);
+    await expect(b.page.locator(".zk-save-status")).toContainText("Saved locally", {
+      timeout: 20_000,
+    });
+
+    // The queued mutation must keep the pre-pull base, so its push conflicts
+    // rather than silently overwriting A's edit (SEC-006).
+    const queued = await readStore(b.page, scoped, "mutations");
+    const upsert = queued.filter((m) => m.object_id === before[0]?.object_id).at(-1);
+    expect(upsert, "the racing edit must be queued").toBeTruthy();
+    expect(upsert!.expected_revision).toBe(baseRevision);
+
+    await triggerSync(b.page);
+    await expectStatus(b.page, "conflict");
+
+    // A's remote edit survives: a later pull from A still shows A's text.
+    await triggerSync(a.page);
+    await expectStatus(a.page, "synced");
+    await openNote(a.page, TITLE);
+    await expect(a.page.locator('textarea[aria-label="Markdown source content"]')).toHaveValue(
+      "A wins the race"
+    );
+
+    await a.context.close();
+    await b.context.close();
+  });
+
+  test("resolving with Keep Local pushes the local edit and converges", async ({ browser }) => {
+    const { a, b } = await seedTwoBrowsers(browser);
+
+    await a.context.setOffline(true);
+    await b.context.setOffline(true);
+    await openNote(a.page, TITLE);
+    await fillBody(a.page, "A edit");
+    await openNote(b.page, TITLE);
+    await fillBody(b.page, LOCAL_BODY_B);
+
+    await a.context.setOffline(false);
+    await triggerSync(a.page);
+    await expectStatus(a.page, "synced");
+    await b.context.setOffline(false);
+    await triggerSync(b.page);
+    await expectStatus(b.page, "conflict");
+
+    // Explicitly resolve in favour of B's local edit.
+    await openConflictResolverFromSync(b.page);
+    await b.page.getByRole("button", { name: "Keep Local Version" }).click();
+
+    // Resolution queues a mutation; the badge must not claim synced yet.
+    await expectStatus(b.page, "pending changes");
+    await expect(b.page.getByTestId("note-conflict-badge")).toHaveCount(0);
+
+    await triggerSync(b.page);
+    await expectStatus(b.page, "synced");
+
+    // The resolution converges onto A.
+    await triggerSync(a.page);
+    await expectStatus(a.page, "synced");
+    await expect(a.page.locator('textarea[aria-label="Markdown source content"]')).toHaveValue(
+      LOCAL_BODY_B,
+      { timeout: 30_000 }
+    );
+
+    await a.context.close();
+    await b.context.close();
+  });
+
+  test("resolving with Preserve Both keeps the remote note and duplicates the local edit", async ({
+    browser,
+  }) => {
+    const { a, b } = await seedTwoBrowsers(browser);
+
+    await a.context.setOffline(true);
+    await b.context.setOffline(true);
+    await openNote(a.page, TITLE);
+    await fillBody(a.page, "A edit");
+    await openNote(b.page, TITLE);
+    await fillBody(b.page, LOCAL_BODY_B);
+
+    await a.context.setOffline(false);
+    await triggerSync(a.page);
+    await expectStatus(a.page, "synced");
+    await b.context.setOffline(false);
+    await triggerSync(b.page);
+    await expectStatus(b.page, "conflict");
+
+    await openConflictResolverFromSync(b.page);
+    await b.page.getByRole("button", { name: /Preserve Both/ }).click();
+    await expectStatus(b.page, "pending changes");
+
+    await triggerSync(b.page);
+    await expectStatus(b.page, "synced");
+    await expect(noteItem(b.page, `${TITLE} (Local Copy)`)).toBeVisible();
+
+    // The duplicate converges onto A, and the original keeps A's remote version.
+    await triggerSync(a.page);
+    await expectStatus(a.page, "synced");
+    await expect(noteItem(a.page, `${TITLE} (Local Copy)`)).toBeVisible({ timeout: 30_000 });
+    await noteItem(a.page, TITLE).click();
+    await expect(a.page.locator('textarea[aria-label="Markdown source content"]')).toHaveValue(
+      "A edit"
+    );
+    await noteItem(a.page, `${TITLE} (Local Copy)`).click();
+    await expect(a.page.locator('textarea[aria-label="Markdown source content"]')).toHaveValue(
+      LOCAL_BODY_B
+    );
 
     await a.context.close();
     await b.context.close();

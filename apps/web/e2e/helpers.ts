@@ -282,6 +282,14 @@ export function noteItems(page: Page) {
   return page.locator(".zk-note-item");
 }
 
+/** Note row whose visible title matches exactly (avoids "X" also matching "X (Local Copy)"). */
+export function noteItem(page: Page, title: string) {
+  const escaped = title.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return page
+    .locator(".zk-note-item")
+    .filter({ has: page.locator("h4", { hasText: new RegExp(`^${escaped}$`) }) });
+}
+
 export async function openNote(page: Page, title: string): Promise<void> {
   await page.locator(".zk-note-item", { hasText: title }).first().click();
   await expect(page.locator('input[aria-label="Note title"]')).toHaveValue(title);
