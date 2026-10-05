@@ -224,3 +224,16 @@ In accordance with **SEC-003**, `zk-server` automatically strips and redacts sen
 - `Cookie: [REDACTED]`
 
 Passphrases, recovery keys, and decrypted content never enter server memory, making leakages mathematically impossible.
+
+
+## Username/password authentication status
+
+ZK-108 is blocked at its mandatory Worker Argon2id feasibility gate under the
+operator-confirmed Workers Free 10 ms CPU budget. Password registration/login,
+credential migrations and browser password controls are not yet available.
+Passkeys and existing session/revocation behavior remain supported. Account
+authentication and the vault passphrase remain separate; signing in does not
+link, upload, restore or unlock the local vault. No schema or deployment
+configuration changes are required for this evidence-only change.
+
+See [measured CPU results, reproduction and options](../../docs/tickets/ZK-108-argon2-feasibility.md).

@@ -143,6 +143,24 @@ The vault passphrase is NOT the server account password.
 
 The vault passphrase must never be transmitted to the server.
 
+ZK-108 proposes username/password account authentication alongside passkeys.
+An account password would prove access to server ciphertext using a separate
+server-only Argon2id verifier; it would not derive a Vault Key or automatically
+link, upload, restore, replace, or unlock a local vault. It must never reuse the
+vault KDF/storage format. Existing explicit vault-link/restore actions remain
+required. A password-authenticated account would use the common session and
+could enroll a passkey on that same account.
+
+This feature is currently **BLOCKED / SPEC QUESTION**: secure tested Argon2id
+configurations exceed the required Workers Free 10 ms CPU budget in local
+workerd. No password authentication endpoints or verifier storage are enabled.
+The selected operator direction is to retain existing passkey behavior and defer
+ZK-108 while issue #14 / ZK-109–ZK-112 advances the native/TUI milestone. Workers
+Paid remains a future alternative, requiring a separate explicit decision.
+See [ZK-108 feasibility evidence and architectural options](docs/tickets/ZK-108-argon2-feasibility.md).
+Do not weaken password hashing or change the authentication architecture without
+an explicit decision resolving this blocker.
+
 ---
 
 # 5. Cryptographic design

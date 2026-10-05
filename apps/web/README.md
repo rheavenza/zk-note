@@ -321,3 +321,16 @@ notes.example.com {
 ## 5. Security & Threat Considerations
 
 Because browser clients depend on code delivered over HTTP, review [`docs/threat-model/threat-model-review.md`](../../docs/threat-model/threat-model-review.md) regarding the **Web-Origin Trust Limitation** (the web crypto delivery paradox) and ensure that production web hosting origins enforce DNSSEC, Subresource Integrity, and TLS 1.3.
+
+
+## Username/password authentication status
+
+ZK-108 is blocked at its mandatory Worker Argon2id feasibility gate under the
+operator-confirmed Workers Free 10 ms CPU budget. Password registration/login,
+credential migrations and browser password controls are not yet available.
+Passkeys and existing session/revocation behavior remain supported. Account
+authentication and the vault passphrase remain separate; signing in does not
+link, upload, restore or unlock the local vault. No schema or deployment
+configuration changes are required for this evidence-only change.
+
+See [measured CPU results, reproduction and options](../../docs/tickets/ZK-108-argon2-feasibility.md).
