@@ -6,6 +6,13 @@ The operator explicitly confirmed **Workers Free, 10 ms CPU per request**.
 
 ## Decision
 
+Operator decision recorded on 2026-10-05: **retain existing passkey behavior and
+defer ZK-108 for now**. Username/password and further web expansion are on hold;
+issue #14 / ZK-109–ZK-112 is the active native/TUI remote multi-device milestone.
+This PR is a feasibility/blocker record only. ZK-108 remains `BLOCKED / SPEC
+QUESTION`, and issue #9 must stay open rather than being closed as implemented.
+
+
 Stop ZK-108 before adding password endpoints, credentials, migrations, or UI.
 All five tested OWASP Argon2id parameter sets exceeded the required CPU budget
 in the project's local workerd execution environment. Do not lower password
@@ -118,8 +125,11 @@ Options:
    authentication trust/session integration decision and availability design.
 3. Keep passkey-only authentication on Workers Free and defer password auth.
 
-Recommended option: Workers Paid if username/password parity on both backends
-remains required. This requires an explicit operator/spec decision; no plan or
+Recommended option for now (selected operator decision): option 3, retain existing
+passkey behavior and defer ZK-108 while issue #14 / ZK-109–ZK-112 proceeds.
+Workers Paid remains a documented future alternative if username/password parity
+on both backends is resumed. Resuming password authentication requires a separate
+explicit operator/spec decision and renewed feasibility checks; no plan or
 architecture change is made here.
 
 ## Acceptance mapping

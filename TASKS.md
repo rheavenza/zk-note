@@ -295,7 +295,7 @@ happens in the same synchronous step as the plaintext replacement, after the fin
 covered by a unit test that gates decryption to inject the edit mid-flight.
 
 ## ZK-108 — Username/password authentication alongside passkeys
-State: BLOCKED / SPEC QUESTION
+State: BLOCKED / SPEC QUESTION (deferred by operator decision)
 Priority: P1
 Dependencies: ZK-104
 Source: https://github.com/rheavenza/zk-note/issues/9
@@ -324,8 +324,10 @@ m=19456 KiB,t=2,p=1 averages 20.56 ms CPU/operation across 18 requests.
 Relevant invariant/spec section: MASTER_SPEC §4 and P-006; ticket criterion 12.
 Options: approve Workers Paid with sufficient CPU; separately design native
 password verification with Free ciphertext hosting; retain passkeys and defer passwords.
-Recommended option: explicitly approve Workers Paid, then repeat feasibility and
-complete auth implementation without reducing Argon2id strength.
+Recommended option for now (selected operator decision): retain existing passkey
+behavior and defer ZK-108 while issue #14 / ZK-109–ZK-112 proceeds as the active
+native/TUI milestone. Workers Paid remains a future alternative if password
+authentication is resumed after an explicit decision; do not weaken Argon2id.
 Evidence: [ZK-108-argon2-feasibility.md](docs/tickets/ZK-108-argon2-feasibility.md).
 No application routes, migrations, sync architecture or browser behavior changed.
 Local workerd CPU measurement is not a deployed Free-plan limit-enforcement test.
@@ -333,6 +335,18 @@ Regression verification: Rust fmt/clippy/491 tests; isolated probe fmt/clippy/te
 web lint/typecheck/tests/build; shared contract (84 checks/backend); local D1/R2
 fault tests; HTTP and HTTPS browser E2E (18 each).
 Full gate results and deferred acceptance are recorded in the ticket.
+
+Review repair (PR #13, 2026-10-05):
+- Updated the PR branch with master 2239abd1e2af5ab56858fc36acd52a486ff2dd37,
+  preserving issue #14 and all ZK-109–ZK-112 tickets and their existing states.
+- Selected direction: retain existing passkey behavior and defer ZK-108 while the
+  native/TUI remote multi-device milestone (issue #14 / ZK-109–ZK-112) proceeds.
+  Workers Paid is a future alternative, not the currently selected direction.
+- This remains an Argon2 feasibility/blocker record; ZK-108 is not DONE and issue
+  #9 stays open. No password implementation or local ZK-109 code is included.
+- Review-repair checks: Rust fmt/clippy/locked check/491 workspace tests and
+  standalone probe locked fmt/clippy/1 verifier test pass. Fresh GitHub CI is
+  triggered by the PR push; historical web/Worker results remain labeled.
 
 
 ---
