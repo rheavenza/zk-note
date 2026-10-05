@@ -128,12 +128,24 @@ Implementation notes:
   authenticated state. Key revoke also revokes its pinned device, device sessions
   and derived key sessions. No vault operations or sync architecture changes.
 - Passed fmt, warnings-as-errors workspace clippy, locked workspace check,
-  all-target/all-feature workspace tests (514), targeted protocol/server-auth/
+  all-target/all-feature workspace tests (516), targeted protocol/server-auth/
   native-server/CLI suites, isolated agent suite, and the shared native auth
   contract (84 checks plus CAS/replay concurrency). GitHub CI required before
   handoff; independent review pending, no merge authorization.
 - Exact acceptance evidence and limitations: [ZK-109 ticket](docs/tickets/ZK-109.md)
   and [ADR-0007](docs/adr/0007-native-ssh-authentication.md).
+
+Review repairs (PR #15, review 5411575250):
+- Persistent `ServerDb::open_file` explicitly enables foreign keys before
+  migrations and verifies the required schema afterward.
+- Schema verification now includes both SSH tables and all three migration-010
+  indexes (14 required tables / 12 required indexes).
+- Real file-backed tests cover fresh/reopened FK enforcement, all four SSH FK
+  relationships, and startup rejection for each missing SSH table/index despite
+  migration 10 remaining recorded. The missing-object test failed before repair.
+- Re-ran fmt, workspace clippy/locked check, 516 workspace tests, 187 server tests,
+  105 CLI/TUI tests, protocol/verifier tests and the 84-check native auth contract
+  with CAS/replay concurrency. Exact-head GitHub CI is recorded in PR #15.
 
 ## ZK-110 — Native vault link, restore, account isolation, and replace-local-from-origin
 Status: READY

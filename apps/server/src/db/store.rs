@@ -105,10 +105,12 @@ impl ServerDb {
         })
     }
 
-    /// Opens an SQLite database file at `path` and executes all migrations.
+    /// Opens a persistent SQLite database with enforced foreign keys and verified migrations.
     pub fn open_file<P: AsRef<std::path::Path>>(path: P) -> Result<Self, DbError> {
         let mut conn = Connection::open(path)?;
+        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         crate::db::migrations::run_server_migrations(&mut conn)?;
+        crate::db::schema::verify_database_schema(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })

@@ -26,6 +26,8 @@ pub const TABLE_SESSIONS: &str = "sessions";
 pub const TABLE_WEBAUTHN_CREDENTIALS: &str = "webauthn_credentials";
 pub const TABLE_WEBAUTHN_CHALLENGES: &str = "webauthn_challenges";
 pub const TABLE_BLOBS: &str = "blobs";
+pub const TABLE_SSH_CREDENTIALS: &str = "ssh_credentials";
+pub const TABLE_SSH_CHALLENGES: &str = "ssh_challenges";
 pub const TABLE_SCHEMA_MIGRATIONS: &str = "schema_migrations";
 
 /// Index name constants.
@@ -38,6 +40,10 @@ pub const INDEX_SESSIONS_DEVICE_ID: &str = "idx_sessions_device_id";
 pub const INDEX_WEBAUTHN_ACCOUNT_ID: &str = "idx_webauthn_account_id";
 pub const INDEX_WEBAUTHN_CHALLENGES_EXPIRES: &str = "idx_webauthn_challenges_expires";
 pub const INDEX_BLOBS_ACCOUNT_ID: &str = "idx_blobs_account_id";
+
+pub const INDEX_SSH_CREDENTIALS_OWNER: &str = "ssh_credentials_owner";
+pub const INDEX_SSH_CHALLENGES_EXPIRY: &str = "ssh_challenges_expiry";
+pub const INDEX_SESSIONS_SSH_CREDENTIAL: &str = "sessions_ssh_credential";
 
 /// All required table names defined in the schema.
 pub const ALL_TABLES: &[&str] = &[
@@ -53,6 +59,8 @@ pub const ALL_TABLES: &[&str] = &[
     TABLE_WEBAUTHN_CREDENTIALS,
     TABLE_WEBAUTHN_CHALLENGES,
     TABLE_BLOBS,
+    TABLE_SSH_CREDENTIALS,
+    TABLE_SSH_CHALLENGES,
 ];
 
 /// All required indexes defined in the schema.
@@ -66,6 +74,9 @@ pub const ALL_INDEXES: &[&str] = &[
     INDEX_WEBAUTHN_ACCOUNT_ID,
     INDEX_WEBAUTHN_CHALLENGES_EXPIRES,
     INDEX_BLOBS_ACCOUNT_ID,
+    INDEX_SSH_CREDENTIALS_OWNER,
+    INDEX_SSH_CHALLENGES_EXPIRY,
+    INDEX_SESSIONS_SSH_CREDENTIAL,
 ];
 
 /// Account record in database.

@@ -6,7 +6,7 @@
 //! 3. Indexes support sync sequence reads;
 //! 4. Zero-knowledge schema invariants (no plaintext note fields).
 
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 use rusqlite::Connection;
 use uuid::Uuid;
@@ -19,11 +19,11 @@ fn test_migrations_reproducible_clean_state_and_idempotent() {
     conn.execute_batch("PRAGMA foreign_keys = ON;")
         .expect("enable foreign keys");
 
-    // Clean run applies migrations 2, 3, 4, 7, 8, and 9
+    // Clean run applies migrations 2, 3, 4, 7, 8, 9, and 10
     let applied = run_server_migrations(&mut conn).expect("run migrations");
     assert_eq!(applied, vec![2, 3, 4, 7, 8, 9, 10]);
 
-    // Verify all 12 tables and 9 indexes exist
+    // Verify all 14 required tables and 12 required indexes, including SSH auth
     verify_database_schema(&conn).expect("schema verification");
 
     // Check schema_migrations rows
@@ -458,4 +458,136 @@ fn test_blobs_uniqueness_and_isolation() {
         rusqlite::params![acc_2, blob_id],
     )
     .expect("same blob_id for acc_2 must succeed");
+}
+
+/// Isolated real database directory, removed after all connections are dropped.
+struct FileDatabase(std::path::PathBuf);
+impl FileDatabase {
+    fn new() -> Self {
+        let dir = std::env::temp_dir().join(format!("zk-server-schema-{}", Uuid::new_v4()));
+        std::fs::create_dir(&dir).expect("create isolated database directory");
+        Self(dir)
+    }
+    fn path(&self) -> std::path::PathBuf {
+        self.0.join("server.sqlite")
+    }
+}
+impl Drop for FileDatabase {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+fn assert_foreign_key_failure(result: rusqlite::Result<usize>) {
+    match result.expect_err("invalid SSH ownership/reference must fail") {
+        rusqlite::Error::SqliteFailure(error, _) => {
+            assert_eq!(
+                error.extended_code,
+                rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY
+            );
+        }
+        error => panic!("expected SQLite foreign-key failure, got {error:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_file_database_enforces_ssh_foreign_keys_on_each_open() {
+    let file = FileDatabase::new();
+    // Fresh and reopened production connections must have the same enforcement.
+    for _ in 0..2 {
+        let db = zk_server::db::ServerDb::open_file(file.path()).expect("open file-backed db");
+        let connection = db.connection();
+        let conn = connection.lock().await;
+        let enabled: i32 = conn
+            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(enabled, 1);
+        verify_database_schema(&conn).expect("migration 010 schema is verified");
+        for (kind, name) in [
+            ("table", "ssh_credentials"),
+            ("table", "ssh_challenges"),
+            ("index", "ssh_credentials_owner"),
+            ("index", "ssh_challenges_expiry"),
+            ("index", "sessions_ssh_credential"),
+        ] {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type = ?1 AND name = ?2",
+                    [kind, name],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "{kind} {name}");
+        }
+        let account = Uuid::new_v4().to_string();
+        let other_account = Uuid::new_v4().to_string();
+        let device = Uuid::new_v4().to_string();
+        let credential = Uuid::new_v4().to_string();
+        // Missing account is rejected by the credential-account FK.
+        assert_foreign_key_failure(conn.execute(
+            "INSERT INTO ssh_credentials (credential_id, account_id, fingerprint, public_key) VALUES (?1, ?2, ?1, ?1)",
+            rusqlite::params![credential, account]));
+        for owner in [&account, &other_account] {
+            conn.execute(
+                "INSERT INTO accounts (id, status) VALUES (?1, 'active')",
+                [owner],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO devices (account_id, device_id) VALUES (?1, ?2)",
+            rusqlite::params![other_account, device],
+        )
+        .unwrap();
+        // A real device belonging to another account is also rejected.
+        assert_foreign_key_failure(conn.execute(
+            "INSERT INTO ssh_credentials (credential_id, account_id, fingerprint, public_key, device_id) VALUES (?1, ?2, ?1, ?1, ?3)",
+            rusqlite::params![credential, account, device]));
+        // Valid credential ownership works; the failures are specifically constraints.
+        conn.execute("INSERT INTO ssh_credentials (credential_id, account_id, fingerprint, public_key) VALUES (?1, ?2, ?1, ?1)", rusqlite::params![credential, account]).unwrap();
+        let absent_credential = Uuid::new_v4().to_string();
+        assert_foreign_key_failure(conn.execute(
+            "INSERT INTO ssh_challenges (challenge_id, purpose, challenge_json, expires_at, credential_id) VALUES (?1, 'login-v1', '{}', 1, ?2)",
+            rusqlite::params![Uuid::new_v4().to_string(), absent_credential]));
+        assert_foreign_key_failure(conn.execute(
+            "INSERT INTO sessions (session_id, account_id, token_hash, ssh_credential_id) VALUES (?1, ?2, X'00', ?3)",
+            rusqlite::params![Uuid::new_v4().to_string(), account, absent_credential]));
+    }
+}
+
+#[test]
+fn test_file_database_rejects_missing_migration_010_objects() {
+    for (kind, name) in [
+        ("TABLE", "ssh_credentials"),
+        ("TABLE", "ssh_challenges"),
+        ("INDEX", "ssh_credentials_owner"),
+        ("INDEX", "ssh_challenges_expiry"),
+        ("INDEX", "sessions_ssh_credential"),
+    ] {
+        let file = FileDatabase::new();
+        drop(
+            zk_server::db::ServerDb::open_file(file.path()).expect("initialize persistent schema"),
+        );
+        {
+            let conn = Connection::open(file.path()).unwrap();
+            conn.execute_batch(&format!("DROP {kind} {name};")).unwrap();
+            let recorded: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM schema_migrations WHERE version = 10",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(recorded, 1, "migration remains recorded despite damage");
+            let error =
+                verify_database_schema(&conn).expect_err("verifier must detect missing SSH object");
+            assert!(error.to_string().contains(name));
+        }
+        let error = zk_server::db::ServerDb::open_file(file.path())
+            .expect_err("startup must reject damaged persistent schema");
+        assert!(matches!(
+            error,
+            zk_server::error::DbError::SchemaVerificationFailed(_)
+        ));
+        assert!(error.to_string().contains(name));
+    }
 }
