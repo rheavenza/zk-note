@@ -95,6 +95,66 @@ Implementation notes:
 
 ---
 
+# Native/TUI remote multi-device milestone
+
+Source: https://github.com/rheavenza/zk-note/issues/14
+
+Goal: make the native `zk-note` CLI/TUI a complete standalone multi-device
+product over an HTTPS-accessible native `zk-server`, without depending on the
+web notes application. Each machine owns its own encrypted local database; never
+share `notes.db` through NFS/Syncthing/cloud-drive synchronization.
+
+## ZK-109 — SSH-key authentication for native CLI/TUI
+Status: READY
+Priority: P1
+Dependencies: ZK-072, ADR-0006
+Ticket: [docs/tickets/ZK-109.md](docs/tickets/ZK-109.md)
+Acceptance: agent-first Ed25519 SSH challenge authentication issues the existing
+server session shape; private keys never leave the client; server-side account/key
+provisioning, listing and revocation work without introducing SSH as the sync
+transport.
+Verification: native auth integration, replay/expiry/wrong-origin tests, session
+and device revocation regression, secret-redaction audit.
+
+## ZK-110 — Native vault link, restore, account isolation, and replace-local-from-origin
+Status: READY
+Priority: P0
+Dependencies: ZK-109
+Ticket: [docs/tickets/ZK-110.md](docs/tickets/ZK-110.md)
+Acceptance: native vaults persist an exact `(server origin, account ID, vault
+identity)` link; first-device encrypted bootstrap upload and second-device
+restore work; wrong server/account/vault sync fails closed; an explicitly
+confirmed destructive replace-local action stages and validates the complete
+remote vault before swapping/deleting local vault state.
+Verification: two isolated native data dirs, failure injection around restore/swap,
+pending/conflict discard tests, zero-plaintext network evidence.
+
+## ZK-111 — Remote-safe native sync execution and CLI sync command
+Status: READY
+Priority: P1
+Dependencies: ZK-110
+Ticket: [docs/tickets/ZK-111.md](docs/tickets/ZK-111.md)
+Acceptance: bounded sync HTTP timeouts, background/non-blocking TUI sync,
+stale-result/cancellation safety, and a real `zk-note sync` command all reuse the
+existing shared SyncEngine and ZK-110 link guard.
+Verification: stalled/failed network tests, PTY responsiveness, cancellation and
+identity-switch tests, CLI/TUI shared-service regression.
+
+## ZK-112 — Remote native multi-machine acceptance and deployment
+Status: READY
+Priority: P1
+Dependencies: ZK-109, ZK-110, ZK-111
+Ticket: [docs/tickets/ZK-112.md](docs/tickets/ZK-112.md)
+Acceptance: two SSH-authenticated machines restore and synchronize the same vault
+through HTTPS, including conflicts, tombstones, offline retry, revocation and
+replace-local-from-origin. Document native `zk-server` behind TLS with
+Cloudflare Tunnel as the reference Internet setup.
+Verification: scripted two-client native acceptance, redacted network evidence,
+repository gates, deployment reproduction and external-smoke status.
+
+
+---
+
 # Web vault synchronization follow-up
 
 Source: https://github.com/rheavenza/zk-note/issues/3
