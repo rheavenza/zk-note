@@ -175,9 +175,14 @@ Implementation notes:
   startup recovery and WAL checkpoints preserve coherent generations. Replacing
   local state preserves auth/device, clears local unlock/plaintext buffers and
   never uploads discarded work or alters the server vault.
-- Passed fmt, workspace clippy/locked check, 543 all-target/all-feature workspace
-  tests; targeted core (42), protocol (23), storage (7), sync (98), CLI/TUI (129),
+- Passed fmt, workspace clippy/locked check, 548 all-target/all-feature workspace
+  tests; targeted core (45), protocol (23), storage (7), sync (98), CLI/TUI (131),
   server (187); native contract (84 checks plus CAS/replay concurrency).
+- PR #16 review repair: ciphertext-only shared pull followed by centralized core
+  typed validation of active notes and attachment manifests. Manifest restore
+  preserves ciphertext/cursor with zero pushes; tampered manifests reject restore
+  and replacement without changing active files. Reserved/unknown active kinds
+  fail closed; no shipped notebook/settings producer exists. Sync engine unchanged.
 - Tests include independent two-machine convergence/tombstones, 12 swap and 12
   staging fault transitions, actual cursor-write failure, page failures, WAL
   reopen, zero-push discard, guard mismatches and secret redaction/scrubbing.

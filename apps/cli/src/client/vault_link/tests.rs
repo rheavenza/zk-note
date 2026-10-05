@@ -906,3 +906,136 @@ async fn real_server_different_local_vault_replacement_requires_discard_and_neve
         UnsyncedCounts::default()
     );
 }
+
+#[tokio::test]
+async fn real_server_attachment_manifest_restore_validates_without_push() {
+    manifest_restore(false).await;
+}
+
+#[tokio::test]
+async fn real_server_tampered_manifest_restore_and_replace_fail_closed_without_push() {
+    manifest_restore(true).await;
+}
+
+async fn manifest_restore(tamper: bool) {
+    use zk_core::attachment::encrypt_attachment_manifest;
+    use zk_crypto::keys::AttachmentKey;
+    use zk_protocol::attachment::AttachmentManifest;
+    let server = Server::start().await;
+    let machine_a = TempDir::new();
+    let machine_b = TempDir::new();
+    let (_, _, key) = initialize(&machine_a.0);
+    let auth_a = server.session(&machine_a.0, Uuid::new_v4()).await;
+    link_local_vault_to_server(&machine_a.0).await.unwrap();
+    let manifest = AttachmentManifest {
+        attachment_id: Uuid::new_v4().to_string(),
+        name: "PRIVATE-FILENAME-CANARY".into(),
+        mime: "application/octet-stream".into(),
+        size: 3,
+        chunk_count: 1,
+        chunk_size: 3,
+        content_hash: None,
+    };
+    let mut envelope =
+        encrypt_attachment_manifest(&manifest, &AttachmentKey::generate(), &key).unwrap();
+    if tamper {
+        let replacement = if envelope.payload.ciphertext.starts_with('A') {
+            "B"
+        } else {
+            "A"
+        };
+        envelope.payload.ciphertext.replace_range(0..1, replacement);
+    }
+    let response = adapter(&auth_a)
+        .unwrap()
+        .push_mutation(&PushRequest {
+            mutation_id: Uuid::new_v4().to_string(),
+            object_id: envelope.object_id.clone(),
+            expected_revision: 0,
+            object_kind: 4,
+            envelope: envelope.clone(),
+            is_deleted: false,
+        })
+        .await
+        .unwrap();
+    server.session(&machine_b.0, auth_a.account_id).await;
+    let before = server.pushes.load(Ordering::SeqCst);
+    let p = replacement_preflight(&machine_b.0).await.unwrap();
+    if tamper {
+        assert!(stage_remote_vault(
+            &machine_b.0,
+            &p,
+            UnlockSecret::Passphrase(b"LOCAL-PASS-CANARY"),
+            false,
+            false
+        )
+        .await
+        .is_err());
+        assert!(!config::vault_file(&machine_b.0).exists());
+        assert!(!config::db_file(&machine_b.0).exists());
+        assert!(!machine_b.0.join("vault-link.json").exists());
+        let (_, _, old_key) = initialize(&machine_b.0);
+        notes::create_note(
+            Some(&machine_b.0),
+            &old_key,
+            "old local",
+            "must survive",
+            vec![],
+        )
+        .unwrap();
+        let old_vault = fs::read(config::vault_file(&machine_b.0)).unwrap();
+        let old_db = fs::read(config::db_file(&machine_b.0)).unwrap();
+        let old_auth = fs::read(config::auth_session_file(&machine_b.0)).unwrap();
+        let p = replacement_preflight(&machine_b.0).await.unwrap();
+        assert_eq!(p.counts.pending, 1);
+        let error = stage_remote_vault(
+            &machine_b.0,
+            &p,
+            UnlockSecret::Passphrase(b"LOCAL-PASS-CANARY"),
+            true,
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert!(!format!("{error:?}").contains("PRIVATE-FILENAME-CANARY"));
+        assert_eq!(
+            fs::read(config::vault_file(&machine_b.0)).unwrap(),
+            old_vault
+        );
+        assert_eq!(fs::read(config::db_file(&machine_b.0)).unwrap(), old_db);
+        assert_eq!(
+            fs::read(config::auth_session_file(&machine_b.0)).unwrap(),
+            old_auth
+        );
+        assert!(!fs::read_dir(&machine_b.0).unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".replace-")));
+        assert_eq!(server.pushes.load(Ordering::SeqCst), before);
+        return;
+    }
+    let stage = stage_remote_vault(
+        &machine_b.0,
+        &p,
+        UnlockSecret::Passphrase(b"LOCAL-PASS-CANARY"),
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+    vault_files::install(&machine_b.0, stage).unwrap();
+    let db = SqliteStorage::open(config::db_file(&machine_b.0)).unwrap();
+    assert_eq!(
+        db.get_object(&envelope.object_id)
+            .unwrap()
+            .unwrap()
+            .envelope,
+        envelope
+    );
+    assert_eq!(
+        db.get_sync_state().unwrap().sync_cursor,
+        response.server_seq
+    );
+    assert_eq!(server.pushes.load(Ordering::SeqCst), before);
+}

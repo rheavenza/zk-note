@@ -410,28 +410,31 @@ async fn stage_with_hook<A: SyncServerAdapter>(
         {
             return Err(CliError::Io("staging database is not empty".into()));
         }
-        // Shared pull ONLY, never SyncEngine or push. Validate decrypted envelopes
-        // in memory with the recovered key; nothing plaintext is persisted or sent.
-        let mut report = pull_remote_changes(
-            a,
-            storage.as_ref(),
-            &cursor,
-            Some(&key),
-            PullOptions::default(),
-        )
-        .await
-        .map_err(|_| {
-            CliError::Network(
-                "remote pull or ciphertext validation failed; active vault unchanged".into(),
-            )
-        })?;
-        // Decrypted validation output is unnecessary after verification.
-        use zeroize::Zeroize;
-        for item in &mut report.decrypted_items {
-            if let Some(note) = &mut item.note {
-                note.title.zeroize();
-                note.body.zeroize();
-                note.tags.zeroize();
+        // Shared ciphertext-only pull preserves every object kind and tombstone.
+        // Validate the staged active objects with their existing typed decoders;
+        // the note-specific unlocked pull decoder cannot decode manifests.
+        let report =
+            pull_remote_changes(a, storage.as_ref(), &cursor, None, PullOptions::default())
+                .await
+                .map_err(|_| {
+                    CliError::Network("remote pull failed; active vault unchanged".into())
+                })?;
+        for object in storage.list_objects(&zk_storage::models::ObjectFilter::all())? {
+            if object.object_id != object.envelope.object_id
+                || object.object_kind != object.envelope.object_kind
+            {
+                return Err(CliError::Network(
+                    "staged object identity mismatch; active vault unchanged".into(),
+                ));
+            }
+            // Tombstones retain opaque envelopes, as in the existing shared pull.
+            if !object.is_deleted {
+                zk_core::object_validation::validate_active_object(&object.envelope, &key)
+                    .map_err(|_| {
+                        CliError::Network(
+                            "staged object validation failed; active vault unchanged".into(),
+                        )
+                    })?;
             }
         }
         hook(4, &stage.dir)?;

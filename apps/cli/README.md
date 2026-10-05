@@ -446,6 +446,11 @@ between masked passphrase and recovery-key input. Esc cancels and scrubs inputs.
 All unwrap/decryption happens locally; passphrases, recovery keys, VaultKey,
 plaintext titles/bodies/tags and search terms never enter network payloads.
 
+Restore validates active note and attachment-manifest envelopes locally with their
+existing typed decoders. Tampering or unsupported active object kinds aborts
+before installation; temporary decoded metadata is never persisted or transmitted.
+Restoring manifests does not download attachment blobs.
+
 Restore builds an independent staged cache, pulls ciphertext and tombstones from
 cursor 0 and never pushes. It installs bootstrap/cache/link only after validation,
 complete pull and durable WAL checkpoint/close. It leaves the restored vault

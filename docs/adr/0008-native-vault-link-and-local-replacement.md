@@ -65,7 +65,16 @@ lanes, and 8..64 salt bytes; wrappers require the existing v1 cipher suite,
 24-byte nonces and 48-byte ciphertexts. Bounds prevent remote allocation abuse,
 and parameters are never weakened/substituted. Pull from cursor 0 through the
 existing shared `pull_remote_changes`, including tombstones, with no push code
-path. Validate decrypted envelopes in memory, verify durable cursor/empty queue,
+path. Pull without the note-specific unlocked decoder, then validate every active
+staged envelope through the shared core kind dispatcher: the existing note decoder
+for kind 1 and attachment-manifest decoder for kind 4. Authenticate wrapped keys,
+payload and AAD and decode the typed model; scrub temporary decoded metadata and
+redact underlying decoder errors. Check stored ID/kind against the envelope.
+Tombstones retain the existing opaque-envelope semantics. Notebook/settings kinds
+2/3 currently have no shipped producer/plaintext model and, like other unsupported
+active kinds, fail closed rather than bypass validation. Future supported kinds
+must extend the central dispatcher. No attachment blob download is implied by
+restoring its manifest. Verify durable cursor/empty queue,
 checkpoint WAL with busy rejection, close/reopen/close the staged DB, fsync its
 file and directory and persist/verify the staged link. Drop removes failed stages.
 

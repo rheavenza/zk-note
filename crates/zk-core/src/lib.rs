@@ -1,6 +1,7 @@
 pub mod attachment;
 pub mod error;
 pub mod note;
+pub mod object_validation;
 pub mod search;
 pub mod time;
 pub mod vault;
