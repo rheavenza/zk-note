@@ -64,6 +64,7 @@ pub enum AccountField {
     ServerUrl,
     Token,
     ConnectButton,
+    SshButton,
     SignOutButton,
 }
 
@@ -71,6 +72,7 @@ pub enum AccountField {
 #[derive(Clone, PartialEq, Eq)]
 pub enum AccountPendingAction {
     Connect { server_url: String, token: String },
+    DiscoverIdentities,
     SignOut,
     RefreshStatus,
     StartupVerify,
@@ -84,6 +86,9 @@ impl fmt::Debug for AccountPendingAction {
                 .field("server_url", server_url)
                 .field("token", &"[REDACTED]")
                 .finish(),
+            AccountPendingAction::DiscoverIdentities => {
+                write!(f, "AccountPendingAction::DiscoverIdentities")
+            }
             AccountPendingAction::SignOut => write!(f, "AccountPendingAction::SignOut"),
             AccountPendingAction::RefreshStatus => write!(f, "AccountPendingAction::RefreshStatus"),
             AccountPendingAction::StartupVerify => write!(f, "AccountPendingAction::StartupVerify"),
@@ -131,6 +136,8 @@ pub struct App {
     pub account_token_input: String,
     pub account_focus_field: AccountField,
     pub account_pending_action: Option<AccountPendingAction>,
+    pub account_ssh_identities: Vec<crate::ssh::AgentIdentity>,
+    pub account_ssh_selected: usize,
 
     // Status & Feedback
     pub sync_status: SyncStatus,
@@ -171,6 +178,23 @@ impl fmt::Debug for App {
 }
 
 impl App {
+    /// Reuse the existing authenticated account state after either login method.
+    pub fn apply_account_session(&mut self, session: crate::auth::StoredAuthSession) {
+        self.account_state = ClientAuthState::Authenticated {
+            server_url: session.server_url.clone(),
+            account_id: session.account_id,
+            device_id: session.device_id,
+            session_id: session.session_id,
+            expires_at: session.expires_at,
+        };
+        self.account_server_input = session.server_url;
+        self.account_ssh_identities.clear();
+        self.account_ssh_selected = 0;
+        self.status_message = Some("Terminal device authorized successfully.".into());
+        self.error_message = None;
+        self.mode = self.previous_mode.take().unwrap_or(AppMode::Normal);
+    }
+
     /// Constructs and initializes a new [`App`] state machine.
     pub fn new(data_dir: Option<&Path>, width: u16, height: u16) -> Self {
         let initial_sync = get_initial_sync_status(data_dir);
@@ -233,6 +257,8 @@ impl App {
             auth_op_generation: 1,
             account_server_input: default_server,
             account_token_input: String::new(),
+            account_ssh_identities: Vec::new(),
+            account_ssh_selected: 0,
             account_focus_field: AccountField::ServerUrl,
             account_pending_action: initial_pending_action,
             sync_status: initial_sync,
@@ -378,6 +404,13 @@ impl App {
 
         self.account_token_input.zeroize();
         self.account_token_input.clear();
+        if let Some(AccountPendingAction::Connect { mut token, .. }) =
+            self.account_pending_action.take()
+        {
+            token.zeroize();
+        }
+        self.account_ssh_identities.clear();
+        self.account_ssh_selected = 0;
 
         self.mode = AppMode::Locked;
         self.previous_mode = None;
@@ -792,6 +825,13 @@ impl App {
                 if self.mode == AppMode::Account {
                     self.account_token_input.zeroize();
                     self.account_token_input.clear();
+                    if let Some(AccountPendingAction::Connect { mut token, .. }) =
+                        self.account_pending_action.take()
+                    {
+                        token.zeroize();
+                    }
+                    self.account_ssh_identities.clear();
+                    self.account_ssh_selected = 0;
                     self.mode = self.previous_mode.take().unwrap_or(AppMode::Normal);
                 }
             }
@@ -820,7 +860,8 @@ impl App {
                     self.account_focus_field = match self.account_focus_field {
                         AccountField::ServerUrl => AccountField::Token,
                         AccountField::Token => AccountField::ConnectButton,
-                        AccountField::ConnectButton => AccountField::SignOutButton,
+                        AccountField::ConnectButton => AccountField::SshButton,
+                        AccountField::SshButton => AccountField::SignOutButton,
                         AccountField::SignOutButton => AccountField::ServerUrl,
                     };
                 }
@@ -831,25 +872,50 @@ impl App {
                         AccountField::ServerUrl => AccountField::SignOutButton,
                         AccountField::Token => AccountField::ServerUrl,
                         AccountField::ConnectButton => AccountField::Token,
-                        AccountField::SignOutButton => AccountField::ConnectButton,
+                        AccountField::SignOutButton => AccountField::SshButton,
+                        AccountField::SshButton => AccountField::ConnectButton,
                     };
+                }
+            }
+            Action::AccountSshSubmit => {
+                if self.mode == AppMode::Account {
+                    self.account_token_input.zeroize();
+                    self.account_token_input.clear();
+                    self.update(Action::AccountSubmit);
+                }
+            }
+            Action::AccountSshNext => {
+                if self.mode == AppMode::Account && !self.account_ssh_identities.is_empty() {
+                    self.account_ssh_selected =
+                        (self.account_ssh_selected + 1) % self.account_ssh_identities.len();
+                }
+            }
+            Action::AccountSshDiscover => {
+                if self.mode == AppMode::Account {
+                    self.account_pending_action = Some(AccountPendingAction::DiscoverIdentities);
                 }
             }
             Action::AccountSubmit => {
                 if self.mode == AppMode::Account {
                     let url = self.account_server_input.trim().to_string();
                     let tok = self.account_token_input.trim().to_string();
-                    if tok.is_empty() {
-                        self.error_message = Some("Session token cannot be empty.".to_string());
-                    } else {
+                    {
                         self.invalidate_auth_ops();
-                        self.account_pending_action = Some(AccountPendingAction::Connect {
-                            server_url: url,
-                            token: tok,
-                        });
+                        self.account_pending_action =
+                            if tok.is_empty() && self.account_ssh_identities.is_empty() {
+                                Some(AccountPendingAction::DiscoverIdentities)
+                            } else {
+                                Some(AccountPendingAction::Connect {
+                                    server_url: url,
+                                    token: tok,
+                                })
+                            };
                         self.account_token_input.zeroize();
                         self.account_token_input.clear();
-                        self.status_message = Some("Authorizing device with server...".to_string());
+                        self.status_message = Some(
+                            "SSH agent: select identity with Left/Right, then Enter; token login remains available."
+                                .to_string(),
+                        );
                         self.error_message = None;
                     }
                 }
@@ -1185,8 +1251,14 @@ impl App {
                     AccountField::Token | AccountField::ConnectButton => {
                         self.update(Action::AccountSubmit)
                     }
+                    AccountField::SshButton => self.update(Action::AccountSshSubmit),
                     AccountField::SignOutButton => self.update(Action::AccountSignOut),
                 },
+                KeyCode::Left | KeyCode::Right
+                    if self.account_focus_field == AccountField::SshButton =>
+                {
+                    self.update(Action::AccountSshNext)
+                }
                 KeyCode::Backspace => match self.account_focus_field {
                     AccountField::ServerUrl => self.update(Action::AccountServerBackspace),
                     AccountField::Token => self.update(Action::AccountTokenBackspace),
@@ -1198,6 +1270,8 @@ impl App {
                     AccountField::ConnectButton if c == 'c' || c == ' ' => {
                         self.update(Action::AccountSubmit)
                     }
+                    AccountField::SshButton if c == ' ' => self.update(Action::AccountSshSubmit),
+                    AccountField::SshButton if c == 'r' => self.update(Action::AccountSshDiscover),
                     AccountField::SignOutButton if c == 'x' || c == ' ' => {
                         self.update(Action::AccountSignOut)
                     }
@@ -1331,6 +1405,11 @@ impl Drop for App {
     fn drop(&mut self) {
         self.passphrase_input.zeroize();
         self.account_token_input.zeroize();
+        if let Some(AccountPendingAction::Connect { token, .. }) =
+            self.account_pending_action.as_mut()
+        {
+            token.zeroize();
+        }
         self.edit_title.zeroize();
         self.edit_tags.zeroize();
         self.edit_body.zeroize();

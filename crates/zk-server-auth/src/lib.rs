@@ -201,3 +201,6 @@ pub fn login(
         .map_err(|_| VerificationFailed)?;
     Ok(count)
 }
+
+#[cfg(feature = "ssh")]
+pub mod ssh;

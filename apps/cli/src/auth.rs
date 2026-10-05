@@ -88,38 +88,38 @@ pub fn get_or_create_device_id(
 
 /// Saves the active authentication session with strict `0600` permissions.
 pub fn save_auth_session(path: &Path, session: &StoredAuthSession) -> Result<(), CliError> {
-    let json = serde_json::to_string_pretty(session)
-        .map_err(|e| CliError::Io(format!("failed to serialize session: {e}")))?;
+    let json = zeroize::Zeroizing::new(
+        serde_json::to_string_pretty(session)
+            .map_err(|_| CliError::Io("Failed to serialize auth session".into()))?,
+    );
 
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+    // Replace atomically: a failed new login/write must preserve the saved session.
+    let temporary = path.with_file_name(format!(".auth_session-{}.tmp", Uuid::new_v4()));
+    let result: Result<(), CliError> = (|| {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        use std::io::Write;
+        let mut file = options
+            .open(&temporary)
+            .map_err(|_| CliError::Io("Failed to create restricted auth session file".into()))?;
+        file.write_all(json.as_bytes())
+            .map_err(|_| CliError::Io("Failed to write auth session".into()))?;
+        file.sync_all()
+            .map_err(|_| CliError::Io("Failed to flush auth session".into()))?;
+        drop(file);
+        std::fs::rename(&temporary, path)
+            .map_err(|_| CliError::Io("Failed to replace auth session".into()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
     }
-
-    use std::io::Write;
-    let mut file = options.open(path).map_err(|e| {
-        CliError::Io(format!(
-            "failed to open auth session file {}: {e}",
-            path.display()
-        ))
-    })?;
-
-    file.write_all(json.as_bytes()).map_err(|e| {
-        CliError::Io(format!(
-            "failed to write auth session file {}: {e}",
-            path.display()
-        ))
-    })?;
-    file.flush().map_err(|e| {
-        CliError::Io(format!(
-            "failed to flush auth session file {}: {e}",
-            path.display()
-        ))
-    })?;
+    result?;
 
     Ok(())
 }
@@ -248,6 +248,7 @@ pub fn auth_http_client_with_timeout(
     request_timeout: std::time::Duration,
 ) -> Result<Client, CliError> {
     Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(connect_timeout)
         .timeout(request_timeout)
         .build()

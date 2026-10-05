@@ -648,9 +648,10 @@ pub async fn device_authorize_handler(
         }
     };
 
-    if let Err(response) = require_owner(&state, &headers, req.account_id).await {
-        return response.into_response();
-    }
+    let caller = match owner_identity(&state, &headers, req.account_id).await {
+        Ok(caller) => caller,
+        Err(response) => return response.into_response(),
+    };
 
     // Check if device is revoked
     match state
@@ -710,19 +711,31 @@ pub async fn device_authorize_handler(
         )
         .await
     {
-        Ok((session, token)) => (
-            StatusCode::OK,
-            Json(DeviceAuthResponse {
-                session: SessionResponse {
-                    token,
-                    session_id: session.session_id,
-                    account_id: session.account_id,
-                    device_id: session.device_id,
-                    expires_at: session.expires_at,
-                },
-            }),
-        )
-            .into_response(),
+        Ok((session, token)) => {
+            if let Some(source) = caller.session_id {
+                if state
+                    .db
+                    .inherit_ssh_credential(req.account_id, source, session.session_id)
+                    .await
+                    .is_err()
+                {
+                    return verification_failure();
+                }
+            }
+            (
+                StatusCode::OK,
+                Json(DeviceAuthResponse {
+                    session: SessionResponse {
+                        token,
+                        session_id: session.session_id,
+                        account_id: session.account_id,
+                        device_id: session.device_id,
+                        expires_at: session.expires_at,
+                    },
+                }),
+            )
+                .into_response()
+        }
         Err(e) => {
             tracing::error!("failed to create device session: {e}");
             (
@@ -871,6 +884,14 @@ async fn require_owner(
     headers: &HeaderMap,
     account: Uuid,
 ) -> Result<(), crate::auth::AuthError> {
+    owner_identity(state, headers, account).await.map(|_| ())
+}
+
+async fn owner_identity(
+    state: &AppState,
+    headers: &HeaderMap,
+    account: Uuid,
+) -> Result<AuthenticatedAccount, crate::auth::AuthError> {
     let token = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
@@ -880,5 +901,5 @@ async fn require_owner(
     if auth.account_id != account {
         return Err(crate::auth::AuthError::ForbiddenAccountAccess);
     }
-    Ok(())
+    Ok(auth)
 }

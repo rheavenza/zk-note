@@ -18,3 +18,15 @@ ciborium = "0.2.2"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.2", features = ["js"] }
+
+[features]
+default = []
+ssh = ["dep:ssh-key", "dep:signature"]
+
+[dependencies.ssh-key]
+workspace = true
+optional = true
+
+[dependencies.signature]
+workspace = true
+optional = true

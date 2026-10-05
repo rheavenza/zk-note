@@ -67,6 +67,9 @@ pub enum Action {
     AccountNextField,
     AccountPrevField,
     AccountSubmit,
+    AccountSshSubmit,
+    AccountSshNext,
+    AccountSshDiscover,
     AccountSignOut,
     AccountRefresh,
 
@@ -89,6 +92,9 @@ impl fmt::Debug for Action {
             Action::EditChar(_) => write!(f, "Action::EditChar([REDACTED])"),
             Action::AccountTokenChar(_) => write!(f, "Action::AccountTokenChar([REDACTED])"),
             Action::AccountTokenBackspace => write!(f, "Action::AccountTokenBackspace"),
+            Action::AccountSshSubmit => write!(f, "Action::AccountSshSubmit"),
+            Action::AccountSshNext => write!(f, "Action::AccountSshNext"),
+            Action::AccountSshDiscover => write!(f, "Action::AccountSshDiscover"),
             Action::AccountSubmit => write!(f, "Action::AccountSubmit"),
             other => write!(f, "Action::{other:?}"),
         }

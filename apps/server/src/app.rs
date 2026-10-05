@@ -27,6 +27,11 @@ impl AppState {
     /// If `config.db_path` is specified, opens the persistent file database;
     /// otherwise initializes an in-memory database.
     pub fn new(config: ServerConfig) -> Result<Self, crate::error::DbError> {
+        config.validate_ssh_origin().map_err(|_| {
+            crate::error::DbError::SchemaVerificationFailed(
+                "Invalid SSH authentication origin".into(),
+            )
+        })?;
         let db = if let Some(ref path) = config.db_path {
             ServerDb::open_file(path)?
         } else {
@@ -37,6 +42,11 @@ impl AppState {
 
     /// Creates a new application state with an in-memory SQLite database initialized with all migrations.
     pub fn new_in_memory(config: ServerConfig) -> Result<Self, crate::error::DbError> {
+        config.validate_ssh_origin().map_err(|_| {
+            crate::error::DbError::SchemaVerificationFailed(
+                "Invalid SSH authentication origin".into(),
+            )
+        })?;
         Ok(Self {
             config,
             db: ServerDb::new_in_memory()?,
@@ -157,6 +167,11 @@ async fn security_headers_middleware(
 pub fn create_app(state: AppState) -> Router {
     let protected_routes = Router::new()
         .route(
+            "/v1/auth/ssh/keys",
+            get(crate::routes::ssh::list).post(crate::routes::ssh::add),
+        )
+        .route("/v1/auth/ssh/keys/{id}", delete(crate::routes::ssh::revoke))
+        .route(
             "/v1/vault/bootstrap",
             get(get_vault_bootstrap_handler).post(create_vault_bootstrap_handler),
         )
@@ -203,6 +218,8 @@ pub fn create_app(state: AppState) -> Router {
         ));
 
     let public_auth_routes = Router::new()
+        .route("/v1/auth/ssh/start", post(crate::routes::ssh::start))
+        .route("/v1/auth/ssh/finish", post(crate::routes::ssh::finish))
         .route(
             "/v1/auth/device/authorize",
             post(crate::routes::auth::device_authorize_handler),

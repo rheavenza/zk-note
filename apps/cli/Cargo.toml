@@ -25,10 +25,14 @@ zk-storage = { workspace = true, features = ["sqlite"] }
 zk-sync = { workspace = true, features = ["native-adapter"] }
 uuid = { workspace = true }
 tokio = { workspace = true }
-reqwest = { workspace = true }
+reqwest = { workspace = true, features = ["rustls"] }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 zeroize = { workspace = true }
+
+ssh-key = { workspace = true }
+ssh-agent-client-rs = { workspace = true }
+base64ct = { workspace = true }
 
 [dev-dependencies]
 rusqlite = { workspace = true }

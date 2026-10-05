@@ -43,7 +43,7 @@ The server **NEVER** performs:
 
 ## REST API Overview
 
-All API endpoints are versioned under `/v1` and strictly enforce authentication (except `/health` and initial `/v1/vault/bootstrap` creation).
+API endpoints are versioned under `/v1`. Protected ciphertext and account-management routes require bearer authentication; health and authentication-challenge/proof routes are public.
 
 ### 1. Health & Diagnostics
 - `GET /health` or `GET /v1/health`: Returns JSON `{"status":"pass"}` and system timestamp. Does not require authentication.
@@ -237,3 +237,44 @@ link, upload, restore or unlock the local vault. No schema or deployment
 configuration changes are required for this evidence-only change.
 
 See [measured CPU results, reproduction and options](../../docs/tickets/ZK-108-argon2-feasibility.md).
+
+
+## Native SSH authentication and operator provisioning (ZK-109)
+
+Set a persistent SQLite path and the exact public origin. No-argument
+`zk-server` startup is preserved:
+
+```bash
+export ZK_SERVER_DB_PATH=/var/lib/zk-notes/server.db
+export ZK_SSH_AUTH_ORIGIN=https://notes.example.com
+zk-server account create --ssh-key ~/.ssh/id_ed25519.pub --label desktop
+zk-server account add-ssh-key <account-id> --ssh-key ~/.ssh/laptop.pub --label laptop
+zk-server
+```
+
+Provisioning uses the same database and append-only migrations as server startup.
+It reads bounded public `.pub` files through the shared server-auth parser,
+accepts only plain `ssh-ed25519`, and prints account ID, credential ID and SHA256
+fingerprint. No bypass bearer token or vault is created. Duplicate keys (including
+revoked ones), unknown/inactive accounts, private input and unsupported keys fail
+clearly. No public HTTP admin/bootstrap route is added.
+
+`ZK_SSH_AUTH_ORIGIN` defaults to `http://127.0.0.1:8080`. Configure it explicitly
+for custom ports and remote deployment. It must be a canonical URL origin:
+lowercase ASCII/IDNA host, canonical port/IPv6 form, no default port, trailing
+slash, credentials, path, query or fragment. HTTPS is required remotely; HTTP is
+permitted only for localhost/loopback. Host/forwarding/Origin headers cannot alter
+it. Clients refuse to sign challenges for a different intended origin.
+
+Public `/v1/auth/ssh/start` and `/finish` exchange a one-use 32-byte CSPRNG
+challenge (120-second TTL) and SSH Ed25519 proof for the existing bearer session
+(one-hour TTL). Authenticated `/v1/auth/ssh/keys` supports list/add and
+`DELETE /v1/auth/ssh/keys/{credential_id}` supports account-scoped revoke.
+Use one key per machine: first authentication pins the key to that device UUID.
+Revoking the key revokes that device and all its active sessions, plus sessions
+derived from the key. Existing device/session/logout revocation still applies.
+
+SSH serves authentication over HTTPS only; no port 22, SSH sync transport,
+private-key upload, vault passphrase or vault operation is involved. Workers SSH
+authentication is outside this ticket. See [ADR-0007](../../docs/adr/0007-native-ssh-authentication.md)
+and [protocol v1](../../docs/protocol/v1.md).
