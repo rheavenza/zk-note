@@ -31,6 +31,8 @@ impl FromStr for LogFormat {
 /// Server runtime configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerConfig {
+    /// Explicit API audience for native SSH authentication, never derived from headers.
+    pub ssh_auth_origin: String,
     /// Explicit WebAuthn relying party ID and browser origin; never inferred from request headers.
     pub webauthn_rp_id: String,
     pub webauthn_origin: String,
@@ -53,6 +55,7 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
+            ssh_auth_origin: "http://127.0.0.1:8080".into(),
             webauthn_rp_id: "localhost".into(),
             webauthn_origin: "http://localhost:5173".into(),
             host: "127.0.0.1".to_string(),
@@ -70,6 +73,7 @@ impl ServerConfig {
     /// Loads configuration from standard process environment variables.
     ///
     /// Supported variables:
+    /// - `ZK_SSH_AUTH_ORIGIN` (default: http://127.0.0.1:8080; canonical audience)
     /// - `ZK_SERVER_HOST` / `HOST` (default: 127.0.0.1)
     /// - `ZK_SERVER_PORT` / `PORT` (default: 8080)
     /// - `ZK_SERVER_LOG_LEVEL` / `RUST_LOG` (default: info)
@@ -142,6 +146,8 @@ impl ServerConfig {
             .filter(|s| !s.is_empty());
 
         let config = Self {
+            ssh_auth_origin: lookup("ZK_SSH_AUTH_ORIGIN")
+                .unwrap_or_else(|| "http://127.0.0.1:8080".into()),
             webauthn_rp_id: lookup("ZK_WEBAUTHN_RP_ID").unwrap_or_else(|| "localhost".into()),
             webauthn_origin: lookup("ZK_WEBAUTHN_ORIGIN")
                 .unwrap_or_else(|| "http://localhost:5173".into()),
@@ -154,10 +160,36 @@ impl ServerConfig {
             db_path,
         };
 
+        config.validate_ssh_origin()?;
+
         // Validate that the host:port combination parses into a valid SocketAddr
         let _ = config.socket_addr()?;
 
         Ok(config)
+    }
+
+    /// Reject ambiguous audiences and remote HTTP. No request header controls this value.
+    pub fn validate_ssh_origin(&self) -> Result<(), ConfigError> {
+        let url = url::Url::parse(&self.ssh_auth_origin)
+            .map_err(|_| ConfigError::InvalidHost("Invalid SSH authentication origin".into()))?;
+        let loopback = match url.host() {
+            Some(url::Host::Domain("localhost")) => true,
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+            _ => false,
+        };
+        if (url.scheme() != "https" && !(url.scheme() == "http" && loopback))
+            || url.host().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.path() != "/"
+            || url.query().is_some()
+            || url.fragment().is_some()
+            || url.origin().ascii_serialization() != self.ssh_auth_origin
+        {
+            return Err(ConfigError::InvalidHost("SSH authentication origin must be a canonical HTTPS origin (loopback HTTP allowed)".into()));
+        }
+        Ok(())
     }
 
     /// Parses host and port into a [`SocketAddr`].

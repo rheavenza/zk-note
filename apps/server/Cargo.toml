@@ -19,7 +19,7 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
-zk-server-auth = { path = "../../crates/zk-server-auth" }
+zk-server-auth = { path = "../../crates/zk-server-auth", features = ["ssh"] }
 zk-protocol = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -34,7 +34,13 @@ rusqlite = { workspace = true }
 base64ct = { workspace = true }
 blake2 = { workspace = true }
 
+ssh-key = { workspace = true }
+rand_core = { workspace = true }
+clap = { workspace = true }
+url = "2.5"
+
 [dev-dependencies]
+signature = { workspace = true }
 zk-sync = { workspace = true, features = ["native-adapter"] }
 zk-core = { workspace = true }
 zk-crypto = { workspace = true }

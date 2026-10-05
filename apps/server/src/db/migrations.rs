@@ -39,6 +39,7 @@ pub struct Migration {
 
 /// All registered server schema migrations in chronological order.
 pub const SERVER_MIGRATIONS: &[Migration] = &[
+    // Append-only SSH schema is ordered after the existing migrations below.
     Migration {
         version: 2,
         name: "002_initial_server_schema",
@@ -68,6 +69,11 @@ pub const SERVER_MIGRATIONS: &[Migration] = &[
         version: 9,
         name: "009_ciphertext_blobs",
         sql: MIGRATION_009_SQL,
+    },
+    Migration {
+        version: 10,
+        name: "010_ssh_auth",
+        sql: include_str!("../../../../migrations/010_ssh_auth.sql"),
     },
 ];
 
@@ -147,7 +153,7 @@ mod tests {
 
         // First migration run applies versions 2, 3, 4, 7, 8, and 9
         let applied1 = run_server_migrations(&mut conn).unwrap();
-        assert_eq!(applied1, vec![2, 3, 4, 7, 8, 9]);
+        assert_eq!(applied1, vec![2, 3, 4, 7, 8, 9, 10]);
 
         // Schema verification passes
         verify_database_schema(&conn).unwrap();

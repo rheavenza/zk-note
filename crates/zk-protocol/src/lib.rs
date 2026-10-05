@@ -7,6 +7,7 @@ pub mod constants;
 pub mod envelope;
 pub mod kind;
 pub mod note;
+pub mod ssh;
 pub mod sync;
 pub mod vault;
 pub mod webauthn;

@@ -17,6 +17,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 use std::path::{Path, PathBuf};
+use uuid::Uuid;
 use zk_core::note::PlaintextNote;
 use zk_protocol::constants::OBJECT_KIND_NOTE;
 use zk_storage::models::ConflictRecord;
@@ -773,6 +774,8 @@ fn test_account_field_navigation_and_actions() {
     app.update(Action::AccountNextField);
     assert_eq!(app.account_focus_field, AccountField::ConnectButton);
     app.update(Action::AccountNextField);
+    assert_eq!(app.account_focus_field, AccountField::SshButton);
+    app.update(Action::AccountNextField);
     assert_eq!(app.account_focus_field, AccountField::SignOutButton);
     app.update(Action::AccountNextField);
     assert_eq!(app.account_focus_field, AccountField::ServerUrl);
@@ -791,11 +794,14 @@ fn test_account_field_navigation_and_actions() {
     app.update(Action::AccountServerBackspace);
     assert_eq!(app.account_server_input, "http://127.0.0.1:909");
 
-    // Submit with empty token produces error
+    // Submit with empty token starts agent authentication
     app.account_token_input.clear();
     app.update(Action::AccountSubmit);
-    assert!(app.error_message.is_some());
-    assert!(app.account_pending_action.is_none());
+    assert!(app.error_message.is_none());
+    assert!(matches!(
+        app.account_pending_action.take(),
+        Some(AccountPendingAction::DiscoverIdentities)
+    ));
 
     // Submit with token sets AccountPendingAction::Connect and zeroes in-app token buffer
     for c in "auth_token_xyz".chars() {
@@ -1881,4 +1887,59 @@ fn test_synthetic_view_text_captures() {
     assert!(!acc_text.contains("tok-secret")); // Token is masked!
     assert!(acc_text.contains("**********"));
     println!("=== VIEW: account ===\n{acc_text}");
+}
+
+#[test]
+fn ssh_account_option_identity_selection_authenticated_state_and_cancel() {
+    let (_dir, mut app) = setup_test_vault();
+    app.update(Action::OpenAccount);
+    app.account_token_input = "token-secret-sentinel".into();
+    app.update(Action::AccountSshSubmit);
+    assert!(app.account_token_input.is_empty());
+    assert!(matches!(
+        app.account_pending_action.take(),
+        Some(AccountPendingAction::DiscoverIdentities)
+    ));
+    app.account_ssh_identities = vec![
+        crate::ssh::AgentIdentity {
+            fingerprint: "SHA256:safe-A".into(),
+            comment: "desktop".into(),
+        },
+        crate::ssh::AgentIdentity {
+            fingerprint: "SHA256:safe-B".into(),
+            comment: "laptop".into(),
+        },
+    ];
+    app.account_focus_field = AccountField::SshButton;
+    let output = render_to_string(&app, 100, 30);
+    assert!(output.contains("SSH Agent"));
+    assert!(output.contains("ssh-ed25519 SHA256:safe-A"));
+    assert!(output.contains("desktop"));
+    assert!(!output.contains("token-secret-sentinel"));
+    app.update(Action::AccountSshNext);
+    assert_eq!(app.account_ssh_selected, 1);
+    assert!(render_to_string(&app, 100, 30).contains("SHA256:safe-B"));
+    app.update(Action::AccountSshSubmit);
+    assert!(
+        matches!(app.account_pending_action.take(), Some(AccountPendingAction::Connect { token, .. }) if token.is_empty())
+    );
+    let session = crate::auth::StoredAuthSession {
+        server_url: "https://notes.example".into(),
+        account_id: Uuid::new_v4(),
+        device_id: Uuid::new_v4(),
+        session_id: Some(Uuid::new_v4()),
+        token: zk_protocol::auth::AuthToken::new("session-secret-sentinel"),
+        expires_at: None,
+    };
+    app.apply_account_session(session);
+    assert!(app.account_state.is_authenticated());
+    assert!(app.account_ssh_identities.is_empty());
+    app.update(Action::OpenAccount);
+    app.account_token_input = "cancel-secret-sentinel".into();
+    app.update(Action::AccountSshDiscover);
+    app.update(Action::CloseAccount);
+    assert!(app.account_pending_action.is_none());
+    assert!(app.account_token_input.is_empty());
+    assert!(app.account_state.is_authenticated());
+    assert!(!format!("{app:?}").contains("session-secret-sentinel"));
 }

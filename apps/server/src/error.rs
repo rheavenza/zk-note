@@ -77,6 +77,10 @@ pub enum DbError {
     InvalidBase64(String),
     /// Invalid UUID string.
     InvalidUuid(String),
+    /// SSH proof or public credential validation failed (details deliberately withheld).
+    SshAuthFailed,
+    SshAccountNotFound,
+    SshCredentialAlreadyExists,
     /// WebAuthn challenge not found or already consumed.
     ChallengeNotFound,
     /// WebAuthn challenge expired.
@@ -117,6 +121,11 @@ impl fmt::Display for DbError {
             Self::Serialization(e) => write!(f, "serialization failure: {e}"),
             Self::InvalidBase64(msg) => write!(f, "invalid base64 encoding: {msg}"),
             Self::InvalidUuid(msg) => write!(f, "invalid UUID format: {msg}"),
+            Self::SshAccountNotFound => write!(f, "Unknown or inactive account"),
+            Self::SshCredentialAlreadyExists => {
+                write!(f, "SSH public credential is already registered")
+            }
+            Self::SshAuthFailed => write!(f, "SSH authentication failed"),
             Self::ChallengeNotFound => write!(f, "webauthn challenge not found or already used"),
             Self::ChallengeExpired => write!(f, "webauthn challenge has expired"),
             Self::CredentialNotFound => write!(f, "webauthn credential not found"),
@@ -144,6 +153,9 @@ impl std::error::Error for DbError {
             | Self::VaultAlreadyExists(_)
             | Self::InvalidBase64(_)
             | Self::InvalidUuid(_)
+            | Self::SshAuthFailed
+            | Self::SshAccountNotFound
+            | Self::SshCredentialAlreadyExists
             | Self::ChallengeNotFound
             | Self::ChallengeExpired
             | Self::CredentialNotFound

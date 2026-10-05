@@ -203,8 +203,29 @@ zk-note detach <note-id> <attachment-id>
 
 `zk-note` synchronizes opaque encrypted note envelopes with a zero-knowledge sync server.
 
-#### Prerequisites: Session Token Provisioning
-In accordance with ADR 0006, device authorization requires an existing valid account session token (e.g. provisioned via web client passkey login or personal access token). The terminal client does not invent unauthenticated token endpoints or display/copy browser session storage.
+#### Agent-first account authentication
+
+The operator registers a public Ed25519 key on the native server (ADR-0007).
+Load the corresponding private key into your local agent; zk-note talks through
+`SSH_AUTH_SOCK` and never reads/exports the private key:
+
+```bash
+ssh-add ~/.ssh/id_ed25519
+zk-note login --server https://notes.example.com
+# Explicitly select one loaded identity (mandatory with multiple keys in scripts):
+zk-note login --server https://notes.example.com --identity SHA256:<fingerprint>
+zk-note ssh-key list
+zk-note ssh-key add ~/.ssh/laptop.pub --label laptop
+zk-note ssh-key revoke <credential-id>
+```
+
+Only plain `ssh-ed25519` is supported. Zero compatible identities gives a safe
+error; one is automatic; multiple identities offer a numbered terminal prompt.
+Noninteractive login requires `--identity` (`--fingerprint` alias) when multiple
+keys exist. Direct private identity-file parsing/decryption is not supported.
+The existing `--token` path below remains compatible with valid bearer sessions.
+SSH login uses the fixed server device label `SSH native client`; `--device-name`
+applies to token-based device authorization.
 
 #### Server URL Validation & Security Rules
 - **HTTPS Required for Remote**: Insecure HTTP is prohibited for remote servers to prevent bearer token interception.
@@ -215,7 +236,7 @@ In accordance with ADR 0006, device authorization requires an existing valid acc
 ```bash
 zk-note login --server http://127.0.0.1:8080 --account-id <uuid> --token <auth-token>
 ```
-Credentials are saved to `~/.local/share/zk-notes/session_auth.json` with strict POSIX `0600` permissions.
+Credentials use the existing `.auth_session` file, atomically replaced with POSIX `0600` permissions. Failed authentication preserves the previous saved session. Full bearer tokens are never printed.
 
 #### Sign-Out & Server Revocation Behavior
 ```bash
@@ -311,7 +332,7 @@ zk-note --data-dir /path/to/data tui
 | | `/` | Incremental in-memory search across notes |
 | | `s` | Trigger manual guarded sync |
 | | `c` | Open Conflicts overlay view |
-| **Server / Account (`a`)** | `Tab` / `Down` | Cycle fields (Server URL -> Token -> Connect -> Sign Out) |
+| **Server / Account (`a`)** | `Tab` / `Down` | Cycle fields (Server URL -> Token -> Token Connect -> SSH Agent -> Sign Out) |
 | | `Shift+Tab` / `Up` | Cycle fields backward |
 | | `Enter` | Submit / execute focused action |
 | | `Ctrl+X` | Trigger Sign Out & remote session revocation |
@@ -364,3 +385,23 @@ zk-note --data-dir /path/to/data tui
    - Failed or offline authorization attempts never overwrite or invalidate existing valid local sessions.
    - Sign-out attempts server revocation before deleting local credentials; if offline, credentials are preserved with an actionable warning to allow retry.
    - Signing in never automatically uploads, links, replaces, or replaces a local vault.
+
+
+### SSH authentication in the Account modal
+
+Open Account with `a`, enter the intended server URL, tab to **SSH Agent** and
+press Enter to discover keys. The modal displays `ssh-ed25519`, SHA256 fingerprint
+and sanitized agent comment. Left/Right cycles deterministically sorted keys;
+Enter authenticates with the selected key; `r` reloads identities. An empty token
+with the Connect button also discovers SSH identities. Token input and its
+existing authorization path remain available. Escape scrubs token input and
+clears pending modal work without changing a valid session. Successful SSH login
+uses the existing authenticated state, account badge, startup verification,
+status, logout and device/session controls.
+
+SSH sessions expire after one hour; reauthenticate with the agent. A credential
+binds to its first local device UUID; keep the data directory/device identity.
+Use one key per machine. Key revocation blocks new SSH login and revokes its
+pinned device and active sessions plus derived key sessions. Other machine keys
+remain usable. Login creates only an account session; it never initializes,
+links, restores, uploads or unlocks a vault. ZK-110 owns vault linking/restoration.

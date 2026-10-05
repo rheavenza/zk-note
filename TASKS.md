@@ -105,7 +105,7 @@ web notes application. Each machine owns its own encrypted local database; never
 share `notes.db` through NFS/Syncthing/cloud-drive synchronization.
 
 ## ZK-109 — SSH-key authentication for native CLI/TUI
-Status: READY
+Status: DONE (PR open / review pending)
 Priority: P1
 Dependencies: ZK-072, ADR-0006
 Ticket: [docs/tickets/ZK-109.md](docs/tickets/ZK-109.md)
@@ -115,6 +115,25 @@ provisioning, listing and revocation work without introducing SSH as the sync
 transport.
 Verification: native auth integration, replay/expiry/wrong-origin tests, session
 and device revocation regression, secret-redaction audit.
+
+Implementation notes:
+- Base: `c4f4f52f5fa58473a3b547bd5a2a884eabcc9dc5`; branch
+  `work/ZK-109-ssh-auth`. Agent-first native Ed25519 auth issues existing sessions
+  without a browser token; existing token authorization remains supported.
+- Shared binary canonical proof, configured origin, 32-byte OsRng challenges,
+  120-second TTL and committed atomic consumption; verifier lives in the
+  optional server-auth SSH module. Migration 010 adds credentials/challenges and
+  session provenance. Operator provisioning and account-scoped key APIs/CLI work.
+- TUI Account modal discovers/selects safe agent identities and reuses the existing
+  authenticated state. Key revoke also revokes its pinned device, device sessions
+  and derived key sessions. No vault operations or sync architecture changes.
+- Passed fmt, warnings-as-errors workspace clippy, locked workspace check,
+  all-target/all-feature workspace tests (514), targeted protocol/server-auth/
+  native-server/CLI suites, isolated agent suite, and the shared native auth
+  contract (84 checks plus CAS/replay concurrency). GitHub CI required before
+  handoff; independent review pending, no merge authorization.
+- Exact acceptance evidence and limitations: [ZK-109 ticket](docs/tickets/ZK-109.md)
+  and [ADR-0007](docs/adr/0007-native-ssh-authentication.md).
 
 ## ZK-110 — Native vault link, restore, account isolation, and replace-local-from-origin
 Status: READY

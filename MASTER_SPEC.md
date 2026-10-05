@@ -135,9 +135,19 @@ These systems are independent.
 Recommended server authentication:
 
 - Passkey/WebAuthn for web;
-- device/browser-assisted login or token provisioning for CLI;
+- agent-first SSH Ed25519 challenge authentication for native CLI/TUI (ADR-0007);
+- existing bearer-token device authorization remains a native compatibility path;
 - revocable short-lived access sessions;
 - refresh/session material stored using platform-appropriate secure storage.
+
+Native SSH is account authentication only, over HTTPS. An operator provisions
+public keys; ssh-agent signs a domain-separated, audience-bound, single-use
+challenge. The native server verifies its stored public credential and issues the
+existing bearer session. No SSH daemon, private-key upload, SSH sync transport,
+vault initialization/link/restore/unlock, or SSH-derived VaultKey is involved.
+Keys bind to their first device; revocation invalidates that device and its active
+sessions plus sessions derived from the SSH credential. Workers SSH support is
+outside ZK-109.
 
 The vault passphrase is NOT the server account password.
 

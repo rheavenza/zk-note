@@ -7,6 +7,7 @@ mod config;
 mod edit;
 mod error;
 mod session;
+mod ssh;
 pub mod tui;
 
 use clap::{Parser, Subcommand};
@@ -133,9 +134,18 @@ pub enum Commands {
         #[arg(long)]
         device_id: Option<String>,
 
+        /// Select a loaded ssh-agent Ed25519 key by SHA256 fingerprint
+        #[arg(long, alias = "fingerprint", conflicts_with = "token")]
+        identity: Option<String>,
+
         /// Pre-provisioned personal access token or session token
         #[arg(short = 't', long)]
         token: Option<String>,
+    },
+    /// Manage this account's public SSH machine credentials
+    SshKey {
+        #[command(subcommand)]
+        command: ssh::KeyCommand,
     },
     /// Log out from the sync server and revoke active session (ZK-072)
     Logout,
@@ -393,7 +403,33 @@ async fn run() -> Result<(), CliError> {
             device_name,
             device_id,
             token,
-        } => cmd_login(data_dir, server, account_id, device_name, device_id, token).await,
+            identity,
+        } => {
+            if token.is_some() {
+                cmd_login(data_dir, server, account_id, device_name, device_id, token).await
+            } else {
+                let server = server
+                    .or_else(|| std::env::var("ZK_SERVER_URL").ok())
+                    .unwrap_or_else(|| "http://127.0.0.1:8080".into());
+                let account = account_id
+                    .map(|a| uuid::Uuid::parse_str(&a))
+                    .transpose()
+                    .map_err(|_| CliError::AuthError("Invalid account ID".into()))?;
+                let device = device_id
+                    .map(|d| uuid::Uuid::parse_str(&d))
+                    .transpose()
+                    .map_err(|_| CliError::AuthError("Invalid device ID".into()))?;
+                crate::client::auth::validate_and_normalize_server_url(&server)?;
+                let identity = ssh::interactive_selector(identity).await?;
+                let session = ssh::login(data_dir, &server, account, device, identity).await?;
+                println!(
+                    "Authenticated account {} on device {}",
+                    session.account_id, session.device_id
+                );
+                Ok(())
+            }
+        }
+        Commands::SshKey { command } => ssh::manage_keys(data_dir, command).await,
         Commands::Logout => cmd_logout(data_dir).await,
         Commands::Whoami { json } => cmd_whoami(data_dir, json).await,
         Commands::Device { subcommand } => match subcommand {

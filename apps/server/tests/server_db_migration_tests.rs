@@ -21,7 +21,7 @@ fn test_migrations_reproducible_clean_state_and_idempotent() {
 
     // Clean run applies migrations 2, 3, 4, 7, 8, and 9
     let applied = run_server_migrations(&mut conn).expect("run migrations");
-    assert_eq!(applied, vec![2, 3, 4, 7, 8, 9]);
+    assert_eq!(applied, vec![2, 3, 4, 7, 8, 9, 10]);
 
     // Verify all 12 tables and 9 indexes exist
     verify_database_schema(&conn).expect("schema verification");

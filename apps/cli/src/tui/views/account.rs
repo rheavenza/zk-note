@@ -51,6 +51,7 @@ pub fn render_account_modal(f: &mut Frame<'_>, app: &App, area: Rect) {
             Constraint::Length(3), // Server URL input box
             Constraint::Length(1), // Token label
             Constraint::Length(3), // Token input box
+            Constraint::Length(2), // SSH identity metadata
             Constraint::Length(1), // Buttons row (Connect / Sign Out)
             Constraint::Length(4), // Current account status & device details
             Constraint::Length(3), // Security disclaimer
@@ -100,7 +101,7 @@ pub fn render_account_modal(f: &mut Frame<'_>, app: &App, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            " (existing account session token from web or CLI):",
+            " (optional: leave empty to use SSH agent):",
             Style::default().fg(Color::DarkGray),
         ),
     ]));
@@ -132,6 +133,23 @@ pub fn render_account_modal(f: &mut Frame<'_>, app: &App, area: Rect) {
     );
     f.render_widget(token_para, chunks[3]);
 
+    let identity = app.account_ssh_identities.get(app.account_ssh_selected);
+    let metadata = if let Some(key) = identity {
+        format!(
+            "ssh-ed25519 {}\n{} ({}/{})",
+            key.fingerprint,
+            key.comment,
+            app.account_ssh_selected + 1,
+            app.account_ssh_identities.len()
+        )
+    } else {
+        "SSH agent: press SSH Agent to discover identities".into()
+    };
+    f.render_widget(
+        Paragraph::new(metadata).style(Style::default().fg(Color::Cyan)),
+        chunks[4],
+    );
+
     // 5. Buttons Row
     let connect_style = if app.account_focus_field == AccountField::ConnectButton {
         Style::default()
@@ -151,11 +169,19 @@ pub fn render_account_modal(f: &mut Frame<'_>, app: &App, area: Rect) {
     };
 
     let buttons_line = Line::from(vec![
+        Span::styled(
+            "[ SSH Agent ] ",
+            if app.account_focus_field == AccountField::SshButton {
+                Style::default().fg(Color::Black).bg(Color::Cyan)
+            } else {
+                Style::default().fg(Color::Cyan)
+            },
+        ),
         Span::styled("[ Connect & Authorize Device ]", connect_style),
-        Span::raw("    "),
+        Span::raw(" "),
         Span::styled("[ Sign Out & Revoke Session ]", sign_out_style),
     ]);
-    f.render_widget(Paragraph::new(buttons_line), chunks[4]);
+    f.render_widget(Paragraph::new(buttons_line), chunks[5]);
 
     // 6. Current Account Status & Device Details
     let (status_badge, status_color) = match &app.account_state {
@@ -206,7 +232,7 @@ pub fn render_account_modal(f: &mut Frame<'_>, app: &App, area: Rect) {
     let details_block = Block::default()
         .borders(Borders::TOP)
         .title(" Active Connection Status ");
-    f.render_widget(Paragraph::new(status_lines).block(details_block), chunks[5]);
+    f.render_widget(Paragraph::new(status_lines).block(details_block), chunks[6]);
 
     // 7. Security Disclaimer (AC-01, AC-06)
     let notice_lines = vec![
@@ -219,7 +245,7 @@ pub fn render_account_modal(f: &mut Frame<'_>, app: &App, area: Rect) {
             Style::default().fg(Color::DarkGray),
         )),
     ];
-    f.render_widget(Paragraph::new(notice_lines), chunks[6]);
+    f.render_widget(Paragraph::new(notice_lines), chunks[7]);
 
     // 8. Footer Key Hints
     let footer = Paragraph::new(Line::from(vec![
@@ -231,5 +257,5 @@ pub fn render_account_modal(f: &mut Frame<'_>, app: &App, area: Rect) {
         Span::styled("[Ctrl+X] Sign Out  ", Style::default().fg(Color::LightRed)),
         Span::styled("[Esc] Close", Style::default().fg(Color::DarkGray)),
     ]));
-    f.render_widget(footer, chunks[7]);
+    f.render_widget(footer, chunks[8]);
 }

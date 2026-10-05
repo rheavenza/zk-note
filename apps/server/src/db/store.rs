@@ -813,24 +813,42 @@ impl ServerDb {
     ) -> Result<(AuthenticatedSession, AuthToken), DbError> {
         self.ensure_account(account_id).await?;
 
-        // If device_id is provided, ensure device is registered and not revoked
+        let mut conn = self.conn.lock().await;
+        let tx = conn.transaction()?;
+        let session =
+            Self::create_session_on(&tx, account_id, device_id, display_name, expires_in_secs)?;
+        tx.commit()?;
+        Ok(session)
+    }
+
+    /// Shared native session/device issuance inside the caller's transaction.
+    pub(super) fn create_session_on(
+        conn: &rusqlite::Connection,
+        account_id: Uuid,
+        device_id: Option<Uuid>,
+        display_name: Option<String>,
+        expires_in_secs: Option<i64>,
+    ) -> Result<(AuthenticatedSession, AuthToken), DbError> {
         if let Some(dev_id) = device_id {
-            self.register_device(account_id, dev_id, display_name.as_deref())
-                .await?;
-            if self.is_device_revoked(account_id, dev_id).await? {
+            Self::register_device_on(conn, account_id, dev_id, display_name.as_deref())?;
+            let revoked: bool = conn.query_row(
+                "SELECT revoked_at IS NOT NULL FROM devices WHERE account_id = ?1 AND device_id = ?2",
+                rusqlite::params![account_id.to_string(), dev_id.to_string()], |r| r.get(0))?;
+            if revoked {
                 return Err(DbError::SchemaVerificationFailed(
-                    "cannot create session for a revoked device".to_string(),
+                    "cannot create session for a revoked device".into(),
                 ));
             }
         }
-
         let session_id = Uuid::new_v4();
-        let tok1 = Uuid::new_v4().simple();
-        let tok2 = Uuid::new_v4().simple();
-        let raw_token = format!("zk_sess_{tok1}{tok2}");
+        use base64ct::{Base64UrlUnpadded, Encoding};
+        use rand_core::RngCore;
+        let mut entropy = [0u8; 32];
+        rand_core::OsRng
+            .try_fill_bytes(&mut entropy)
+            .map_err(|_| DbError::SshAuthFailed)?;
+        let raw_token = format!("zk_sess_{}", Base64UrlUnpadded::encode_string(&entropy));
         let token_hash: [u8; 32] = Blake2s256::digest(raw_token.as_bytes()).into();
-
-        let conn = self.conn.lock().await;
 
         let acc_str = account_id.to_string();
         let sess_str = session_id.to_string();
@@ -865,7 +883,7 @@ impl ServerDb {
         )?;
 
         let (created_at, expires_at): (String, Option<String>) = conn.query_row(
-            "SELECT created_at, expires_at FROM sessions WHERE session_id = ?1",
+            "SELECT created_at, strftime('%Y-%m-%dT%H:%M:%SZ', expires_at) FROM sessions WHERE session_id = ?1",
             [&sess_str],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
@@ -1003,6 +1021,15 @@ impl ServerDb {
         self.ensure_account(account_id).await?;
         let conn = self.conn.lock().await;
 
+        Self::register_device_on(&conn, account_id, device_id, display_name)
+    }
+
+    pub(super) fn register_device_on(
+        conn: &rusqlite::Connection,
+        account_id: Uuid,
+        device_id: Uuid,
+        display_name: Option<&str>,
+    ) -> Result<DeviceRow, DbError> {
         let acc_str = account_id.to_string();
         let dev_str = device_id.to_string();
 

@@ -151,37 +151,53 @@ pub async fn run_tui(data_dir: Option<&Path>) -> Result<(), CliError> {
         // Handle async account authentication operations (ZK-101 Addendum)
         if let Some(action) = app.account_pending_action.take() {
             match action {
+                app::AccountPendingAction::DiscoverIdentities => {
+                    match crate::ssh::discover_identities().await {
+                        Ok(keys) => {
+                            app.account_ssh_identities = keys;
+                            app.account_ssh_selected = 0;
+                            app.account_focus_field = app::AccountField::SshButton;
+                            app.status_message = Some(
+                                "Choose SSH identity: Left/Right; Enter signs in; r reloads agent."
+                                    .into(),
+                            );
+                            app.error_message = None;
+                        }
+                        Err(error) => app.error_message = Some(error.to_string()),
+                    }
+                }
                 app::AccountPendingAction::Connect {
                     server_url,
                     mut token,
                 } => {
-                    let auth_res = crate::client::auth::authorize_terminal_device(
-                        app.data_dir.as_deref(),
-                        &server_url,
-                        &token,
-                        None,
-                        Some("zk-note-tui".to_string()),
-                        None,
-                    )
-                    .await;
+                    let auth_res = if token.is_empty() {
+                        crate::ssh::login(
+                            app.data_dir.as_deref(),
+                            &server_url,
+                            None,
+                            None,
+                            app.account_ssh_identities
+                                .get(app.account_ssh_selected)
+                                .map(|key| key.fingerprint.clone()),
+                        )
+                        .await
+                    } else {
+                        crate::client::auth::authorize_terminal_device(
+                            app.data_dir.as_deref(),
+                            &server_url,
+                            &token,
+                            None,
+                            Some("zk-note-tui".to_string()),
+                            None,
+                        )
+                        .await
+                    };
                     token.zeroize();
                     drop(token);
                     app.invalidate_auth_ops();
                     match auth_res {
                         Ok(session) => {
-                            app.account_state =
-                                crate::client::auth::ClientAuthState::Authenticated {
-                                    server_url: session.server_url.clone(),
-                                    account_id: session.account_id,
-                                    device_id: session.device_id,
-                                    session_id: session.session_id,
-                                    expires_at: session.expires_at,
-                                };
-                            app.account_server_input = session.server_url;
-                            app.status_message =
-                                Some("Terminal device authorized successfully.".to_string());
-                            app.error_message = None;
-                            app.mode = app.previous_mode.take().unwrap_or(app::AppMode::Normal);
+                            app.apply_account_session(session);
                         }
                         Err(e) => {
                             app.error_message = Some(format!("Authentication failed: {e}"));
