@@ -18,6 +18,10 @@ use zk_sync::orchestrator::{SyncCycleOptions, SyncEngine};
 pub enum SyncStatus {
     /// Device is not logged in to a sync server.
     Offline,
+    /// Vault binding failure; pull and push disabled.
+    Blocked(super::vault_link::LinkError),
+    /// Explicit staged restore is in progress.
+    Restoring,
     /// Device is authenticated and idle, ready to sync.
     Idle,
     /// Synchronization cycle is currently in flight.
@@ -39,8 +43,10 @@ pub enum SyncStatus {
 impl fmt::Display for SyncStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            SyncStatus::Blocked(e) => write!(f, "{e}"),
+            SyncStatus::Restoring => write!(f, "Restoring (pull only)"),
             SyncStatus::Offline => write!(f, "Offline (not logged in)"),
-            SyncStatus::Idle => write!(f, "Idle"),
+            SyncStatus::Idle => write!(f, "Linked (Idle)"),
             SyncStatus::Syncing => write!(f, "Syncing..."),
             SyncStatus::Synced { accepted } => write!(f, "Synced ({accepted} pushed)"),
             SyncStatus::Conflict { conflict_count } => {
@@ -61,6 +67,19 @@ pub fn get_initial_sync_status(custom_data_dir: Option<&Path>) -> SyncStatus {
         return SyncStatus::Offline;
     }
 
+    if let Err(e) = super::vault_files::recover(&data_dir) {
+        return SyncStatus::Error(e.to_string());
+    }
+    match load_auth_session(&auth_path)
+        .and_then(|auth| super::vault_link::validate_local_link(&data_dir, &auth))
+    {
+        Ok(_) => {}
+        Err(CliError::VaultLink(e)) => return SyncStatus::Blocked(e),
+        Err(e) => return SyncStatus::Error(e.to_string()),
+    }
+    if !db_path.exists() {
+        return SyncStatus::Idle;
+    }
     if let Ok(storage) = SqliteStorage::open(&db_path) {
         if let Ok(conflicts) = storage.list_conflicts(Some(false)) {
             if !conflicts.is_empty() {
@@ -82,6 +101,7 @@ pub async fn perform_sync(
     vault_key: Option<&VaultKey>,
 ) -> Result<SyncStatus, CliError> {
     let data_dir = resolve_data_dir(custom_data_dir);
+    super::vault_files::recover(&data_dir)?;
     let vault_path = vault_file(&data_dir);
     let auth_path = auth_session_file(&data_dir);
     let db_path = db_file(&data_dir);
@@ -95,11 +115,15 @@ pub async fn perform_sync(
     }
 
     let auth_session = load_auth_session(&auth_path)?;
+    let link = super::vault_link::validate_local_link(&data_dir, &auth_session)?;
+    // Preserve normal sync's existing transport/timeout behavior (ZK-111 owns
+    // execution changes). Only the identity gate is introduced here.
     let adapter = NativeHttpSyncAdapter::new(
-        &auth_session.server_url,
+        &link.server_origin,
         Some(auth_session.token.expose_secret().to_string()),
     )
-    .map_err(|e| CliError::Network(format!("failed to initialize sync adapter: {e}")))?;
+    .map_err(|_| CliError::Network("cannot initialize sync transport".into()))?;
+    super::vault_link::validate_remote_link(&link, &adapter).await?;
 
     let storage = Arc::new(SqliteStorage::open(&db_path)?);
     let engine = SyncEngine::new(adapter, Arc::clone(&storage));
@@ -116,8 +140,12 @@ pub async fn perform_sync(
 
     let report = match report_result {
         Ok(r) => r,
-        Err(e) => {
-            return Ok(SyncStatus::Error(e.to_string()));
+        Err(_) => {
+            // Remote error bodies and decrypted validation details are untrusted;
+            // never reflect them into status Debug/logging/UI.
+            return Ok(SyncStatus::Error(
+                "guarded sync failed; check connection/session and retry".into(),
+            ));
         }
     };
 

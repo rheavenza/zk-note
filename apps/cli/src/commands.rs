@@ -39,6 +39,7 @@ pub fn cmd_init(
     test_kdf: bool,
 ) -> Result<(), CliError> {
     let data_dir = resolve_data_dir(custom_data_dir);
+    crate::client::vault_files::recover(&data_dir)?;
     let vault_path = vault_file(&data_dir);
     let db_path = db_file(&data_dir);
 
@@ -124,6 +125,7 @@ pub fn cmd_unlock(
     idle_timeout_mins: Option<u64>,
 ) -> Result<(), CliError> {
     let data_dir = resolve_data_dir(custom_data_dir);
+    crate::client::vault_files::recover(&data_dir)?;
     let vault_path = vault_file(&data_dir);
     let sess_path = session_file(&data_dir);
 
@@ -220,6 +222,7 @@ pub fn cmd_passwd(
     test_kdf: bool,
 ) -> Result<(), CliError> {
     let data_dir = resolve_data_dir(custom_data_dir);
+    crate::client::vault_files::recover(&data_dir)?;
     let vault_path = vault_file(&data_dir);
     let sess_path = session_file(&data_dir);
 
@@ -320,6 +323,7 @@ pub fn cmd_recover(
     test_kdf: bool,
 ) -> Result<(), CliError> {
     let data_dir = resolve_data_dir(custom_data_dir);
+    crate::client::vault_files::recover(&data_dir)?;
     let vault_path = vault_file(&data_dir);
     let sess_path = session_file(&data_dir);
 
@@ -457,6 +461,7 @@ pub fn cmd_lock(custom_data_dir: Option<&Path>) -> Result<(), CliError> {
 /// Displays the current vault status (UNINITIALIZED, LOCKED, or UNLOCKED).
 pub fn cmd_status(custom_data_dir: Option<&Path>) -> Result<(), CliError> {
     let data_dir = resolve_data_dir(custom_data_dir);
+    crate::client::vault_files::recover(&data_dir)?;
     match crate::client::vault::get_vault_status(custom_data_dir)? {
         crate::client::vault::VaultState::Uninitialized => {
             println!("Vault status: UNINITIALIZED");
@@ -516,6 +521,7 @@ pub fn cmd_new(
     tags: Vec<String>,
 ) -> Result<String, CliError> {
     let data_dir = resolve_data_dir(custom_data_dir);
+    crate::client::vault_files::recover(&data_dir)?;
     let vault_path = vault_file(&data_dir);
     let sess_path = session_file(&data_dir);
 
@@ -593,6 +599,7 @@ pub fn cmd_show(
     json_output: bool,
 ) -> Result<PlaintextNote, CliError> {
     let data_dir = resolve_data_dir(custom_data_dir);
+    crate::client::vault_files::recover(&data_dir)?;
     let sess_path = session_file(&data_dir);
 
     // Must be unlocked to decrypt note
@@ -636,6 +643,7 @@ pub fn cmd_search(
     json_output: bool,
 ) -> Result<Vec<SearchResult>, CliError> {
     let data_dir = resolve_data_dir(custom_data_dir);
+    crate::client::vault_files::recover(&data_dir)?;
     let sess_path = session_file(&data_dir);
 
     // Must be unlocked to decrypt note contents into volatile memory index
@@ -693,6 +701,7 @@ pub fn cmd_edit(
     tag_override: Option<Vec<String>>,
 ) -> Result<PlaintextNote, CliError> {
     let data_dir = resolve_data_dir(custom_data_dir);
+    crate::client::vault_files::recover(&data_dir)?;
     let vault_path = vault_file(&data_dir);
     let sess_path = session_file(&data_dir);
 
@@ -801,6 +810,7 @@ pub fn cmd_delete(
     purge: bool,
 ) -> Result<u64, CliError> {
     let data_dir = resolve_data_dir(custom_data_dir);
+    crate::client::vault_files::recover(&data_dir)?;
     let sess_path = session_file(&data_dir);
 
     // Must be unlocked to delete note
@@ -833,6 +843,7 @@ pub fn cmd_list(
     json_output: bool,
 ) -> Result<Vec<NoteSummary>, CliError> {
     let data_dir = resolve_data_dir(custom_data_dir);
+    crate::client::vault_files::recover(&data_dir)?;
     let sess_path = session_file(&data_dir);
 
     // Must be unlocked to decrypt note titles/tags
@@ -890,6 +901,7 @@ pub fn cmd_history(
     json_output: bool,
 ) -> Result<Vec<NoteHistoryItem>, CliError> {
     let data_dir = resolve_data_dir(custom_data_dir);
+    crate::client::vault_files::recover(&data_dir)?;
     let vault_path = vault_file(&data_dir);
     let db_path = db_file(&data_dir);
     let sess_path = session_file(&data_dir);
@@ -1005,6 +1017,7 @@ pub fn cmd_conflicts(
     json_output: bool,
 ) -> Result<Vec<ConflictListItem>, CliError> {
     let data_dir = resolve_data_dir(custom_data_dir);
+    crate::client::vault_files::recover(&data_dir)?;
     let sess_path = session_file(&data_dir);
     let vault_key_opt = load_session_key(&sess_path).ok();
 
@@ -1072,6 +1085,7 @@ pub fn cmd_resolve(
     tag_override: Option<Vec<String>>,
 ) -> Result<ConflictResolutionResult, CliError> {
     let data_dir = resolve_data_dir(custom_data_dir);
+    crate::client::vault_files::recover(&data_dir)?;
     let vault_path = vault_file(&data_dir);
     let db_path = db_file(&data_dir);
     let sess_path = session_file(&data_dir);
@@ -1631,6 +1645,7 @@ pub async fn cmd_login(
 /// Revokes the current session on the server and clears local credentials (ZK-072).
 pub async fn cmd_logout(custom_data_dir: Option<&Path>) -> Result<(), CliError> {
     let data_dir = resolve_data_dir(custom_data_dir);
+    crate::client::vault_files::recover(&data_dir)?;
     let auth_path = auth_session_file(&data_dir);
 
     if !has_auth_session(&auth_path) {
@@ -1650,6 +1665,7 @@ pub async fn cmd_logout(custom_data_dir: Option<&Path>) -> Result<(), CliError> 
 /// Displays active account and session identity without leaking token (ZK-072).
 pub async fn cmd_whoami(custom_data_dir: Option<&Path>, json_output: bool) -> Result<(), CliError> {
     let data_dir = resolve_data_dir(custom_data_dir);
+    crate::client::vault_files::recover(&data_dir)?;
     let auth_path = auth_session_file(&data_dir);
 
     if !has_auth_session(&auth_path) {
@@ -1865,6 +1881,7 @@ pub async fn cmd_device_list(
     json_output: bool,
 ) -> Result<(), CliError> {
     let data_dir = resolve_data_dir(custom_data_dir);
+    crate::client::vault_files::recover(&data_dir)?;
     let auth_path = auth_session_file(&data_dir);
 
     if !has_auth_session(&auth_path) {
@@ -1913,6 +1930,7 @@ pub async fn cmd_device_revoke(
     json_output: bool,
 ) -> Result<(), CliError> {
     let data_dir = resolve_data_dir(custom_data_dir);
+    crate::client::vault_files::recover(&data_dir)?;
     let auth_path = auth_session_file(&data_dir);
 
     if !has_auth_session(&auth_path) {
@@ -1954,6 +1972,7 @@ pub fn cmd_autolock(
     json_output: bool,
 ) -> Result<(), CliError> {
     let data_dir = resolve_data_dir(custom_data_dir);
+    crate::client::vault_files::recover(&data_dir)?;
     let sess_path = session_file(&data_dir);
 
     if !sess_path.exists() {
@@ -2017,6 +2036,7 @@ pub fn cmd_attach(
     custom_mime: Option<String>,
 ) -> Result<String, CliError> {
     let data_dir = resolve_data_dir(custom_data_dir);
+    crate::client::vault_files::recover(&data_dir)?;
     let vault_path = vault_file(&data_dir);
     let db_path = db_file(&data_dir);
     let sess_path = session_file(&data_dir);
@@ -2132,6 +2152,7 @@ pub fn cmd_detach(
     attachment_id: &str,
 ) -> Result<(), CliError> {
     let data_dir = resolve_data_dir(custom_data_dir);
+    crate::client::vault_files::recover(&data_dir)?;
     let vault_path = vault_file(&data_dir);
     let db_path = db_file(&data_dir);
     let sess_path = session_file(&data_dir);
@@ -2223,6 +2244,7 @@ pub fn cmd_attachments(
     json_output: bool,
 ) -> Result<Vec<zk_protocol::attachment::AttachmentManifest>, CliError> {
     let data_dir = resolve_data_dir(custom_data_dir);
+    crate::client::vault_files::recover(&data_dir)?;
     let vault_path = vault_file(&data_dir);
     let db_path = db_file(&data_dir);
     let sess_path = session_file(&data_dir);
@@ -2270,4 +2292,120 @@ pub fn cmd_attachments(
     }
 
     Ok(manifests)
+}
+
+/// Explicit vault operations. Secret prompts remain local and zeroizing.
+pub async fn cmd_vault(
+    data_dir: Option<&Path>,
+    command: crate::VaultCommands,
+) -> Result<(), CliError> {
+    use crate::client::{vault_files, vault_link};
+    use std::io::IsTerminal;
+    use zeroize::Zeroizing;
+    let dir = resolve_data_dir(data_dir);
+    vault_files::recover(&dir)?;
+    let (replace, confirmed, passphrase, recovery) = match command {
+        crate::VaultCommands::Status => {
+            let status = vault_link::inspect_vault_link(&dir).await?;
+            println!("Vault: {}", status.status);
+            println!(
+                "Local: {}",
+                status.local_fingerprint.as_deref().unwrap_or("absent")
+            );
+            if let Some(link) = status.link {
+                println!(
+                    "Linked account: {}\nServer: {}",
+                    link.account_id, link.server_origin
+                );
+            }
+            println!(
+                "Remote: {}",
+                status.remote_fingerprint.as_deref().unwrap_or("absent")
+            );
+            return Ok(());
+        }
+        crate::VaultCommands::Link => {
+            let link = vault_link::link_local_vault_to_server(&dir).await?;
+            println!(
+                "Vault explicitly linked to {} / {}",
+                link.server_origin, link.account_id
+            );
+            return Ok(());
+        }
+        crate::VaultCommands::Restore {
+            passphrase,
+            recovery_key,
+        } => (false, false, passphrase, recovery_key),
+        crate::VaultCommands::ReplaceFromServer {
+            discard_local,
+            passphrase,
+            recovery_key,
+        } => (true, discard_local, passphrase, recovery_key),
+    };
+    let passphrase = passphrase.map(Zeroizing::new);
+    let recovery = recovery.map(Zeroizing::new);
+    // Refuse noninteractive replacement before preflight opens even the local DB.
+    if replace && !confirmed && !std::io::stdin().is_terminal() {
+        return Err(vault_link::LinkError::ConfirmationRequired.into());
+    }
+    if !replace
+        && (vault_file(&dir).exists()
+            || db_file(&dir).exists()
+            || dir.join("vault-link.json").exists())
+    {
+        return Err(CliError::VaultAlreadyInitialized);
+    }
+    let preflight = vault_link::replacement_preflight(&dir).await?;
+    let mut discard = confirmed;
+    if replace {
+        println!("Replace LOCAL vault from server; nothing local will be uploaded.");
+        if let Some(link) = &preflight.current_link {
+            println!(
+                "Current: {} / {} / {}",
+                link.server_origin, link.account_id, link.vault_fingerprint
+            );
+        }
+        println!(
+            "Target: {} / {} / {}",
+            preflight.target_link.server_origin,
+            preflight.target_link.account_id,
+            preflight.target_link.vault_fingerprint
+        );
+        let c = &preflight.counts;
+        println!(
+            "Discard: pending {}, in-flight {}, failed {}, conflicts {}, unconfirmed objects {}",
+            c.pending, c.in_flight, c.failed, c.conflicts, c.unconfirmed_objects
+        );
+        if !discard {
+            println!("Type REPLACE LOCAL VAULT to discard this machine's local changes:");
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input)?;
+            if input.trim_end() != "REPLACE LOCAL VAULT" {
+                return Err(vault_link::LinkError::ConfirmationRequired.into());
+            }
+            discard = true;
+        }
+    }
+    let prompt;
+    let secret = if let Some(recovery) = &recovery {
+        if recovery.is_empty() {
+            prompt = Zeroizing::new(rpassword::prompt_password(
+                "Remote vault recovery key (local unlock): ",
+            )?);
+            vault_link::UnlockSecret::RecoveryKey(&prompt)
+        } else {
+            vault_link::UnlockSecret::RecoveryKey(recovery)
+        }
+    } else if let Some(passphrase) = &passphrase {
+        vault_link::UnlockSecret::Passphrase(passphrase.as_bytes())
+    } else {
+        prompt = Zeroizing::new(rpassword::prompt_password(
+            "Remote vault passphrase (local unlock): ",
+        )?);
+        vault_link::UnlockSecret::Passphrase(prompt.as_bytes())
+    };
+    let stage = vault_link::stage_remote_vault(&dir, &preflight, secret, replace, discard).await?;
+    vault_files::install(&dir, stage)?;
+    println!("Remote vault restored locally and linked. Vault is locked; run zk-note unlock.");
+    Ok(())
 }

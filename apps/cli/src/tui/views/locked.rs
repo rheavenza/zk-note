@@ -84,7 +84,10 @@ pub fn render_locked_screen(f: &mut Frame<'_>, app: &App, area: Rect) {
     }
 
     let footer = Paragraph::new(Line::from(vec![
-        Span::styled("[Enter] Unlock  ", Style::default().fg(Color::Yellow)),
+        Span::styled(
+            "[Ctrl+V] Vault  [Ctrl+A] Account  [Enter] Unlock  ",
+            Style::default().fg(Color::Yellow),
+        ),
         Span::styled("[q/Esc] Quit", Style::default().fg(Color::DarkGray)),
     ]));
     f.render_widget(footer, chunks[3]);

@@ -40,6 +40,11 @@ pub struct Cli {
 /// Available CLI subcommands.
 #[derive(Subcommand, Debug)]
 pub enum Commands {
+    /// Explicit native vault link, restore and local replacement
+    Vault {
+        #[command(subcommand)]
+        command: VaultCommands,
+    },
     /// Initialize a new encrypted vault
     Init {
         /// Optional passphrase (for automated scripts or tests)
@@ -362,11 +367,74 @@ pub enum DeviceCommands {
     },
 }
 
+/// Vault secrets are never included in command Debug output.
+#[derive(Subcommand)]
+pub enum VaultCommands {
+    /// Inspect local/remote association without changing it
+    Status,
+    /// Explicitly upload/adopt this local encrypted vault for the current account
+    Link,
+    /// Restore into a machine with no local vault/cache
+    Restore {
+        #[arg(long, conflicts_with = "recovery_key")]
+        passphrase: Option<String>,
+        /// Omit the value to enter the recovery key at a masked local prompt
+        #[arg(long, num_args = 0..=1, default_missing_value = "")]
+        recovery_key: Option<String>,
+    },
+    /// Discard LOCAL vault/cache/unsynced changes; never change the server vault
+    ReplaceFromServer {
+        #[arg(long)]
+        discard_local: bool,
+        #[arg(long, conflicts_with = "recovery_key")]
+        passphrase: Option<String>,
+        /// Omit the value to enter the recovery key at a masked local prompt
+        #[arg(long, num_args = 0..=1, default_missing_value = "")]
+        recovery_key: Option<String>,
+    },
+}
+impl std::fmt::Debug for VaultCommands {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Status => "VaultStatus",
+            Self::Link => "VaultLink",
+            Self::Restore { .. } => "VaultRestore([REDACTED])",
+            Self::ReplaceFromServer { .. } => "VaultReplaceFromServer([REDACTED])",
+        })
+    }
+}
+
 async fn run() -> Result<(), CliError> {
     let cli = Cli::parse();
     let data_dir = cli.data_dir.as_deref();
 
+    use std::io::IsTerminal;
+    if matches!(
+        &cli.command,
+        Commands::Vault {
+            command: VaultCommands::ReplaceFromServer {
+                discard_local: false,
+                ..
+            }
+        }
+    ) && !std::io::stdin().is_terminal()
+    {
+        return Err(client::vault_link::LinkError::ConfirmationRequired.into());
+    }
+    let resolved = config::resolve_data_dir(data_dir);
+    if matches!(
+        &cli.command,
+        Commands::Vault {
+            command: VaultCommands::ReplaceFromServer { .. }
+        }
+    ) && !resolved.exists()
+    {
+        return Err(CliError::NotLoggedIn);
+    }
+    let _data_guard = client::vault_files::NativeDataGuard::acquire(&resolved)?;
+
     match cli.command {
+        Commands::Vault { command } => commands::cmd_vault(data_dir, command).await,
         Commands::Init {
             passphrase,
             test_kdf,

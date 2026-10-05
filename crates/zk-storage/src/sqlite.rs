@@ -64,6 +64,44 @@ impl SqliteStorage {
         })
     }
 
+    /// Inspect a closed, checkpointed cache without creating WAL/SHM sidecars.
+    /// Caller excludes writers. Never use immutable reads with uncheckpointed WAL:
+    /// SQLite would omit committed WAL frames. Refuse instead of undercounting.
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self, StorageError> {
+        let path = path.as_ref().to_path_buf();
+        let wal = PathBuf::from(format!("{}-wal", path.display()));
+        match std::fs::metadata(wal) {
+            Ok(m) if m.len() != 0 => return Err(StorageError::Backend("uncheckpointed cache WAL; open/close the local cache normally before replacement preflight".into())),
+            Ok(_) => {},
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+            Err(e) => return Err(StorageError::Backend(format!("cannot inspect cache WAL: {e}"))),
+        }
+        let absolute = std::fs::canonicalize(&path)
+            .map_err(|e| StorageError::Backend(format!("read-only cache path failed: {e}")))?;
+        let name = absolute
+            .to_str()
+            .ok_or_else(|| StorageError::Backend("read-only cache path is not UTF-8".into()))?;
+        let encoded: String = name
+            .bytes()
+            .map(|b| {
+                if b.is_ascii_alphanumeric() || b"/-_.".contains(&b) {
+                    char::from(b).to_string()
+                } else {
+                    format!("%{b:02X}")
+                }
+            })
+            .collect();
+        let conn = Connection::open_with_flags(
+            format!("file:{encoded}?mode=ro&immutable=1"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )
+        .map_err(|e| StorageError::Backend(format!("read-only cache open failed: {e}")))?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+            path: Some(path),
+        })
+    }
+
     /// Opens an ephemeral in-memory SQLite database.
     ///
     /// Useful for fast integration testing.
@@ -80,6 +118,24 @@ impl SqliteStorage {
             conn: Mutex::new(conn),
             path: None,
         })
+    }
+
+    /// Durably checkpoint WAL before closing a staged database for installation.
+    /// Refuse a busy checkpoint instead of discarding a live WAL.
+    pub fn checkpoint(&self) -> Result<(), StorageError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| StorageError::Backend("SQLite lock poisoned".into()))?;
+        let (busy, _, _): (i64, i64, i64) = conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .map_err(|e| StorageError::Backend(format!("SQLite checkpoint failed: {e}")))?;
+        if busy != 0 {
+            return Err(StorageError::Backend("SQLite checkpoint is busy".into()));
+        }
+        Ok(())
     }
 
     /// Returns the file path of the database, if not in-memory.

@@ -145,6 +145,7 @@ pub fn list_notes(
     tag_filter: Option<&str>,
 ) -> Result<Vec<ClientNoteSummary>, CliError> {
     let data_dir = resolve_data_dir(custom_data_dir);
+    super::vault_files::recover(&data_dir)?;
     let vault_path = vault_file(&data_dir);
     let db_path = db_file(&data_dir);
 
@@ -207,6 +208,7 @@ pub fn get_plaintext_note(
     id_or_prefix: &str,
 ) -> Result<(StoredEncryptedObject, PlaintextNote), CliError> {
     let data_dir = resolve_data_dir(custom_data_dir);
+    super::vault_files::recover(&data_dir)?;
     let vault_path = vault_file(&data_dir);
     let db_path = db_file(&data_dir);
 
@@ -250,6 +252,7 @@ pub fn create_note(
     tags: Vec<String>,
 ) -> Result<String, CliError> {
     let data_dir = resolve_data_dir(custom_data_dir);
+    super::vault_files::recover(&data_dir)?;
     let vault_path = vault_file(&data_dir);
     let db_path = db_file(&data_dir);
 
@@ -306,6 +309,7 @@ pub fn update_note(
     tags: Vec<String>,
 ) -> Result<u64, CliError> {
     let data_dir = resolve_data_dir(custom_data_dir);
+    super::vault_files::recover(&data_dir)?;
     let vault_path = vault_file(&data_dir);
     let db_path = db_file(&data_dir);
 
@@ -366,6 +370,7 @@ pub fn delete_note(
     purge: bool,
 ) -> Result<(String, u64), CliError> {
     let data_dir = resolve_data_dir(custom_data_dir);
+    super::vault_files::recover(&data_dir)?;
     let vault_path = vault_file(&data_dir);
     let db_path = db_file(&data_dir);
 
@@ -420,6 +425,7 @@ pub fn search_notes(
     query: &str,
 ) -> Result<Vec<SearchResult>, CliError> {
     let data_dir = resolve_data_dir(custom_data_dir);
+    super::vault_files::recover(&data_dir)?;
     let vault_path = vault_file(&data_dir);
     let db_path = db_file(&data_dir);
 

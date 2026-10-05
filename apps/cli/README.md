@@ -245,7 +245,7 @@ zk-note logout
 Signing out revokes the session on the sync server before deleting local credentials. If the server is offline or unreachable, local credentials are intentionally preserved with a truthful warning so the user can retry revocation when connectivity is restored.
 
 #### Authentication vs. Vault Linking / Sync
-> **Important**: Signing in authorizes this terminal device with the server account. It does **not** link, upload, replace, or restore your vault. Vault synchronization is a separate, guarded operation (`zk-note sync` or `s` in the TUI) that uses compare-and-swap (CAS) revision checks to prevent silent overwrites.
+> **Important**: Signing in authorizes this terminal device with the server account. It does **not** link, upload, replace, or restore your vault. Vault synchronization is a separate, guarded operation (`s` in the TUI; the CLI sync implementation is ZK-111) that uses compare-and-swap (CAS) revision checks to prevent silent overwrites.
 
 #### Check Sync & Device Identity
 ```bash
@@ -404,4 +404,90 @@ binds to its first local device UUID; keep the data directory/device identity.
 Use one key per machine. Key revocation blocks new SSH login and revokes its
 pinned device and active sessions plus derived key sessions. Other machine keys
 remain usable. Login creates only an account session; it never initializes,
-links, restores, uploads or unlocks a vault. ZK-110 owns vault linking/restoration.
+links, restores, uploads or unlocks a vault. ZK-110 provides explicit vault linking/restoration independently of login.
+
+### Explicit native vault link, restore and local replacement (ZK-110)
+
+Each machine must have its own data directory, `vault.json`, `notes.db`, device
+identity and SSH session. Do **not** synchronize/share `notes.db` with Syncthing,
+NFS or cloud drives. Signing in authenticates an account; it never links a vault.
+
+First machine, with an initialized local vault:
+
+```bash
+zk-note login --server https://notes.example.com
+zk-note vault status
+zk-note vault link
+zk-note tui
+```
+
+Link explicitly creates the encrypted remote bootstrap if absent, or adopts an
+existing bootstrap with the same stable vault identity. A different remote vault
+is refused without POST/overwrite. Successful server persistence is required
+before `vault-link.json` is written. TUI `s` runs existing guarded sync; the CLI
+`sync` implementation remains ZK-111 scope.
+
+Second machine, with no local vault/cache, authenticates independently to the
+same account then restores:
+
+```bash
+zk-note login --server https://notes.example.com
+zk-note vault restore
+zk-note unlock
+zk-note tui
+```
+
+The restore passphrase prompt is masked. Use `vault restore --recovery-key` for a masked recovery-key prompt. Supplying
+`--recovery-key <key>` or `--passphrase <passphrase>` is also supported.
+Prefer masked interactive input because shell arguments/history are visible to
+other local tools. In the TUI, Ctrl+V opens the vault modal, even while locked;
+Ctrl+A opens account authentication separately. Choose Restore, then Tab switches
+between masked passphrase and recovery-key input. Esc cancels and scrubs inputs.
+All unwrap/decryption happens locally; passphrases, recovery keys, VaultKey,
+plaintext titles/bodies/tags and search terms never enter network payloads.
+
+Restore validates active note and attachment-manifest envelopes locally with their
+existing typed decoders. Tampering or unsupported active object kinds aborts
+before installation; temporary decoded metadata is never persisted or transmitted.
+Restoring manifests does not download attachment blobs.
+
+Restore builds an independent staged cache, pulls ciphertext and tombstones from
+cursor 0 and never pushes. It installs bootstrap/cache/link only after validation,
+complete pull and durable WAL checkpoint/close. It leaves the restored vault
+locked and preserves the server auth session and device identity.
+
+To explicitly discard this machine's local state and rebuild from its currently
+authenticated account/server:
+
+```bash
+zk-note vault replace-from-server
+# Read account/server/vault identity and pending/in-flight/failed/conflict counts.
+# Type exactly: REPLACE LOCAL VAULT
+# Enter the remote vault passphrase locally.
+```
+
+Noninteractive replacement requires `--discard-local`, plus an explicitly
+supplied local unlock secret. Without confirmation no replacement staging or
+sync push occurs. TUI Replace uses a dedicated warning/counts screen and the same
+typed confirmation before masked unlock. Pending, in-flight, failed and conflicted
+local work is discarded **without upload**. This action never replaces/deletes
+anything on the server. Authentication and `device.json` survive; the old local
+unlock session and plaintext UI state are cleared before installation.
+
+Preflight refuses a nonempty/uncheckpointed WAL rather than omit unsynced work
+or mutate the cache before confirmation. Close other cache users and perform a
+normal local read/open-close (for example unlock then `zk-note list`) to complete
+SQLite recovery/checkpoint before retrying. Every native process holds an exclusive
+lock on its local data directory; concurrent CLI/TUI use of that directory is
+refused. Local Unix filesystems with atomic rename and file/directory fsync are
+the supported crash-durability model.
+
+`vault-link.json` is separate from `.auth_session` and binds normalized origin,
+account ID and `blake2s-v1:` recovery-envelope identity. Sync fails closed for
+missing/corrupt links, wrong server/account, local identity mismatch, missing
+remote bootstrap or remote identity mismatch. It never repairs or relinks inside
+sync. Local passphrase rotation preserves vault identity, but does not overwrite
+the create-once remote bootstrap; remote passphrase propagation needs a future
+explicit protocol. Restore from the server may require its original passphrase
+or the recovery key. See [ADR-0008](../../docs/adr/0008-native-vault-link-and-local-replacement.md)
+for framing, journal phases, crash recovery and verification details.

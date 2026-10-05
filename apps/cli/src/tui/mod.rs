@@ -5,6 +5,7 @@ pub mod app;
 pub mod event;
 pub mod terminal;
 pub mod ui;
+pub mod vault;
 pub mod views;
 
 #[cfg(test)]
@@ -142,11 +143,16 @@ pub async fn run_tui(data_dir: Option<&Path>) -> Result<(), CliError> {
                     app.reload_notes();
                     app.reload_conflicts();
                 }
+                Err(CliError::VaultLink(e)) => {
+                    app.sync_status = SyncStatus::Blocked(e);
+                }
                 Err(e) => {
                     app.sync_status = SyncStatus::Error(e.to_string());
                 }
             }
         }
+
+        vault::process_pending(&mut app).await;
 
         // Handle async account authentication operations (ZK-101 Addendum)
         if let Some(action) = app.account_pending_action.take() {

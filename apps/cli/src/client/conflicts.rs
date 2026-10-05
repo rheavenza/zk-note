@@ -146,6 +146,7 @@ pub fn list_conflicts(
     include_resolved: bool,
 ) -> Result<Vec<ClientConflictSummary>, CliError> {
     let data_dir = resolve_data_dir(custom_data_dir);
+    super::vault_files::recover(&data_dir)?;
     let vault_path = vault_file(&data_dir);
     let db_path = db_file(&data_dir);
 
@@ -203,6 +204,7 @@ pub fn get_conflict_detail(
     conflict_id: &str,
 ) -> Result<ClientConflictDetail, CliError> {
     let data_dir = resolve_data_dir(custom_data_dir);
+    super::vault_files::recover(&data_dir)?;
     let vault_path = vault_file(&data_dir);
     let db_path = db_file(&data_dir);
 
@@ -265,6 +267,7 @@ pub fn resolve_conflict_item(
     strategy: ConflictResolutionStrategy,
 ) -> Result<ConflictResolutionResult, CliError> {
     let data_dir = resolve_data_dir(custom_data_dir);
+    super::vault_files::recover(&data_dir)?;
     let vault_path = vault_file(&data_dir);
     let db_path = db_file(&data_dir);
 

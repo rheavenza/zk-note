@@ -38,6 +38,7 @@ pub enum AppMode {
     DeleteConfirm,
     Conflict,
     Account,
+    Vault,
     Help,
     Locked,
     TerminalTooSmall,
@@ -140,6 +141,7 @@ pub struct App {
     pub account_ssh_selected: usize,
 
     // Status & Feedback
+    pub vault_modal: super::vault::VaultModal,
     pub sync_status: SyncStatus,
     pub status_message: Option<String>,
     pub error_message: Option<String>,
@@ -261,6 +263,7 @@ impl App {
             account_ssh_selected: 0,
             account_focus_field: AccountField::ServerUrl,
             account_pending_action: initial_pending_action,
+            vault_modal: super::vault::VaultModal::default(),
             sync_status: initial_sync,
             status_message: None,
             error_message: None,
@@ -377,11 +380,35 @@ impl App {
     /// error and sets a truthful error message instead of displaying a false success message.
     /// In-memory buffers are fail-closed zeroized regardless of persistent cleanup outcome.
     pub fn lock_and_clear(&mut self) -> Result<(), CliError> {
+        self.vault_modal = super::vault::VaultModal::default();
         self.vault_key = None;
         self.passphrase_input.zeroize();
         self.passphrase_input.clear();
         self.unlock_error = None;
 
+        for n in &mut self.notes {
+            n.title.zeroize();
+            n.tags.zeroize();
+        }
+        for n in &mut self.search_results {
+            n.title.zeroize();
+            n.tags.zeroize();
+        }
+        if let Some(n) = &mut self.preview {
+            n.title.zeroize();
+            n.body.zeroize();
+            n.tags.zeroize();
+        }
+        if let Some(c) = &mut self.conflict_detail {
+            for n in [&mut c.local_note, &mut c.remote_note, &mut c.candidate_note]
+                .into_iter()
+                .flatten()
+            {
+                n.title.zeroize();
+                n.body.zeroize();
+                n.tags.zeroize();
+            }
+        }
         self.notes.clear();
         self.selected_index = None;
         self.preview = None;
@@ -1167,7 +1194,41 @@ impl App {
             self.record_user_activity();
         }
 
+        if matches!(self.mode, AppMode::Normal | AppMode::Locked)
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            if key.code == KeyCode::Char('v') {
+                self.passphrase_input.zeroize();
+                self.passphrase_input.clear();
+                self.previous_mode = Some(self.mode);
+                self.mode = AppMode::Vault;
+                self.vault_modal = super::vault::VaultModal::default();
+                self.vault_modal.pending = Some(super::vault::Pending::Inspect);
+                return;
+            }
+            if key.code == KeyCode::Char('a') {
+                self.update(Action::OpenAccount);
+                return;
+            }
+        }
         match self.mode {
+            AppMode::Vault => {
+                if key.code == KeyCode::Esc {
+                    self.vault_modal = super::vault::VaultModal::default();
+                    self.mode = self.previous_mode.take().unwrap_or(AppMode::Locked);
+                } else {
+                    self.vault_modal.handle_key(key);
+                    if matches!(
+                        self.vault_modal.pending,
+                        Some(
+                            super::vault::Pending::StageRestore
+                                | super::vault::Pending::StageReplace
+                        )
+                    ) {
+                        self.sync_status = SyncStatus::Restoring;
+                    }
+                }
+            }
             AppMode::TerminalTooSmall => {
                 if key.code == KeyCode::Char('q') {
                     self.update(Action::Quit);

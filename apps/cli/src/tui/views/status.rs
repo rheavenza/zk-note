@@ -17,6 +17,7 @@ pub fn render_status_bar(f: &mut Frame<'_>, app: &App, area: Rect) {
         AppMode::DeleteConfirm => "DELETE",
         AppMode::Conflict => "CONFLICT",
         AppMode::Account => "ACCOUNT",
+        AppMode::Vault => "VAULT",
         AppMode::Help => "HELP",
         AppMode::Locked => "LOCKED",
         AppMode::TerminalTooSmall => "RESIZE",
@@ -76,6 +77,8 @@ pub fn render_status_bar(f: &mut Frame<'_>, app: &App, area: Rect) {
         SyncStatus::Syncing => Color::Yellow,
         SyncStatus::Synced { .. } => Color::Green,
         SyncStatus::Conflict { .. } => Color::LightRed,
+        SyncStatus::Blocked(_) => Color::Red,
+        SyncStatus::Restoring => Color::Yellow,
         SyncStatus::Error(_) => Color::Red,
     };
     let sync_badge = Span::styled(
@@ -125,12 +128,13 @@ pub fn render_status_bar(f: &mut Frame<'_>, app: &App, area: Rect) {
 
     let key_hints = match app.mode {
         AppMode::Normal => {
-            "j/k: nav | Tab: focus | /: search | n: new | e: edit | E: $EDITOR | d: del | s: sync | a: server/auth | c: conflicts | l: lock | ?: help | q: quit"
+            "Ctrl+V: vault | j/k: nav | Tab: focus | /: search | n: new | e: edit | E: $EDITOR | d: del | s: sync | a: server/auth | c: conflicts | l: lock | ?: help | q: quit"
         }
         AppMode::Search => "Type: search query | Esc: cancel | Enter: confirm filter | Up/Down: nav",
         AppMode::Create | AppMode::InlineEdit => "Tab: next field | Ctrl+S: save | Esc: cancel",
         AppMode::DeleteConfirm => "y: confirm delete | n/Esc: cancel",
         AppMode::Conflict => "1/l: keep local | 2/r: accept remote | 3/m: merge | 4/d: duplicate | R: restore | Esc: close",
+        AppMode::Vault => "Ctrl+V: vault | Esc: cancel",
         AppMode::Account => "Tab: next field | Enter: submit/select | Ctrl+X: sign out | Ctrl+R: refresh | Esc: close",
         AppMode::Help => "Esc/q/?: close help",
         AppMode::Locked => "Type passphrase | Enter: unlock | q: quit",
