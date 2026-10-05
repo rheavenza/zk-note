@@ -1243,3 +1243,22 @@ V1 is ready for release-candidate security review when:
 - native/WASM test vectors match;
 - relevant test suites pass;
 - threat model and protocol documentation are current.
+
+### Native multi-device vault association (ZK-110 / ADR-0008)
+
+Account authentication and vault linkage are independent. Each machine owns an
+independent encrypted SQLite cache and device identity; caches must not be shared
+through NFS/Syncthing/cloud drives. Native remote sync requires a persisted exact
+normalized-origin/account/stable-vault-identity link, plus matching authenticated
+remote bootstrap identity, before any sync pull/push. Identity is BLAKE2s-256 over
+versioned canonical recovery-wrapper fields, excluding the mutable password
+wrapper/KDF, as defined in ADR-0008. Missing/corrupt/mismatching links fail closed.
+
+Explicit first-machine Link may create the encrypted bootstrap once; existing
+different vaults are never overwritten. Second-machine Restore validates/unlocks
+locally and pulls ciphertext/tombstones from zero into fresh staged storage.
+Explicit Replace Local Vault From Server discards only this machine's local work
+without uploading it, uses typed destructive confirmation and journaled recovery,
+preserves auth/device identity, and never deletes or changes the server vault.
+Secrets and plaintext stay local. Local password-wrapper rotation does not
+implicitly replace the remote bootstrap; propagation needs a separate spec task.

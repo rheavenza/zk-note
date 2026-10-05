@@ -20,6 +20,11 @@ pub fn render(f: &mut Frame<'_>, app: &App) {
         return;
     }
 
+    if app.mode == AppMode::Vault {
+        super::vault::render(f, app, area);
+        return;
+    }
+
     // Locked screen (AC-04)
     if app.mode == AppMode::Locked {
         render_locked_screen(f, app, area);

@@ -5,6 +5,8 @@ use std::fmt;
 /// Application errors for `zk-note` commands.
 #[derive(Debug)]
 pub enum CliError {
+    /// Explicit native vault association failure.
+    VaultLink(crate::client::vault_link::LinkError),
     /// Vault is locked and requires unlocking before proceeding.
     VaultLocked,
     /// Vault has not yet been initialized.
@@ -55,6 +57,7 @@ pub enum CliError {
 impl fmt::Display for CliError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::VaultLink(e) => write!(f, "{e}"),
             Self::VaultLocked => write!(f, "vault is locked; run 'zk-note unlock' first"),
             Self::VaultUninitialized => {
                 write!(f, "vault is uninitialized; run 'zk-note init' first")

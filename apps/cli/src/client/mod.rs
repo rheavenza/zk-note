@@ -8,6 +8,8 @@ pub mod editor;
 pub mod notes;
 pub mod sync;
 pub mod vault;
+pub mod vault_files;
+pub mod vault_link;
 
 pub use auth::{
     authorize_terminal_device, check_auth_state_online, force_clear_session, get_local_auth_state,

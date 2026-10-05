@@ -29,6 +29,7 @@ pub enum VaultState {
 /// Checks the current status of the vault on disk.
 pub fn get_vault_status(custom_data_dir: Option<&Path>) -> Result<VaultState, CliError> {
     let data_dir = resolve_data_dir(custom_data_dir);
+    super::vault_files::recover(&data_dir)?;
     let vault_path = vault_file(&data_dir);
     let sess_path = session_file(&data_dir);
 
@@ -66,6 +67,7 @@ pub fn unlock_vault(
     timeout_mins: Option<u64>,
 ) -> Result<VaultKey, CliError> {
     let data_dir = resolve_data_dir(custom_data_dir);
+    super::vault_files::recover(&data_dir)?;
     let vault_path = vault_file(&data_dir);
     let sess_path = session_file(&data_dir);
 
@@ -103,6 +105,7 @@ pub fn unlock_with_recovery_key(
     timeout_mins: Option<u64>,
 ) -> Result<VaultKey, CliError> {
     let data_dir = resolve_data_dir(custom_data_dir);
+    super::vault_files::recover(&data_dir)?;
     let vault_path = vault_file(&data_dir);
     let sess_path = session_file(&data_dir);
 
@@ -136,6 +139,7 @@ pub fn unlock_with_recovery_key(
 /// Locks the vault, clearing session files and zeroizing keys.
 pub fn lock_vault(custom_data_dir: Option<&Path>) -> Result<(), CliError> {
     let data_dir = resolve_data_dir(custom_data_dir);
+    super::vault_files::recover(&data_dir)?;
     let sess_path = session_file(&data_dir);
     clear_session(&sess_path)
 }
@@ -143,6 +147,7 @@ pub fn lock_vault(custom_data_dir: Option<&Path>) -> Result<(), CliError> {
 /// Retrieves the active [`VaultKey`], updating the last active timestamp.
 pub fn get_active_vault_key(custom_data_dir: Option<&Path>) -> Result<VaultKey, CliError> {
     let data_dir = resolve_data_dir(custom_data_dir);
+    super::vault_files::recover(&data_dir)?;
     let sess_path = session_file(&data_dir);
     load_session_key(&sess_path)
 }
@@ -153,6 +158,7 @@ pub fn get_active_vault_key(custom_data_dir: Option<&Path>) -> Result<VaultKey, 
 /// Returns `Ok(true)` if the session has expired due to idle timeout.
 pub fn is_session_expired(custom_data_dir: Option<&Path>) -> Result<bool, CliError> {
     let data_dir = resolve_data_dir(custom_data_dir);
+    super::vault_files::recover(&data_dir)?;
     let sess_path = session_file(&data_dir);
     if !sess_path.exists() {
         return Ok(true);
@@ -167,6 +173,7 @@ pub fn is_session_expired(custom_data_dir: Option<&Path>) -> Result<bool, CliErr
 /// Refreshes the last active timestamp for genuine user interactions through the shared session path.
 pub fn touch_session_activity(custom_data_dir: Option<&Path>) -> Result<(), CliError> {
     let data_dir = resolve_data_dir(custom_data_dir);
+    super::vault_files::recover(&data_dir)?;
     let sess_path = session_file(&data_dir);
     crate::session::touch_session(&sess_path)
 }

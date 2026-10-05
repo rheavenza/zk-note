@@ -105,7 +105,7 @@ web notes application. Each machine owns its own encrypted local database; never
 share `notes.db` through NFS/Syncthing/cloud-drive synchronization.
 
 ## ZK-109 — SSH-key authentication for native CLI/TUI
-Status: DONE (PR open / review pending)
+Status: DONE (merged PR #15)
 Priority: P1
 Dependencies: ZK-072, ADR-0006
 Ticket: [docs/tickets/ZK-109.md](docs/tickets/ZK-109.md)
@@ -131,7 +131,7 @@ Implementation notes:
   all-target/all-feature workspace tests (516), targeted protocol/server-auth/
   native-server/CLI suites, isolated agent suite, and the shared native auth
   contract (84 checks plus CAS/replay concurrency). GitHub CI required before
-  handoff; independent review pending, no merge authorization.
+  handoff; subsequently merged as PR #15 after independent review.
 - Exact acceptance evidence and limitations: [ZK-109 ticket](docs/tickets/ZK-109.md)
   and [ADR-0007](docs/adr/0007-native-ssh-authentication.md).
 
@@ -148,7 +148,7 @@ Review repairs (PR #15, review 5411575250):
   with CAS/replay concurrency. Exact-head GitHub CI is recorded in PR #15.
 
 ## ZK-110 — Native vault link, restore, account isolation, and replace-local-from-origin
-Status: READY
+Status: DONE (PR open / review pending)
 Priority: P0
 Dependencies: ZK-109
 Ticket: [docs/tickets/ZK-110.md](docs/tickets/ZK-110.md)
@@ -159,6 +159,32 @@ confirmed destructive replace-local action stages and validates the complete
 remote vault before swapping/deleting local vault state.
 Verification: two isolated native data dirs, failure injection around restore/swap,
 pending/conflict discard tests, zero-plaintext network evidence.
+
+Implementation notes:
+- Base `464eea3ff0d2b1e056fb6e2b4aec95cb34f6aec0`; branch
+  `work/ZK-110-native-vault-link-restore`. No ZK-111/112 work, server schema
+  changes, SSH protocol changes, bootstrap overwrite, or new sync engine.
+- Shared canonical BLAKE2s recovery-envelope identity is stable under passphrase
+  rotation. Atomic `vault-link.json` binds exact origin/account/identity; native
+  sync validates local and remote bindings before any sync pull/push.
+- Explicit CLI/TUI Link, Restore and Replace flows use verified existing bearer
+  sessions, locally masked/zeroizing unlock secrets and pull-only staged SQLite.
+  Replacement preflight counts pending/in-flight/failed/conflicts/unconfirmed
+  objects and requires typed confirmation or explicit noninteractive discard.
+- Journal phases Prepared/OldMoved/NewInstalled/Committed, directory lock,
+  startup recovery and WAL checkpoints preserve coherent generations. Replacing
+  local state preserves auth/device, clears local unlock/plaintext buffers and
+  never uploads discarded work or alters the server vault.
+- Passed fmt, workspace clippy/locked check, 543 all-target/all-feature workspace
+  tests; targeted core (42), protocol (23), storage (7), sync (98), CLI/TUI (129),
+  server (187); native contract (84 checks plus CAS/replay concurrency).
+- Tests include independent two-machine convergence/tombstones, 12 swap and 12
+  staging fault transitions, actual cursor-write failure, page failures, WAL
+  reopen, zero-push discard, guard mismatches and secret redaction/scrubbing.
+- Limits: closed/checkpointed cache required for mutation-free preflight; local
+  Unix filesystem durability; restore ends locked; create-once remote bootstrap
+  does not receive local passphrase updates. See ticket and ADR-0008 for details.
+- Independent PR review pending; exact pushed-head GitHub CI recorded in PR.
 
 ## ZK-111 — Remote-safe native sync execution and CLI sync command
 Status: READY

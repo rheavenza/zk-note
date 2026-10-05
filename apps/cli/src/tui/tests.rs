@@ -1943,3 +1943,126 @@ fn ssh_account_option_identity_selection_authenticated_state_and_cancel() {
     assert!(app.account_state.is_authenticated());
     assert!(!format!("{app:?}").contains("session-secret-sentinel"));
 }
+
+#[test]
+fn vault_modal_is_available_while_locked_and_authentication_is_separate() {
+    use crossterm::event::KeyModifiers;
+    let dir = TestDir::new("vault_modal_locked");
+    let mut app = App::new(Some(dir.path()), 100, 30);
+    assert_eq!(app.mode, AppMode::Locked);
+    app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL));
+    assert_eq!(app.mode, AppMode::Vault);
+    let screen = buffer_to_screen_text(&app, 100, 30);
+    assert!(screen.contains("Link Local Vault"));
+    assert!(screen.contains("Restore Remote Vault"));
+    assert!(screen.contains("Replace Local Vault From Server"));
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert_eq!(app.mode, AppMode::Locked);
+    app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+    assert_eq!(app.mode, AppMode::Account);
+}
+#[test]
+fn vault_replace_requires_typed_second_confirmation_and_masks_scrubs_both_secrets() {
+    use super::vault::{Pending, Phase};
+    use crossterm::event::KeyModifiers;
+    let (dir, mut app) = setup_test_vault();
+    let before = std::fs::read(crate::config::vault_file(dir.path())).unwrap();
+    app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL));
+    app.vault_modal.pending = None;
+    app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+    assert_eq!(
+        app.vault_modal.pending.take(),
+        Some(Pending::ReplacePreflight)
+    );
+    assert_eq!(app.vault_modal.phase, Phase::Menu); // x alone never stages/replaces
+    app.vault_modal.phase = Phase::ReplaceConfirm;
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(app.vault_modal.phase, Phase::ReplaceConfirm);
+    for c in "REPLACE LOCAL VAULT".chars() {
+        app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(app.vault_modal.phase, Phase::ReplaceSecret);
+    for c in "PASSPHRASE-TUI-CANARY".chars() {
+        app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+    assert!(!buffer_to_screen_text(&app, 100, 30).contains("PASSPHRASE-TUI-CANARY"));
+    assert!(!format!("{app:?} {:?}", app.vault_modal).contains("PASSPHRASE-TUI-CANARY"));
+    app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    assert!(app.vault_modal.secret.is_empty());
+    assert!(app.vault_modal.recovery);
+    for c in "RECOVERY-TUI-CANARY".chars() {
+        app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+    assert!(!buffer_to_screen_text(&app, 100, 30).contains("RECOVERY-TUI-CANARY"));
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(app.vault_modal.secret.is_empty());
+    assert!(app.vault_modal.pending.is_none());
+    assert_eq!(app.mode, AppMode::Normal);
+    assert!(app.vault_key.is_some());
+    assert_eq!(
+        std::fs::read(crate::config::vault_file(dir.path())).unwrap(),
+        before
+    );
+}
+#[tokio::test]
+async fn vault_modal_failure_preserves_existing_unlocked_vault_and_auth_session() {
+    use super::vault::{Pending, Phase};
+    let (dir, mut app) = setup_test_vault();
+    let auth = crate::auth::StoredAuthSession {
+        server_url: "http://127.0.0.1:1".into(),
+        account_id: Uuid::new_v4(),
+        device_id: Uuid::new_v4(),
+        session_id: None,
+        token: zk_protocol::auth::AuthToken::new("AUTH-TUI-CANARY"),
+        expires_at: None,
+    };
+    crate::auth::save_auth_session(&crate::config::auth_session_file(dir.path()), &auth).unwrap();
+    app.mode = AppMode::Vault;
+    app.vault_modal.phase = Phase::ReplaceSecret;
+    app.vault_modal.secret.push_str("SECRET-TUI-CANARY");
+    app.vault_modal.pending = Some(Pending::StageReplace);
+    super::vault::process_pending(&mut app).await;
+    assert!(app.vault_modal.secret.is_empty());
+    assert!(app.vault_key.is_some());
+    assert!(crate::session::has_active_session(&session_file(
+        dir.path()
+    )));
+    assert_eq!(
+        crate::auth::load_auth_session(&crate::config::auth_session_file(dir.path())).unwrap(),
+        auth
+    );
+    assert!(!app
+        .error_message
+        .as_ref()
+        .unwrap()
+        .contains("SECRET-TUI-CANARY"));
+}
+
+#[test]
+fn vault_onboarding_inputs_and_pending_actions_are_scrubbed_on_lock() {
+    let (_dir, mut app) = setup_test_vault();
+    app.vault_modal.secret.push_str("RECOVERY-LOCK-CANARY");
+    app.vault_modal.pending = Some(super::vault::Pending::StageReplace);
+    app.lock_and_clear().unwrap();
+    assert!(app.vault_modal.secret.is_empty());
+    assert!(app.vault_modal.pending.is_none());
+    assert!(app.preview.is_none());
+    assert!(app.notes.is_empty());
+    assert!(app.vault_key.is_none());
+}
+
+#[test]
+fn restore_submission_renders_pull_only_progress_before_network_work() {
+    use crossterm::event::KeyModifiers;
+    let dir = TestDir::new("restore_progress");
+    let mut app = App::new(Some(dir.path()), 100, 30);
+    app.mode = AppMode::Vault;
+    app.vault_modal.phase = super::vault::Phase::RestoreSecret;
+    app.vault_modal.secret.push_str("RESTORE-PROGRESS-CANARY");
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(app.sync_status, SyncStatus::Restoring);
+    let rendered = buffer_to_screen_text(&app, 100, 30);
+    assert!(rendered.contains("Restoring (pull only)"));
+    assert!(!rendered.contains("RESTORE-PROGRESS-CANARY"));
+}

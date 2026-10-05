@@ -4,6 +4,7 @@ pub mod note;
 pub mod search;
 pub mod time;
 pub mod vault;
+pub mod vault_identity;
 
 pub use attachment::{
     calculate_chunk_count, compute_content_hash, decrypt_attachment_stream_with_source,
